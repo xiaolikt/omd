@@ -492,6 +492,38 @@ pub fn execute_js(index: usize, code: &str) -> bool {
     true
 }
 
+/// 取这个槽位的 Browser 句柄。
+fn browser_at(index: usize) -> Option<Browser> {
+    slots().get(index).and_then(|slot| slot.browser.clone())
+}
+
+pub fn go_back(index: usize) {
+    if let Some(browser) = browser_at(index) {
+        browser.go_back();
+    }
+}
+
+pub fn go_forward(index: usize) {
+    if let Some(browser) = browser_at(index) {
+        browser.go_forward();
+    }
+}
+
+pub fn reload(index: usize) {
+    if let Some(browser) = browser_at(index) {
+        browser.reload();
+    }
+}
+
+/// 当前页面地址（同步可用，header 每帧读）。
+pub fn current_url(index: usize) -> Option<String> {
+    let browser = browser_at(index)?;
+    let frame = browser.main_frame()?;
+    let userfree = frame.url();
+    let url = CefString::from(&userfree).to_string();
+    (!url.is_empty()).then_some(url)
+}
+
 pub fn navigate(index: usize, url: &str) -> bool {
     let frame = slots().get(index).and_then(|s| {
         s.browser

@@ -9381,6 +9381,65 @@ fn pane_divider(pane_id: u64, kind: BlockPlacement, dragging: bool, cx: &mut Con
 
 
 
+/// 浏览器 pane：上面一条 GPUI 画的工具条（前进/后退/刷新 + 地址），
+/// 下面整块交给 CEF 子窗口。工具条高度变了，BrowserElement 的布局矩形
+/// 自动跟着变，X11 宿主也就跟着挪。
+fn browser_pane_element(index: usize) -> AnyElement {
+    let url = browser::current_url(index).unwrap_or_default();
+    let shown = if url.is_empty() {
+        "about:blank".to_string()
+    } else {
+        url
+    };
+    let mut bar = div()
+        .h(px(HEADER_H))
+        .flex_shrink_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(2.))
+        .px(px(8.))
+        .bg(rgb(0x161a22))
+        .border_b_1()
+        .border_color(rgb(0x23272f));
+    for (label, action) in [
+        ("←", browser::go_back as fn(usize)),
+        ("→", browser::go_forward),
+        ("⟳", browser::reload),
+    ] {
+        bar = bar.child(
+            div()
+                .id(SharedString::from(format!("browser-{label}-{index}")))
+                .px(px(6.))
+                .py(px(2.))
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(0x20232b)))
+                .child(div().text_xs().text_color(rgb(0x8b93a7)).child(label))
+                .on_mouse_down(MouseButton::Left, move |_ev, _win, cx| {
+                    cx.stop_propagation();
+                    action(index);
+                }),
+        );
+    }
+    bar = bar.child(
+        div()
+            .flex_1()
+            .min_w(px(0.))
+            .overflow_hidden()
+            .child(div().text_xs().text_color(rgb(0x6b7386)).child(shown)),
+    );
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .child(bar)
+        // BrowserElement 自己是 flex 子项（grow=1, basis=0），直接挂在列里；
+        // 中间再包一层普通 div 会让它拿不到剩余高度（实测塌成 1px）。
+        .child(BrowserElement { index })
+        .into_any_element()
+}
+
 /// 浏览器块的 Element。
 ///
 /// CEF 子窗口是真正的 X11 窗口，不参与 GPUI 绘制，所以这里不画任何东西：
@@ -9416,9 +9475,16 @@ impl Element for BrowserElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        // 在 flex 容器里按剩余空间铺开：不能写 Size::full()，否则会压掉
+        // 上面的工具条和分屏里其它兄弟。
         let style = Style {
-            size: Size::full(),
+            flex_grow: 1.,
+            flex_basis: px(0.).into(),
             flex_shrink: 1.,
+            min_size: Size {
+                width: px(0.).into(),
+                height: px(0.).into(),
+            },
             ..Default::default()
         };
         (window.request_layout(style, [], cx), ())
@@ -12754,7 +12820,7 @@ impl Render for Root {
                 .find(|pane| pane.id == pane_id)
                 .and_then(|pane| pane.browser)
             {
-                leaf_elements.insert(pane_id, BrowserElement { index }.into_any_element());
+                leaf_elements.insert(pane_id, browser_pane_element(index));
                 continue;
             }
             let title = media
