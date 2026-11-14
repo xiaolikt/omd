@@ -3241,10 +3241,14 @@ impl Root {
                     不钳制就会以 500 次/秒泵、把主线程烧到 40%+。和 Ghostex 一样
                     钳到 [8ms, 33ms]：8ms 够 120Hz，33ms 是空闲上限。
                     */
+                    let min_ms: i64 = std::env::var("OMD_PUMP_MIN")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(8);
                     let delay = match browser::pump_delay_ms() {
-                        d if d <= 0 => 8,
+                        d if d <= 0 => min_ms,
                         d if d >= 1000 => 200,
-                        d => d.clamp(8, 33),
+                        d => d.clamp(min_ms, 33),
                     };
                     let wait = std::time::Duration::from_millis(delay as u64);
                     let sleep = cx.background_executor().timer(wait);
