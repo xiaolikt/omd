@@ -9384,7 +9384,7 @@ fn pane_divider(pane_id: u64, kind: BlockPlacement, dragging: bool, cx: &mut Con
 /// 浏览器 pane：上面一条 GPUI 画的工具条（前进/后退/刷新 + 地址），
 /// 下面整块交给 CEF 子窗口。工具条高度变了，BrowserElement 的布局矩形
 /// 自动跟着变，X11 宿主也就跟着挪。
-fn browser_pane_element(index: usize) -> AnyElement {
+fn browser_pane_element(index: usize, focus: FocusHandle) -> AnyElement {
     let url = browser::current_url(index).unwrap_or_default();
     let shown = if url.is_empty() {
         "about:blank".to_string()
@@ -9436,7 +9436,7 @@ fn browser_pane_element(index: usize) -> AnyElement {
         .child(bar)
         // BrowserElement 自己是 flex 子项（grow=1, basis=0），直接挂在列里；
         // 中间再包一层普通 div 会让它拿不到剩余高度（实测塌成 1px）。
-        .child(BrowserElement { index })
+        .child(BrowserElement { index, focus })
         .into_any_element()
 }
 
@@ -9447,6 +9447,8 @@ fn browser_pane_element(index: usize) -> AnyElement {
 /// 分屏、拖动分隔条、最大化都会自动跟随。
 struct BrowserElement {
     index: usize,
+    /// 页面点击后把键盘焦点拿过来，gpui 的 window 级键盘监听才会分发。
+    focus: FocusHandle,
 }
 
 impl IntoElement for BrowserElement {
@@ -9512,6 +9514,7 @@ impl Element for BrowserElement {
                 height.round().max(1.) as u32,
             );
             let index = self.index;
+            let focus = self.focus.clone();
             // CEF 的鼠标坐标是 view 坐标（物理像素），GPUI 给的是窗口逻辑坐标。
             let to_page = move |position: Point<Pixels>| {
                 (
@@ -9552,8 +9555,15 @@ impl Element for BrowserElement {
                 (MouseButton::Middle, cef::MouseButtonType::MIDDLE),
                 (MouseButton::Right, cef::MouseButtonType::RIGHT),
             ] {
-                window.on_mouse_event(move |ev: &MouseDownEvent, phase, _window, _cx| {
-                    if phase.bubble() && inside(ev.position) && ev.button == button {
+                let focus = focus.clone();
+                window.on_mouse_event(move |ev: &MouseDownEvent, phase, _window, cx| {
+                    if !phase.bubble() {
+                        return;
+                    }
+                    // 点在页面外就把键盘交还 GPUI。
+                    crate::browser::osr_set_focused(inside(ev.position));
+                    if inside(ev.position) && ev.button == button {
+                        focus.focus(_window, cx);
                         let (x, y) = to_page(ev.position);
                         crate::browser::osr_mouse_button(
                             index,
@@ -9626,6 +9636,49 @@ impl Element for BrowserElement {
         if !crate::browser::osr_mode() {
             return;
         }
+        // gpui 要求 on_key_event 在 paint 阶段注册（prepaint 里调会静默失效）。
+        let index = self.index;
+        let mods = |modifiers: gpui_kit::Modifiers| -> u32 {
+            let mut bits = 0;
+            if modifiers.shift {
+                bits |= crate::browser::EVF_SHIFT;
+            }
+            if modifiers.control {
+                bits |= crate::browser::EVF_CTRL;
+            }
+            if modifiers.alt {
+                bits |= crate::browser::EVF_ALT;
+            }
+            if modifiers.platform {
+                bits |= crate::browser::EVF_META;
+            }
+            bits
+        };
+        window.on_key_event(move |ev: &KeyDownEvent, phase, _window, cx| {
+            if !phase.bubble() || !crate::browser::osr_focused() {
+                return;
+            }
+            if let Some(vk) = crate::browser::vk_for(&ev.keystroke.key) {
+                let ch = ev
+                    .keystroke
+                    .key_char
+                    .as_ref()
+                    .and_then(|text| text.chars().next())
+                    .map(|c| c as u16)
+                    .unwrap_or(0);
+                crate::browser::osr_key(index, vk, ch, mods(ev.keystroke.modifiers), false);
+                cx.stop_propagation();
+            }
+        });
+        window.on_key_event(move |ev: &KeyUpEvent, phase, _window, cx| {
+            if !phase.bubble() || !crate::browser::osr_focused() {
+                return;
+            }
+            if let Some(vk) = crate::browser::vk_for(&ev.keystroke.key) {
+                crate::browser::osr_key(index, vk, 0, mods(ev.keystroke.modifiers), true);
+                cx.stop_propagation();
+            }
+        });
         let Some((width, height)) = crate::browser::accel_size(self.index) else {
             return;
         };
@@ -12933,7 +12986,14 @@ impl Render for Root {
                 .find(|pane| pane.id == pane_id)
                 .and_then(|pane| pane.browser)
             {
-                leaf_elements.insert(pane_id, browser_pane_element(index));
+                let focus = self
+                    .panes
+                    .iter()
+                    .find(|pane| pane.id == pane_id)
+                    .map(|pane| pane.focus.clone());
+                if let Some(focus) = focus {
+                    leaf_elements.insert(pane_id, browser_pane_element(index, focus));
+                }
                 continue;
             }
             let title = media

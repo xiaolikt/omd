@@ -564,31 +564,87 @@ pub fn osr_mouse_wheel(index: usize, x: i32, y: i32, delta_x: i32, delta_y: i32,
     }
 }
 
-pub fn osr_key(
-    index: usize,
-    windows_key_code: i32,
-    character: u16,
-    unmodified: u16,
-    modifiers: u32,
-    up: bool,
-) {
+/// 页面当前是否该收键盘（鼠标最后点在里面）。
+static OSR_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn osr_set_focused(focused: bool) {
+    let was = OSR_FOCUSED.swap(focused, Ordering::Relaxed);
+    if was != focused {
+        if let Some(index) = primary() {
+            if let Some(host) = host_at(index) {
+                host.set_focus(i32::from(focused));
+            }
+        }
+    }
+}
+
+pub fn osr_focused() -> bool {
+    OSR_FOCUSED.load(Ordering::Relaxed)
+}
+
+/// GPUI 的 key 名 → Windows 虚拟键码（CEF 的 send_key_event 要这个）。
+pub fn vk_for(key: &str) -> Option<i32> {
+    let special = [
+        ("enter", 13),
+        ("tab", 9),
+        ("backspace", 8),
+        ("escape", 27),
+        ("space", 32),
+        ("delete", 46),
+        ("insert", 45),
+        ("left", 37),
+        ("up", 38),
+        ("right", 39),
+        ("down", 40),
+        ("home", 36),
+        ("end", 35),
+        ("pageup", 33),
+        ("pagedown", 34),
+    ];
+    if let Some((_, vk)) = special.iter().find(|(name, _)| *name == key) {
+        return Some(*vk);
+    }
+    if let Some(rest) = key.strip_prefix('f') {
+        if let Ok(n) = rest.parse::<i32>() {
+            if (1..=12).contains(&n) {
+                return Some(111 + n);
+            }
+        }
+    }
+    let mut chars = key.chars();
+    let (first, rest) = (chars.next()?, chars.next());
+    if rest.is_none() {
+        return Some(first.to_ascii_uppercase() as i32);
+    }
+    None
+}
+
+/// 无窗口模式的按键：CEF 要求 RAWKEYDOWN → CHAR → KEYUP 三步，
+/// 只发 KEYDOWN 页面收不到 keydown（实测 0 次）。
+pub fn osr_key(index: usize, windows_key_code: i32, character: u16, modifiers: u32, up: bool) {
     let Some(host) = host_at(index) else { return };
-    let event = KeyEvent {
-        size: std::mem::size_of::<KeyEvent>(),
-        type_: if up {
-            KeyEventType::KEYUP
-        } else {
-            KeyEventType::KEYDOWN
-        },
-        modifiers,
-        windows_key_code,
-        native_key_code: 0,
-        is_system_key: 0,
-        character,
-        unmodified_character: unmodified,
-        focus_on_editable_field: 0,
+    let send = |type_: KeyEventType, character: u16| {
+        let event = KeyEvent {
+            size: std::mem::size_of::<KeyEvent>(),
+            type_,
+            modifiers,
+            windows_key_code,
+            native_key_code: 0,
+            is_system_key: 0,
+            character,
+            unmodified_character: character,
+            focus_on_editable_field: 0,
+        };
+        host.send_key_event(Some(&event));
     };
-    host.send_key_event(Some(&event));
+    if up {
+        send(KeyEventType::KEYUP, 0);
+        return;
+    }
+    send(KeyEventType::RAWKEYDOWN, 0);
+    if character != 0 {
+        send(KeyEventType::CHAR, character);
+    }
 }
 
 /// OSR 下没有原生焦点可给，只能显式告诉 Chromium。
