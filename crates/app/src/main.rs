@@ -9499,7 +9499,7 @@ impl Element for BrowserElement {
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         window: &mut Window,
-        _: &mut App,
+        cx: &mut App,
     ) -> Self::PrepaintState {
         let scale = window.scale_factor();
         let x = f32::from(bounds.origin.x) * scale;
@@ -9507,7 +9507,8 @@ impl Element for BrowserElement {
         let width = f32::from(bounds.size.width) * scale;
         let height = f32::from(bounds.size.height) * scale;
         if crate::browser::osr_mode() {
-            // 无窗口模式：CEF 只等一个 view 尺寸，画面走纹理。
+            // 键盘只沿焦点路径分发。不登记的话按键落到根节点，这个元素的监听收不到。
+            window.set_focus_handle(&self.focus, cx);
             crate::browser::resize(
                 self.index,
                 width.round().max(1.) as u32,
