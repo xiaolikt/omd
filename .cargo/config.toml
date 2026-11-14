@@ -1,0 +1,4 @@
+# CEF 二进制不随仓库分发，放在 vendor/cef/<version>/<platform> 下。
+# cef-dll-sys 的构建脚本不认 `~`，这里用相对仓库根的路径。
+[env]
+CEF_PATH = { value = "vendor/cef", relative = true }

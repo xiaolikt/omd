@@ -129,6 +129,7 @@ crates/
 | [docs/07-risks-and-roadmap.md](docs/07-risks-and-roadmap.md) | 风险对策、M0–M5 里程碑、工程量 |
 | [docs/08-build-on-herdr.md](docs/08-build-on-herdr.md) | 为什么 v1 不嵌 herdr-core；三种形态的评审 |
 | [docs/09-mobile.md](docs/09-mobile.md) | 手机版评估：架构顺、UI 壳是难点、路线排序 |
+| [docs/10-startup-timings.md](docs/10-startup-timings.md) | 启动时间实测：首帧 ~110ms、独显唤醒坑、字体 fontconfig 收窄、首帧按帧补铺 |
 | [contracts/endpoints.json](contracts/endpoints.json) | 29 个包 / 144 个端点，含参数与结果 JSON Schema（自动导出） |
 
 ## 研究方法（可复现）

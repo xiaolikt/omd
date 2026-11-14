@@ -10,9 +10,12 @@ use std::sync::Arc;
 
 use async_channel::{Receiver, Sender};
 use dsh_host::{DshHost, DshRuntime};
-use term::{Span, Term};
+use term::{PlacedImage, Span, Term, CELL_H, CELL_W};
 use dsh_transport::{CookieProvider, Frame, Mux, Rpc};
 mod ghostty_vt;
+use ghostty_vt::{GHOSTTY_MODS_ALT, GHOSTTY_MODS_CTRL, GHOSTTY_MODS_SHIFT, GHOSTTY_MODS_SUPER};
+mod lsp;
+mod browser;
 mod term;
 
 fn uuid_like() -> String {
@@ -25,9 +28,236 @@ fn uuid_like() -> String {
 }
 
 use gpui_kit::*;
+use gpui_kit::component::input::{
+    Editor, EditorState, GutterDecoration, GutterDecorationCollection, RangeDecoration,
+    RangeDecorationCollection, RangeDecorationStyle,
+};
+use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::text::TextView;
 use serde_json::{json, Value};
+
+// ---------------------------------------------------------------------------
+// 启动耗时打点
+// ---------------------------------------------------------------------------
+
+/// 首帧只铺最后这么多块：每块 markdown 解析+measure 约 0.5ms，baseline 回放时
+/// 让首帧只等这一批，剩下按帧补。
+const FIRST_PAINT_BLOCKS: usize = 40;
+/// 每帧补多少块历史。
+const REVEAL_STEP: usize = 40;
+
+static PROC_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static RENDER_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn t0() -> std::time::Instant {
+    *PROC_START.get_or_init(std::time::Instant::now)
+}
+
+/// 只用一小撮字体建 fontconfig 配置。
+///
+/// cosmic-text 的 `FontSystem::new()` 走 fontconfig 枚举**全机**字体：这台机器 4178 个
+/// face，release 下也要 ~88ms，冷启动还要建 fontconfig 缓存（~1.4s）。UI 实际只需要
+/// 一个拉丁 sans + 一个 mono + 一个 CJK + emoji，所以启动前写一份只指向这几个文件的
+/// fontconfig 配置，用同目录软链组成私有字体目录，再把 FONTCONFIG_FILE 指过去。
+///
+/// 探测不到关键字体（CJK / sans / mono）时什么都不做，回落到系统全量扫描。
+fn setup_fontconfig() {
+    if std::env::var_os("OMD_NO_FONTCONFIG").is_some() {
+        stamp("fontconfig: OMD_NO_FONTCONFIG set, using system scan");
+        return;
+    }
+    if std::env::var_os("FONTCONFIG_FILE").is_some() {
+        stamp("fontconfig: FONTCONFIG_FILE already set, leaving alone");
+        return;
+    }
+    // (目录, 文件名前缀) —— 目录存在时收下所有匹配的文件
+    const DIRS: &[(&str, &[&str])] = &[
+        (
+            "/usr/share/fonts/opentype/noto",
+            &["NotoSansCJK-Regular", "NotoSansCJK-Bold", "NotoSerifCJK-Regular"],
+        ),
+        (
+            "/usr/share/fonts/truetype/noto",
+            &[
+                "NotoColorEmoji",
+                "NotoSans-Regular",
+                "NotoSans-Bold",
+                "NotoSansMono-Regular",
+            ],
+        ),
+        ("/usr/share/fonts/noto-cjk", &["NotoSansCJK-Regular", "NotoSansCJK-Bold"]),
+        (
+            "/usr/share/fonts/truetype/dejavu",
+            &[
+                "DejaVuSans.ttf",
+                "DejaVuSans-Bold.ttf",
+                "DejaVuSansMono.ttf",
+                "DejaVuSansMono-Bold.ttf",
+                "DejaVuSerif.ttf",
+            ],
+        ),
+        ("/usr/share/fonts/truetype/wqy", &["wqy-"]),
+        ("/usr/share/fonts/wqy-zenhei", &["wqy-"]),
+        ("/usr/share/fonts/wqy-microhei", &["wqy-"]),
+    ];
+
+    let mut picked: Vec<PathBuf> = Vec::new();
+    for (dir, prefixes) in DIRS {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+                let path = PathBuf::from(dir).join(&name);
+                if !picked.contains(&path) {
+                    picked.push(path);
+                }
+            }
+        }
+    }
+    let has = |needle: &str| {
+        picked
+            .iter()
+            .any(|path| path.to_string_lossy().contains(needle))
+    };
+    let has_cjk = has("CJK") || has("wqy");
+    let has_sans = has("DejaVuSans.") || has("NotoSans-Regular") || has("NotoSansCJK");
+    let has_mono = has("Mono");
+    if !(has_cjk && has_sans && has_mono) || picked.len() < 3 {
+        stamp(format!(
+            "fontconfig: not enough local fonts (cjk={has_cjk} sans={has_sans} mono={has_mono}, {} files), using system scan",
+            picked.len()
+        ));
+        return;
+    }
+
+    let dir = data_dir().join("fonts");
+    let cache = std::env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".cache")
+        })
+        .join("omd/fontconfig");
+    if std::fs::create_dir_all(&dir).is_err() || std::fs::create_dir_all(&cache).is_err() {
+        stamp("fontconfig: cannot create dirs, using system scan");
+        return;
+    }
+    // 清掉上次的链接，再按当前探测结果重建（字体包增删也能跟上）
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    for path in &picked {
+        let Some(name) = path.file_name() else { continue };
+        let _ = std::os::unix::fs::symlink(path, dir.join(name));
+    }
+
+    let conf = dirs_config_path();
+    let xml = format!(
+        "<?xml version=\"1.0\"?>\n<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n<fontconfig>\n  <dir>{}</dir>\n  <cachedir>{}</cachedir>\n</fontconfig>\n",
+        dir.display(),
+        cache.display()
+    );
+    if std::fs::write(&conf, xml).is_err() {
+        stamp("fontconfig: cannot write config, using system scan");
+        return;
+    }
+    // SAFETY: 单线程启动阶段，早于任何其它线程读环境变量
+    unsafe { std::env::set_var("FONTCONFIG_FILE", &conf) };
+    stamp(format!(
+        "fontconfig: curated {} font files ({})",
+        picked.len(),
+        conf.display()
+    ));
+}
+
+/// 让 wgpu 选直连屏幕的那块 GPU，而不是 `PowerPreference::HighPerformance` 唤醒的独显。
+///
+/// gpui-pre-wgpu 的排序是「离散 > 集成」，所以在核显+独显的笔记本上会选独显；
+/// 独显此时通常处于 runtime suspend（RTD3），唤醒要 ~1s —— 这就是"歇一会儿再启动"
+/// 时首帧 1.1s、连续启动只要 200ms 的原因。gpui 提供了 `ZED_DEVICE_ID` 覆盖钩子
+/// （4 位十六进制 PCI device id），指向 boot VGA 设备即可，而且同卡渲染还能省掉
+/// compositor 的跨设备拷贝。
+///
+/// 探测不到就什么都不做（保持 gpui 默认排序）。
+fn setup_gpu_preference() {
+    // 逃生开关：钉错了 GPU 会拿不到适配器（窗口起不来），给个纯环境变量的退路。
+    if std::env::var_os("OMD_NO_GPU_PIN").is_some() {
+        stamp("gpu: OMD_NO_GPU_PIN set, keeping gpui default ordering");
+        return;
+    }
+    if std::env::var_os("ZED_DEVICE_ID").is_some() {
+        stamp("gpu: ZED_DEVICE_ID already set, leaving alone");
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir("/sys/bus/pci/devices") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let read = |name: &str| {
+            std::fs::read_to_string(dir.join(name))
+                .map(|value| value.trim().to_string())
+                .unwrap_or_default()
+        };
+        if read("boot_vga") != "1" {
+            continue;
+        }
+        if !read("class").starts_with("0x0300") {
+            continue;
+        }
+        let device = read("device");
+        let device = device.trim_start_matches("0x").to_string();
+        let vendor = read("vendor");
+        if device.len() == 4 && device.chars().all(|c| c.is_ascii_hexdigit()) {
+            // SAFETY: 单线程启动阶段，早于 wgpu 初始化
+            unsafe { std::env::set_var("ZED_DEVICE_ID", &device) };
+            stamp(format!("gpu: boot VGA device 0x{device} (vendor {vendor})"));
+        }
+        // 光选适配器还不够：Vulkan loader 在 `Instance::new` 就会枚举**所有** ICD，
+        // 碰到 runtime-suspended 的 NVIDIA 独显会把它唤醒（这台机 ~1s）。所以把
+        // ICD 也钉到直连屏幕那块 GPU 的厂商。NVIDIA 自己当 boot VGA 时不钉（没有
+        // 第二块 GPU 要躲，钉了反而无路可退）。
+        let icd = match vendor.as_str() {
+            "0x1002" => Some("radeon_icd.json"),
+            "0x8086" => Some("intel_icd.json"),
+            "0x1af4" | "0x1b36" => Some("virtio_icd.json"),
+            _ => None,
+        };
+        let unset = |name: &str| std::env::var_os(name).is_none();
+        if let Some(icd) = icd {
+            let path = ["/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d"]
+                .iter()
+                .map(|dir| PathBuf::from(dir).join(icd))
+                .find(|path| path.is_file());
+            if let Some(path) = path {
+                let path = path.to_string_lossy().to_string();
+                if unset("VK_ICD_FILENAMES") {
+                    unsafe { std::env::set_var("VK_ICD_FILENAMES", &path) };
+                }
+                if unset("VK_DRIVER_FILES") {
+                    unsafe { std::env::set_var("VK_DRIVER_FILES", &path) };
+                }
+                stamp(format!("gpu: pinning vulkan ICD {path}"));
+            }
+        }
+        return;
+    }
+}
+
+fn dirs_config_path() -> PathBuf {
+    data_dir().join("fontconfig.xml")
+}
+
+/// 相对进程启动的毫秒打点：`[t +  12.34ms] tag`
+fn stamp(tag: impl std::fmt::Display) {
+    eprintln!("[t +{:>8.2}ms] {tag}", t0().elapsed().as_secs_f64() * 1000.0);
+}
 
 // ---------------------------------------------------------------------------
 // 通信类型
@@ -43,14 +273,630 @@ struct SessionRow {
     updated_at: i64,
 }
 
-/// Tern/Herdr-style workspace: a cwd groups conversations (tabs).
+/// 对话正文列的最大宽度（居中），以及输入框的最大宽度（比正文窄一点）。
+const CONTENT_MAX_W: f32 = 880.;
+const INPUT_MAX_W: f32 = 780.;
+
+/// 命令面板的分类：All / Commands / Panels / Spaces。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PaletteTab {
+    All,
+    Commands,
+    Tabs,
+    Spaces,
+}
+
+impl PaletteTab {
+    const ALL: [PaletteTab; 4] = [
+        PaletteTab::All,
+        PaletteTab::Commands,
+        PaletteTab::Tabs,
+        PaletteTab::Spaces,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            PaletteTab::All => "All",
+            PaletteTab::Commands => "Commands",
+            PaletteTab::Tabs => "Panels",
+            PaletteTab::Spaces => "Spaces",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            PaletteTab::All => PaletteTab::Commands,
+            PaletteTab::Commands => PaletteTab::Tabs,
+            PaletteTab::Tabs => PaletteTab::Spaces,
+            PaletteTab::Spaces => PaletteTab::All,
+        }
+    }
+}
+
+/// 文件浏览器里的一项（纯 Rust 读盘，不走 dsh API）。
+#[derive(Clone, Debug)]
+struct FileItem {
+    name: String,
+    dir: bool,
+    size: u64,
+}
+
+fn read_dir_items(dir: &str) -> Vec<FileItem> {
+    let mut items: Vec<FileItem> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let meta = entry.metadata().ok();
+            items.push(FileItem {
+                dir: meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
+                size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                name,
+            });
+        }
+    }
+    items.sort_by(|a, b| {
+        b.dir
+            .cmp(&a.dir)
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    items
+}
+
+/// 读文本预览：超过 512KB 或不是 UTF-8 就退化成提示。
+fn read_text_preview(path: &str) -> String {
+    const MAX_BYTES: u64 = 512 * 1024;
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) => return format!("cannot stat: {err}"),
+    };
+    if meta.is_dir() {
+        return "directory".to_string();
+    }
+    if meta.len() > MAX_BYTES {
+        return format!("file too large ({} KB)", meta.len() / 1024);
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => "binary file".to_string(),
+        },
+        Err(err) => format!("read failed: {err}"),
+    }
+}
+
+#[derive(Clone, Debug)]
+enum PaletteAction {
+    OpenSession(String),
+    OpenTab { space_id: String, tab_id: String },
+    SwitchSpace(String),
+    NewSession,
+    TermPane(BlockPlacement),
+    OpenModels,
+    OpenSettings,
+    OpenFiles,
+    GitStageAll,
+    GitUnstageAll,
+    GitCommit,
+}
+
+struct PaletteEntry {
+    section: &'static str,
+    label: String,
+    tag: String,
+    sub: String,
+    badge: Option<String>,
+    dot: Option<u32>,
+    action: PaletteAction,
+}
+
+/// pane 的去向：下 / 右 / 整个标签页。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BlockPlacement {
+    Bottom,
+    Right,
+    Panel,
+}
+
+impl BlockPlacement {
+    fn as_str(self) -> &'static str {
+        match self {
+            BlockPlacement::Bottom => "bottom",
+            BlockPlacement::Right => "right",
+            BlockPlacement::Panel => "tab",
+        }
+    }
+    fn parse(value: &str) -> Self {
+        match value {
+            "right" => BlockPlacement::Right,
+            "tab" => BlockPlacement::Panel,
+            _ => BlockPlacement::Bottom,
+        }
+    }
+}
+
+/// Media block content. Images/GIFs render in-app; video/audio use the
+/// system handler so OMD never owns a media process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaKind {
+    Image,
+    Gif,
+    Video,
+    Audio,
+}
+
+impl MediaKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            MediaKind::Image => "image",
+            MediaKind::Gif => "gif",
+            MediaKind::Video => "video",
+            MediaKind::Audio => "audio",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "image" => Some(Self::Image),
+            "gif" => Some(Self::Gif),
+            "video" => Some(Self::Video),
+            "audio" => Some(Self::Audio),
+            _ => None,
+        }
+    }
+
+    fn inline(self) -> bool {
+        matches!(self, Self::Image | Self::Gif)
+    }
+}
+
+fn media_kind_for(path: &str) -> Option<MediaKind> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())?
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "webp" | "bmp" | "ico" | "tif" | "tiff" => Some(MediaKind::Image),
+        "gif" => Some(MediaKind::Gif),
+        "mp4" | "webm" | "mkv" | "mov" | "avi" | "m4v" | "ogv" => Some(MediaKind::Video),
+        "mp3" | "m4a" | "aac" | "flac" | "ogg" | "opus" | "wav" | "wma" => Some(MediaKind::Audio),
+        _ => None,
+    }
+}
+
+/// 一个终端 pane：自带终端实例、屏幕、焦点。
+struct Block {
+    id: u64,
+    /// 这个 panel 属于哪个 tab（None = 当前 tab）
+    tab_id: Option<String>,
+    kind: BlockPlacement,
+    /// Bottom 用高度，Right 用宽度
+    size: f32,
+    session: Option<String>,
+    term_id: String,
+    term: Option<Term>,
+    screen: Vec<Vec<Span>>,
+    /// 非空 = 这个 panel 是编辑器，内容是文件路径
+    editor_path: Option<String>,
+    /// 非空 = 这个 block 是 media（图片/GIF 内嵌，视频/音频外部播放）
+    media_path: Option<String>,
+    media_kind: Option<MediaKind>,
+    media_image: Option<Arc<RenderImage>>,
+    /// 这一帧终端里的 kitty 图形放置。
+    images: Vec<PlacedImage>,
+    cwd: Option<String>,
+    /// 拉起这个 pane 时写入的命令（terminal-browser 的 listPanes 用）。
+    command: Option<String>,
+    focus: FocusHandle,
+}
+
+impl Block {
+    fn new(id: u64, kind: BlockPlacement, focus: FocusHandle) -> Self {
+        let size = match kind {
+            BlockPlacement::Bottom => 220.,
+            BlockPlacement::Right => 460.,
+            BlockPlacement::Panel => 0.,
+        };
+        Self {
+            id,
+            tab_id: None,
+            kind,
+            size,
+            session: None,
+            term_id: String::new(),
+            term: Term::new(100, 30),
+            screen: Vec::new(),
+            editor_path: None,
+            media_path: None,
+            media_kind: None,
+            media_image: None,
+            images: Vec::new(),
+            cwd: None,
+            command: None,
+            focus,
+        }
+    }
+}
+
+/// 顶栏高度（panel 右键菜单要挂在它下面，和 hover 下拉一致）。
+const HEADER_H: f32 = 38.;
+
+/// 第三方 dsh TUI（Ink/React，npm 上的 @deepseek-harness-tui/dsh-tui），
+/// 跑在终端 pane 里就是完整的 agent UI。它要求 PATH 上有 `dsh`，
+/// 所以把 OMD 自带 runtime 的 bin 目录塞进 PATH。
+fn dsh_tui_command() -> String {
+    let bin = dsh_host::runtime_root().join("bin");
+    format!(
+        "PATH=\"{}:$PATH\" npx -y @deepseek-harness-tui/dsh-tui",
+        bin.display()
+    )
+}
+
+/// 终端 pane 尺寸的合法范围。
+const PANE_WIDTH_MIN: f32 = 280.;
+/// 顶栏图标按钮的统一尺寸/字号（左右箭头、+、下拉、文件、设置、窗口按钮都一样）
+const HEAD_BTN: f32 = 24.;
+const HEAD_GLYPH: f32 = 13.;
+
+const PANE_WIDTH_MAX: f32 = 900.;
+const PANE_HEIGHT_MIN: f32 = 120.;
+
+
+/// 分割方向：Row = 左右并排；Col = 上下堆叠。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitDir {
+    Row,
+    Col,
+}
+
+/// tab 宽度：按标题文字估宽（CJK 按双宽算），夹在 56..220 之间。
+fn est_tab_width(title: &str) -> f32 {
+    let mut w: f32 = 0.;
+    for ch in title.chars() {
+        w += if (ch as u32) > 0x2000 { 11.5f32 } else { 6.4f32 };
+    }
+    (w + 34.).clamp(56., 220.)
+}
+
+fn next_split_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(1);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
+/// 一个 tab 的 panel 布局树。Leaf(0) 固定是 chat panel。
+#[derive(Clone, Debug)]
+enum Layout {
+    Leaf(u64),
+    Split {
+        id: u64,
+        dir: SplitDir,
+        /// 每个孩子的权重（和为 1 左右）
+        sizes: Vec<f32>,
+        children: Vec<Layout>,
+    },
+}
+
+impl SplitDir {
+    fn pane_kind(self) -> BlockPlacement {
+        match self {
+            SplitDir::Row => BlockPlacement::Right,
+            SplitDir::Col => BlockPlacement::Bottom,
+        }
+    }
+}
+
+impl Layout {
+    fn label(&self) -> String {
+        match self {
+            Layout::Leaf(id) => format!("leaf {id}"),
+            Layout::Split { dir, children, .. } => {
+                format!("{:?}({})", dir, children.len())
+            }
+        }
+    }
+
+    /// 把某个 leaf 一分为二：原 leaf 在前，新 leaf 在后。
+    fn split(&mut self, leaf: u64, dir: SplitDir, new_leaf: u64) -> bool {
+        match self {
+            Layout::Leaf(id) if *id == leaf => {
+                let old = *id;
+                *self = Layout::Split {
+                    id: next_split_id(),
+                    dir,
+                    sizes: if dir == SplitDir::Row {
+                        vec![0.62, 0.38]
+                    } else {
+                        vec![0.6, 0.4]
+                    },
+                    children: vec![Layout::Leaf(old), Layout::Leaf(new_leaf)],
+                };
+                true
+            }
+            Layout::Split { children, .. } => {
+                children.iter_mut().any(|child| child.split(leaf, dir, new_leaf))
+            }
+            _ => false,
+        }
+    }
+
+    /// 摘掉一个 leaf；父 split 只剩一个孩子时折叠成那个孩子。
+    fn remove(&mut self, leaf: u64) -> bool {
+        if let Layout::Split { children, sizes, .. } = self {
+            for index in 0..children.len() {
+                if matches!(children[index], Layout::Leaf(id) if id == leaf) {
+                    children.remove(index);
+                    if index < sizes.len() {
+                        sizes.remove(index);
+                    }
+                    let total: f32 = sizes.iter().sum();
+                    if total > 0.0 {
+                        for size in sizes.iter_mut() {
+                            *size /= total;
+                        }
+                    }
+                    if children.len() == 1 {
+                        if let Some(only) = children.pop() {
+                            *self = only;
+                        }
+                    }
+                    return true;
+                }
+            }
+            children.iter_mut().any(|child| child.remove(leaf))
+        } else {
+            false
+        }
+    }
+
+    fn leaves(&self, out: &mut Vec<u64>) {
+        match self {
+            Layout::Leaf(id) => out.push(*id),
+            Layout::Split { children, .. } => {
+                for child in children {
+                    child.leaves(out);
+                }
+            }
+        }
+    }
+
+    /// 在同一个 split 里和相邻兄弟换位置（拖 header 用）。
+    fn swap_neighbor(&mut self, leaf: u64, dir: SplitDir, delta: isize) -> bool {
+        if let Layout::Split {
+            dir: split_dir,
+            sizes,
+            children,
+            ..
+        } = self
+        {
+            if *split_dir == dir {
+                if let Some(index) = children
+                    .iter()
+                    .position(|child| matches!(child, Layout::Leaf(id) if *id == leaf))
+                {
+                    let target = index as isize + delta;
+                    if target >= 0 && (target as usize) < children.len() {
+                        children.swap(index, target as usize);
+                        if index < sizes.len() && (target as usize) < sizes.len() {
+                            sizes.swap(index, target as usize);
+                        }
+                        return true;
+                    }
+                }
+            }
+            return children
+                .iter_mut()
+                .any(|child| child.swap_neighbor(leaf, dir, delta));
+        }
+        false
+    }
+
+    /// 在右侧编辑器列追加一个 leaf：根是 Row 且第一个孩子是 chat(Leaf(0)) 时均分右列。
+    fn add_right(&mut self, leaf: u64) {
+        const EDITOR_AREA: f32 = 0.40;
+        if let Layout::Split {
+            dir: SplitDir::Row,
+            children,
+            sizes,
+            ..
+        } = self
+        {
+            if matches!(children.first(), Some(Layout::Leaf(0))) {
+                children.push(Layout::Leaf(leaf));
+                let rest = (children.len() - 1) as f32;
+                sizes.clear();
+                sizes.push(1.0 - EDITOR_AREA);
+                for _ in 0..(children.len() - 1) {
+                    sizes.push(EDITOR_AREA / rest);
+                }
+                return;
+            }
+        }
+        self.split(0, SplitDir::Row, leaf);
+    }
+
+    fn has(&self, leaf: u64) -> bool {
+        match self {
+            Layout::Leaf(id) => *id == leaf,
+            Layout::Split { children, .. } => children.iter().any(|child| child.has(leaf)),
+        }
+    }
+
+    fn set_sizes(&mut self, split_id: u64, sizes: Vec<f32>) {
+        if let Layout::Split { id, sizes: cur, children, .. } = self {
+            if *id == split_id {
+                if sizes.len() == cur.len() {
+                    *cur = sizes;
+                }
+                return;
+            }
+            for child in children.iter_mut() {
+                child.set_sizes(split_id, sizes.clone());
+            }
+        }
+    }
+
+    /// 协议方向上的邻居 pane。`delta` 为 +1（right/down）或 -1（left/up）。
+    fn neighbor(&self, leaf: u64, want: SplitDir, delta: isize) -> Option<u64> {
+        let Layout::Split { dir, children, .. } = self else {
+            return None;
+        };
+        if *dir == want {
+            if let Some(index) = children.iter().position(|child| child.has(leaf)) {
+                let target = index as isize + delta;
+                if target >= 0 && (target as usize) < children.len() {
+                    let mut leaves = Vec::new();
+                    children[target as usize].leaves(&mut leaves);
+                    return if delta > 0 {
+                        leaves.first().copied()
+                    } else {
+                        leaves.last().copied()
+                    };
+                }
+            }
+        }
+        children
+            .iter()
+            .find_map(|child| child.neighbor(leaf, want, delta))
+    }
+
+    /// 新建的那个二分里，把 `leaf` 的权重设成 `weight`（另一半补齐）。
+    fn set_leaf_weight(&mut self, leaf: u64, weight: f32) -> bool {
+        if let Layout::Split { children, sizes, .. } = self {
+            if children.len() == 2 && sizes.len() == 2 {
+                if let Some(index) = children
+                    .iter()
+                    .position(|child| matches!(child, Layout::Leaf(id) if *id == leaf))
+                {
+                    let weight = weight.clamp(0.15, 0.85);
+                    sizes[index] = weight;
+                    sizes[1 - index] = 1.0 - weight;
+                    return true;
+                }
+            }
+            return children
+                .iter_mut()
+                .any(|child| child.set_leaf_weight(leaf, weight));
+        }
+        false
+    }
+
+    fn sizes_of(&self, split_id: u64) -> Option<Vec<f32>> {
+        match self {
+            Layout::Leaf(_) => None,
+            Layout::Split { id, sizes, children, .. } => {
+                if *id == split_id {
+                    return Some(sizes.clone());
+                }
+                children.iter().find_map(|child| child.sizes_of(split_id))
+            }
+        }
+    }
+}
+
+/// 一个 tab：装若干 panel（panel1-omp / panel2-terminal …），同一时刻显示一个。
+#[derive(Clone, Debug)]
+struct Panel {
+    id: String,
+    /// 稳定编号（不随位置变化）：默认名字就是 "tab {number}"
+    number: u32,
+    /// 被最大化的 panel（只显示它）
+    maximized: Option<u64>,
+    /// 用户可改的名字；空 = 用当前 panel 的标题
+    name: String,
+    /// panel id（= dsh session id；terminal panel 也是 session id）
+    blocks: Vec<String>,
+    active: Option<String>,
+    /// panel 布局树（Leaf(0) = chat）
+    layout: Layout,
+    /// 从磁盘读出来的原始布局，等 Root 建好再 materialize
+    pending_layout: Option<Value>,
+}
+
+impl Panel {
+    fn new(id: String, number: u32) -> Self {
+        Self {
+            id,
+            number,
+            maximized: None,
+            name: String::new(),
+            blocks: Vec::new(),
+            active: None,
+            layout: Layout::Leaf(0),
+            pending_layout: None,
+        }
+    }
+
+    fn label(&self, panel_title: impl Fn(&str) -> String) -> String {
+        if !self.name.trim().is_empty() {
+            return self.name.clone();
+        }
+        self.active
+            .as_deref()
+            .or_else(|| self.blocks.first().map(|s| s.as_str()))
+            .map(|id| panel_title(id))
+            .unwrap_or_else(|| "tab".to_string())
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Space {
     id: String,
     name: String,
     cwd: String,
-    tabs: Vec<String>,
-    active: Option<String>,
+    panels: Vec<Panel>,
+    active_panel: Option<String>,
+}
+
+impl Space {
+    /// 这个 panel 在哪个 tab 里。
+    fn tab_of(&self, panel: &str) -> Option<&Panel> {
+        self.panels
+            .iter()
+            .find(|tab| tab.blocks.iter().any(|p| p == panel))
+    }
+
+    /// 当前 tab。
+    fn current_tab(&self) -> Option<&Panel> {
+        self.active_panel
+            .as_deref()
+            .and_then(|id| self.panels.iter().find(|tab| tab.id == id))
+            .or_else(|| self.panels.first())
+    }
+
+    /// 把一个 panel 放进它应该在的 tab；没有就新建一个 tab。
+    fn attach_panel(&mut self, panel: &str) {
+        if self.tab_of(panel).is_some() {
+            return;
+        }
+        let id = next_tab_id();
+        let number = self.panels.iter().map(|tab| tab.number).max().unwrap_or(0) + 1;
+        let mut tab = Panel::new(id.clone(), number);
+        tab.blocks.push(panel.to_string());
+        tab.active = Some(panel.to_string());
+        self.panels.push(tab);
+        self.active_panel = Some(id);
+    }
+
+    /// 把 panel 所在 tab 置为当前，并让该 tab 显示这个 panel。
+    fn activate_panel(&mut self, panel: &str) {
+        let tab_id = self.tab_of(panel).map(|tab| tab.id.clone());
+        if let Some(tab_id) = tab_id {
+            self.active_panel = Some(tab_id.clone());
+            if let Some(tab) = self.panels.iter_mut().find(|tab| tab.id == tab_id) {
+                tab.active = Some(panel.to_string());
+            }
+        }
+    }
+
+    fn all_panels(&self) -> Vec<String> {
+        self.panels
+            .iter()
+            .flat_map(|tab| tab.blocks.iter().cloned())
+            .collect()
+    }
 }
 
 
@@ -77,33 +923,120 @@ enum Cmd {
     ModelCatalog,
     SelectModel { provider: String, model: String },
     Follow(String),
+    /// Start a background follow without changing the focused session.
+    Watch(String),
+    CancelSession(String),
     NewSession { cwd: Option<String> },
-    NewTerminal,
-    Prompt { text: String, request_id: String },
-    TerminalInput(String),
+    /// 为一个 pane 建终端（会话 + terminal/create）
+    NewTerminal {
+        pane_id: u64,
+        kind: BlockPlacement,
+        cwd: Option<String>,
+        /// 终端起来后自动敲进去的命令（例如 `npx -y @deepseek-harness-tui/dsh-tui`）
+        run: Option<String>,
+    },
+    AttachTerminal {
+        pane_id: u64,
+        session_id: String,
+        term_id: String,
+    },
+    Prompt { session_id: String, text: String, request_id: String },
+    TerminalInput { term_id: String, data: String },
+    /// 订阅某个 session 的后台任务清单（job/list 是流）
+    JobsWatch { session_id: Option<String> },
+    /// 杀掉一个后台任务
+    JobKill { session_id: String, job_id: String },
+    /// 通用 RPC 透传：endpoint 是 dsh 的 api 名（"settings/describe" 等）
+    Call {
+        tag: String,
+        endpoint: String,
+        args: Value,
+    },
     Cancel,
     Decide { event_id: String, allow: bool },
     AnswerQuestion { event_id: String, answer: Value },
     UpdateDsh,
 }
 
+/// 每个 shell 起来时写进环境，terminal-browser 靠它找到 omd 的 socket。
+fn terminal_browser_prelude() -> String {
+    let path = block_socket_path()
+        .display()
+        .to_string()
+        .replace('\'', "'\\''");
+    format!("export TERMINAL_BROWSER_TERMINAL_SOCKET='{path}'\r")
+}
+
+fn shell_join(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            if arg
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '@' | '='))
+            {
+                arg.clone()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// terminal-browser unix socket 上的一次调用。
+enum TbCall {
+    Current { tty: Option<String>, cwd: Option<String> },
+    List,
+    Neighbor { pane: String, direction: String },
+    Split {
+        from: String,
+        direction: String,
+        command: Vec<String>,
+        size: Option<f32>,
+    },
+    Send { pane: String, text: String },
+    Paste { pane: String },
+    Focus { pane: String },
+}
+
 enum Ev {
     HostReady(String),
-    Sessions(Vec<SessionRow>),
+    DshSessions(Vec<SessionRow>),
     ModelCatalog(Value),
     ModelSelected { provider: String, model: String },
     FollowStart(String),
-    Event(Value),
+    Event { session_id: String, value: Value },
     Line(String),
-    StreamStart,
-    StreamDelta(String),
-    ReasoningDelta(String),
-    StreamEnd,
+    StreamStart { session_id: String },
+    StreamDelta { session_id: String, delta: String },
+    ReasoningDelta { session_id: String, delta: String },
+    StreamEnd { session_id: String },
     Connection(bool),
     AgentRunning(bool),
     ImageB64(String),
-    TerminalOutput(String),
+    TerminalOutput { term_id: String, data: String },
     TerminalScreen(Vec<String>),
+    /// 新会话建好了：UI 把它加进当前空间的 tabs 并切过去
+    SessionCreated(String),
+    /// 终端建好了：把 term 绑到 pane 上（tab 形态的 pane 还会被打开成标签页）
+    /// job/list 的一帧（整份清单替换）
+    Jobs(Value),
+    Called {
+        tag: String,
+        endpoint: String,
+        result: std::result::Result<Value, String>,
+    },
+    /// terminal-browser 的 socket 请求。UI 线程填 result，控制线程在等。
+    Tb {
+        call: TbCall,
+        reply: tokio::sync::oneshot::Sender<Value>,
+    },
+    TerminalSession {
+        pane_id: u64,
+        kind: BlockPlacement,
+        session_id: String,
+        term_id: String,
+    },
     Approval { event_id: String, label: String },
     ApprovalGone,
     Question { event_id: String, request: Value },
@@ -117,8 +1050,41 @@ enum Ev {
 // worker：持有 host / rpc / mux，串行处理命令与流帧
 // ---------------------------------------------------------------------------
 
-fn spawn_worker(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
-    eprintln!("[worker] thread starting");
+/// 事件名（启动耗时日志用）。
+fn ev_name(ev: &Ev) -> &'static str {
+    match ev {
+        Ev::HostReady(_) => "HostReady",
+        Ev::DshSessions(_) => "DshSessions",
+        Ev::ModelCatalog(_) => "ModelCatalog",
+        Ev::ModelSelected { .. } => "ModelSelected",
+        Ev::FollowStart(_) => "FollowStart",
+        Ev::Event { .. } => "Event",
+        Ev::Line(_) => "Line",
+        Ev::StreamStart { .. } => "StreamStart",
+        Ev::StreamDelta { .. } => "StreamDelta",
+        Ev::ReasoningDelta { .. } => "ReasoningDelta",
+        Ev::StreamEnd { .. } => "StreamEnd",
+        Ev::Connection(_) => "Connection",
+        Ev::AgentRunning(_) => "AgentRunning",
+        Ev::ImageB64(_) => "ImageB64",
+        Ev::SessionCreated(_) => "SessionCreated",
+        Ev::TerminalOutput { .. } => "TerminalOutput",
+        Ev::TerminalScreen(_) => "TerminalScreen",
+        Ev::Jobs(_) => "Jobs",
+        Ev::Called { .. } => "Called",
+        Ev::TerminalSession { .. } => "TerminalSession",
+        Ev::Tb { .. } => "Tb",
+        Ev::Approval { .. } => "Approval",
+        Ev::ApprovalGone => "ApprovalGone",
+        Ev::Question { .. } => "Question",
+        Ev::QuestionGone => "QuestionGone",
+        Ev::DshInfo { .. } => "DshInfo",
+        Ev::DshUpdate { .. } => "DshUpdate",
+        Ev::Error(_) => "Error",
+    }
+}
+
+fn spawn_worker(cmds: Receiver<Cmd>, evs: Sender<Ev>) {    eprintln!("[worker] thread starting");
     std::thread::spawn(move || {
         eprintln!("[worker] thread running");
         let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -147,7 +1113,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
         let _ = evs
             .send(Ev::DshUpdate {
                 done: false,
-                message: "正在安装内置 dsh 引擎…".into(),
+                message: "installing bundled dsh engine…".into(),
             })
             .await;
         match dsh_host::install_dsh("latest").await {
@@ -155,7 +1121,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                 let _ = evs
                     .send(Ev::DshUpdate {
                         done: true,
-                        message: format!("内置引擎 v{} 已安装", runtime.version),
+                        message: format!("bundled engine v{} installed", runtime.version),
                     })
                     .await;
             }
@@ -163,7 +1129,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                 let _ = evs
                     .send(Ev::DshUpdate {
                         done: true,
-                        message: format!("内置引擎安装失败：{err}"),
+                        message: format!("bundled engine install failed: {err}"),
                     })
                     .await;
             }
@@ -171,9 +1137,11 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
     }
     if let Some(rows) = load_sessions_cache() {
         eprintln!("[worker] cached sessions: {}", rows.len());
-        let _ = evs.send(Ev::Sessions(rows)).await;
+        stamp(format!("worker: session cache sent ({} rows)", rows.len()));
+        let _ = evs.send(Ev::DshSessions(rows)).await;
     }
     eprintln!("[worker] launching host");
+    stamp("worker: launching host");
     let host = match DshHost::launch("web").await {
         Ok(host) => host,
         Err(err) => {
@@ -181,6 +1149,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
             return;
         }
     };
+    stamp("worker: host attached");
     eprintln!(
         "[worker] host ready: {} ({}ms)",
         host.base(),
@@ -239,23 +1208,41 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
     }
 
     // 流帧转发：Follow 时起一个 generation，旧帧直接丢弃。
-    let (frame_tx, frame_rx) = async_channel::unbounded::<(u64, Value)>();
+    let (frame_tx, frame_rx) = async_channel::unbounded::<(String, Value)>();
     let generation = Arc::new(AtomicU64::new(0));
     let mut current: Option<String> = None;
+    let mut followed: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut prompt_started: Option<std::time::Instant> = None;
     // 每次 Follow/NewSession 提升世代；旧 follow task 看到变化后主动取消流。
     let (follow_gen_tx, follow_gen_rx) = tokio::sync::watch::channel(0u64);
     // 本地回显过的 prompt rpcId；follow 回放同一条 user/message 时用它去重。
     let mut pending_echoes: VecDeque<String> = VecDeque::new();
+    // 后台任务订阅的世代（换了 session 就作废旧流）
+    let jobs_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // 工具耗时：在这里打点（UI 侧事件是批量的，量出来恒为 0）
+    let mut tool_started: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
 
-    // 终端：attach 流 + uplink
-    let terminal_target: tokio::sync::Mutex<Option<(String, String)>> =
-        tokio::sync::Mutex::new(None);
-    let (terminal_out, mut terminal_out_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
-    let terminal_up_rx_slot: tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<TerminalUp>>> =
-        tokio::sync::Mutex::new(None);
-    let terminal_up_global: tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<TerminalUp>>> =
-        tokio::sync::Mutex::new(None);
+    // 终端：每个终端一条 attach 流 + 自己的 uplink（支持多个 pane）
+    let terminal_up: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<TerminalUp>>,
+        >,
+    > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let terminal_buffers: Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>> =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let control_path = block_socket_path();
+    {
+        let http_c = host.client().clone();
+        let base_c = host.base().clone();
+        let mux_c = mux.clone();
+        let evs_c = evs.clone();
+        let up_c = terminal_up.clone();
+        let buf_c = terminal_buffers.clone();
+        tokio::spawn(async move {
+            serve_control(control_path, http_c, base_c, mux_c, evs_c, up_c, buf_c).await;
+        });
+    }
 
     // 常驻订阅全局事件（审批/提问都走这里）
     {
@@ -313,7 +1300,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                                 })
                                 .await;
 
-                            // 调试钩子：自动放行/拒绝，用于端到端验证
+                            // 调试钩子：自动放行/Deny，用于端到端验证
                             if let Ok(decision) = std::env::var("DSH_GUI_AUTODECIDE") {
                                 let value = if decision == "allow" {
                                     "allowed-once"
@@ -359,7 +1346,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
         .await;
     let http = host.client().clone();
     let base = host.base().clone();
-    let _ = evs.send(Ev::Line("本地引擎已就绪".into())).await;
+    let _ = evs.send(Ev::Line("engine ready".into())).await;
     let _ = refresh_sessions(&rpc, &evs).await;
 
     loop {
@@ -405,9 +1392,41 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                     Cmd::Refresh => {
                         let _ = refresh_sessions(&rpc, &evs).await;
                     }
+                    Cmd::Watch(id) => {
+                        if followed.insert(id.clone()) {
+                            let mux_f = mux.clone();
+                            let frame_tx_f = frame_tx.clone();
+                            let evs_f = evs.clone();
+                            let sid = id.clone();
+                            tokio::spawn(async move {
+                                match mux_f
+                                    .open("session/follow", json!({
+                                        "request": {
+                                            "address": { "kind": "session", "sessionId": sid },
+                                            "maxMessages": 200,
+                                        }
+                                    }))
+                                    .await
+                                {
+                                    Ok(mut stream) => loop {
+                                        match stream.recv().await {
+                                            Some(Frame::Item(value)) => {
+                                                if frame_tx_f.send((sid.clone(), value)).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            _ => break,
+                                        }
+                                    },
+                                    Err(err) => {
+                                        let _ = evs_f.send(Ev::Error(format!("watch failed: {err}"))).await;
+                                    }
+                                }
+                            });
+                        }
+                    }
                     Cmd::Follow(id) => {
-                        let gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
-                        let _ = follow_gen_tx.send(gen);
+                        let first = followed.insert(id.clone());
                         current = Some(id.clone());
                         let _ = evs.send(Ev::FollowStart(id.clone())).await;
                         if let Ok(value) = rpc
@@ -436,14 +1455,14 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             }
                         }
 
-                        // 完全独立的 task，不在 select 的生命周期里
+                        if !first {
+                            continue;
+                        }
+                        // 每个 session 一个独立 follow；不再用全局 generation 取消。
                         let mux_f = mux.clone();
                         let frame_tx_f = frame_tx.clone();
                         let evs_f = evs.clone();
                         let sid = id.clone();
-                        let mut stop_rx = follow_gen_rx.clone();
-                        // 本次世代已看过，避免 changed() 立即触发取消。
-                        let _ = stop_rx.borrow_and_update();
                         let http_f = http.clone();
                         let base_f = base.clone();
                         tokio::task::spawn(async move {
@@ -467,16 +1486,25 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             let mut n = 0u64;
                             let mut prompted = false;
                             loop {
-                                tokio::select! {
-                                    changed = stop_rx.changed() => {
-                                        if changed.is_err() { break; }
-                                        stream.cancel();
-                                        break;
-                                    }
-                                    frame = stream.recv() => {
-                                        match frame {
+                                match stream.recv().await {
                                             Some(Frame::Item(v)) => {
                                                 n += 1;
+                                                // 调试钩子：DSH_GUI_AUTOPROMPT=<文本> 在 follow 出第一帧后自动发一条
+                                                let auto = std::env::var("DSH_GUI_AUTOPROMPT").ok();
+                                                if n == 1 && !prompted && auto.is_some() {
+                                                    prompted = true;
+                                                    let text = auto.unwrap();
+                                                    let rpc_f = Rpc::new(&http_f, &base_f);
+                                                    let r = rpc_f.call("session/prompt", json!({
+                                                        "request": {
+                                                            "requestId": format!("auto-{sid}"),
+                                                            "sessionId": sid.clone(),
+                                                            "mode": "queue",
+                                                            "content": [ { "type": "text", "text": text } ],
+                                                        }
+                                                    })).await;
+                                                    eprintln!("[worker] autoprompt: {r:?}");
+                                                }
                                                 if n == 1 && !prompted && std::env::var("DSH_GUI_SELFTEST").is_ok() {
                                                     prompted = true;
                                                     let rpc_f = Rpc::new(&http_f, &base_f);
@@ -491,11 +1519,9 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                                                     eprintln!("[worker] selftest prompt: {r:?}");
                                                 }
 
-                                                if frame_tx_f.send((gen, v)).await.is_err() { break; }
+                                                if frame_tx_f.send((sid.clone(), v)).await.is_err() { break; }
                                             }
                                             _ => break,
-                                        }
-                                    }
                                 }
                             }
                             trace(format_args!("[worker] follow task EXITED after {n}"));
@@ -509,7 +1535,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             let result = rpc
                                 .call("session/prompt", json!({
                                     "request": {
-                                        "requestId": format!("omd-auto-{gen}"),
+                                        "requestId": format!("omd-auto-{sid}"),
                                         "sessionId": id.clone(),
                                         "mode": "queue",
                                         "content": [ { "type": "text", "text": text } ],
@@ -533,14 +1559,18 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             .await
                         {
                             Ok(created) => {
-                                if let Some(session_id) =
-                                    created.get("sessionId").and_then(|v| v.as_str())
+                                if let Some(session_id) = created
+                                    .get("sessionId")
+                                    .and_then(|v| v.as_str())
+                                    .map(|v| v.to_string())
                                 {
                                     eprintln!("[worker] created session {session_id}");
-                                    let _ = evs.send(Ev::Line(format!("+++ new session {session_id}"))).await;
+                                    let _ = evs
+                                        .send(Ev::SessionCreated(session_id.clone()))
+                                        .await;
                                     let gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
                                     let _ = follow_gen_tx.send(gen);
-                                    current = Some(session_id.to_string());
+                                    current = Some(session_id.clone());
                                     if let Ok(mut stream) = mux
                                         .open("session/follow", json!({
                                             "request": {
@@ -551,6 +1581,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                                     {
                                         let frame_tx = frame_tx.clone();
                                         let mut stop_rx = follow_gen_rx.clone();
+                                        let sid_task = session_id.clone();
                                         // 本次世代已看过，避免 changed() 立即触发取消。
                                         let _ = stop_rx.borrow_and_update();
                                         tokio::spawn(async move {
@@ -564,7 +1595,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                                                     frame = stream.recv() => {
                                                         match frame {
                                                             Some(Frame::Item(value)) => {
-                                                                if frame_tx.send((gen, value)).await.is_err() { break; }
+                                                                if frame_tx.send((sid_task.clone(), value)).await.is_err() { break; }
                                                             }
                                                             _ => break,
                                                         }
@@ -572,6 +1603,20 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                                                 }
                                             }
                                         });
+                                        // 调试钩子：新会话建好后自动发一条（follow 已经打开）
+                                        if let Ok(text) = std::env::var("DSH_GUI_AUTOPROMPT") {
+                                            let r = rpc
+                                                .call("session/prompt", json!({
+                                                    "request": {
+                                                        "requestId": format!("auto-{gen}"),
+                                                        "sessionId": session_id.clone(),
+                                                        "mode": "queue",
+                                                        "content": [ { "type": "text", "text": text } ],
+                                                    }
+                                                }))
+                                                .await;
+                                            eprintln!("[worker] autoprompt(new session): {r:?}");
+                                        }
                                         if let Ok(b64) = std::env::var("DSH_GUI_AUTOIMAGE") {
                                             let result = rpc
                                                 .call("session/prompt", json!({
@@ -612,11 +1657,16 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                         }
                         let _ = refresh_sessions(&rpc, &evs).await;
                     }
-                    Cmd::NewTerminal => {
-                        eprintln!("[worker] NewTerminal cmd received");
-                        // 终端挂到新会话上，避免与浏览器/GUI 已占用的会话撞写权
+                    Cmd::NewTerminal {
+                        pane_id,
+                        kind,
+                        cwd,
+                        run,
+                    } => {
+                        let term_cwd = cwd.unwrap_or_else(|| "/tmp".to_string());
+                        eprintln!("[worker] NewTerminal pane={pane_id} cwd={term_cwd}");
                         let session_id = match rpc
-                            .call("session/create", json!({ "request": { "cwd": "/tmp" } }))
+                            .call("session/create", json!({ "request": { "cwd": term_cwd } }))
                             .await
                         {
                             Ok(created) => created
@@ -624,17 +1674,26 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                             Err(err) => {
-                                let _ = evs.send(Ev::Error(format!("term session create failed: {err}"))).await;
+                                let hint = if format!("{err}").contains("sending request") {
+                                    "（不是 web：这是本地 dsh daemon 的 HTTP API，daemon 可能挂/换端口了，重启 omd 会重新拉起）"
+                                } else {
+                                    ""
+                                };
+                                let _ = evs
+                                    .send(Ev::Error(format!(
+                                        "session/create 失败: {err}{hint}"
+                                    )))
+                                    .await;
                                 None
                             }
                         };
-                        eprintln!("[worker] NewTerminal session resolved: {session_id:?}");
                         let Some(session_id) = session_id else {
-                            let _ = evs.send(Ev::Error("need a session for its terminal".into())).await;
+                            let _ = evs
+                                .send(Ev::Error("终端需要先有会话；上面的失败原因就是它".into()))
+                                .await;
                             continue;
                         };
                         let term_id = format!("omd-term-{}", uuid_like());
-                        eprintln!("[worker] calling terminal/create…");
                         match rpc
                             .call("terminal/create", json!({
                                 "agentId": session_id,
@@ -643,36 +1702,51 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             .await
                         {
                             Ok(_) => {
-                                eprintln!("[worker] terminal created {term_id}");
-                                *terminal_target.lock().await = Some((term_id.clone(), session_id.clone()));
+                                eprintln!("[worker] terminal created {} (pane={pane_id})", term_id);
+                                let (up_tx, mut up_rx) =
+                                    tokio::sync::mpsc::unbounded_channel::<TerminalUp>();
+                                terminal_up.lock().await.insert(term_id.clone(), up_tx);
+                                let _ = evs
+                                    .send(Ev::TerminalSession {
+                                        pane_id,
+                                        kind,
+                                        session_id: session_id.clone(),
+                                        term_id: term_id.clone(),
+                                    })
+                                    .await;
 
-                                // 每个终端独立 uplink channel；全局 sender 换成广播语义太重，
-                                // v1 只支持一个活跃终端：直接用全局 terminal_up 的接收端
-                                let mut up_rx = terminal_up_rx_slot.lock().await.take();
-                                if up_rx.is_none() {
-                                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<TerminalUp>();
-                                    *terminal_up_global.lock().await = Some(tx);
-                                    up_rx = Some(rx);
-                                }
-                                let Some(mut up_rx) = up_rx else { continue };
-
+                                // 每个终端一条 attach 流，输出带 term_id 回 UI
                                 let mux = mux.clone();
-                                let tx_out = terminal_out.clone();
-                                let attach_id = term_id.clone();
-                                let agent_for_attach = session_id.clone();
+                                let evs_t = evs.clone();
+                                let tid = term_id.clone();
+                                let agent = session_id.clone();
+                                let buf_t = terminal_buffers.clone();
                                 tokio::spawn(async move {
                                     let Ok(mut stream) = mux
-                                        .open("terminal/attach", json!({ "agentId": agent_for_attach, "id": attach_id }))
+                                        .open(
+                                            "terminal/attach",
+                                            json!({ "agentId": agent, "id": tid.clone() }),
+                                        )
                                         .await
-                                    else { return };
-                                    if std::env::var("DSH_GUI_AUTOTERM").is_ok() {
+                                    else {
+                                        return;
+                                    };
+                                    let mut seq: u64 = 0;
+                                    seq += 1;
+                                    stream.send_item(json!({
+                                        "type": "write",
+                                        "sequence": seq,
+                                        "data": terminal_browser_prelude(),
+                                    }));
+                                    // 需要的话，先把命令敲进去（TUI 之类）
+                                    if let Some(command) = run {
+                                        seq += 1;
                                         stream.send_item(json!({
                                             "type": "write",
-                                            "sequence": 1,
-                                            "data": "ls --color=always / | head -5; echo COLORS-DONE\r",
+                                            "sequence": seq,
+                                            "data": format!("{command}\r"),
                                         }));
                                     }
-                                    let mut seq: u64 = 0;
                                     loop {
                                         tokio::select! {
                                             item = up_rx.recv() => {
@@ -689,7 +1763,33 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                                             }
                                             frame = stream.recv() => {
                                                 match frame {
-                                                    Some(Frame::Item(v)) => { let _ = tx_out.send(v); }
+                                                    Some(Frame::Item(v)) => {
+                                                        let frame_type = v.get("type").and_then(|t| t.as_str());
+                                                        if matches!(frame_type, Some("snapshot") | Some("output")) {
+                                                            let data = if frame_type == Some("snapshot") {
+                                                                v.get("screen").and_then(|d| d.as_str()).unwrap_or_default().to_string()
+                                                            } else {
+                                                                v.get("data").and_then(|d| d.as_str()).unwrap_or_default().to_string()
+                                                            };
+                                                            if !data.is_empty() {
+                                                                let mut buffers = buf_t.lock().await;
+                                                                let entry = buffers
+                                                                    .entry(tid.clone())
+                                                                    .or_insert_with(String::new);
+                                                                entry.push_str(&data);
+                                                                if entry.len() > 2_000_000 {
+                                                                    let cut = entry.len() - 2_000_000;
+                                                                    entry.drain(..cut);
+                                                                }
+                                                            }
+                                                            let _ = evs_t
+                                                                .send(Ev::TerminalOutput {
+                                                                    term_id: tid.clone(),
+                                                                    data,
+                                                                })
+                                                                .await;
+                                                        }
+                                                    }
                                                     _ => break,
                                                 }
                                             }
@@ -698,13 +1798,144 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                                 });
                             }
                             Err(err) => {
-                                let _ = evs.send(Ev::Error(format!("terminal/create failed: {err}"))).await;
+                                let _ = evs
+                                    .send(Ev::Error(format!("terminal/create failed: {err}")))
+                                    .await;
                             }
                         }
                     }
-                    Cmd::TerminalInput(text) => {
-                        if let Some(tx) = terminal_up_global.lock().await.as_ref() {
-                            let _ = tx.send(TerminalUp::Write(text));
+                    Cmd::AttachTerminal {
+                        pane_id,
+                        session_id,
+                        term_id,
+                    } => {
+                        eprintln!("[worker] AttachTerminal pane={pane_id} term={term_id}");
+                        let (up_tx, mut up_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<TerminalUp>();
+                        terminal_up.lock().await.insert(term_id.clone(), up_tx);
+                        let mux_t = mux.clone();
+                        let evs_t = evs.clone();
+                        let buf_t = terminal_buffers.clone();
+                        let tid = term_id.clone();
+                        let agent = session_id.clone();
+                        tokio::spawn(async move {
+                            let Ok(mut stream) = mux_t
+                                .open("terminal/attach", json!({ "agentId": agent, "id": tid.clone() }))
+                                .await
+                            else {
+                                let _ = evs_t
+                                    .send(Ev::Error(format!("terminal attach failed: {tid}")))
+                                    .await;
+                                return;
+                            };
+                            let mut seq = 0u64;
+                            loop {
+                                tokio::select! {
+                                    item = up_rx.recv() => {
+                                        let Some(item) = item else { break };
+                                        seq += 1;
+                                        match item {
+                                            TerminalUp::Write(data) => stream.send_item(json!({
+                                                "type": "write", "sequence": seq, "data": data,
+                                            })),
+                                            TerminalUp::Resize(cols, rows) => stream.send_item(json!({
+                                                "type": "resize", "sequence": seq, "cols": cols, "rows": rows,
+                                            })),
+                                        }
+                                    }
+                                    frame = stream.recv() => {
+                                        match frame {
+                                            Some(Frame::Item(value)) => {
+                                                let frame_type = value.get("type").and_then(|v| v.as_str());
+                                                if !matches!(frame_type, Some("snapshot") | Some("output")) {
+                                                    continue;
+                                                }
+                                                let data = if frame_type == Some("snapshot") {
+                                                    value.get("screen").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                                                } else {
+                                                    value.get("data").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                                                };
+                                                if data.is_empty() {
+                                                    continue;
+                                                }
+                                                let mut buffers = buf_t.lock().await;
+                                                let entry = buffers.entry(tid.clone()).or_insert_with(String::new);
+                                                entry.push_str(&data);
+                                                if entry.len() > 2_000_000 {
+                                                    let cut = entry.len() - 2_000_000;
+                                                    entry.drain(..cut);
+                                                }
+                                                drop(buffers);
+                                                let _ = evs_t
+                                                    .send(Ev::TerminalOutput { term_id: tid.clone(), data })
+                                                    .await;
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Cmd::JobsWatch { session_id } => {
+                        let gen = jobs_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                        let Some(session_id) = session_id else { continue };
+                        let mux = mux.clone();
+                        let evs_jobs = evs.clone();
+                        let gen_ref = jobs_gen.clone();
+                        tokio::spawn(async move {
+                            let Ok(mut stream) = mux
+                                .open("job/list", json!({ "request": { "sessionId": session_id } }))
+                                .await
+                            else {
+                                return;
+                            };
+                            loop {
+                                if gen_ref.load(Ordering::SeqCst) != gen {
+                                    break;
+                                }
+                                match stream.recv().await {
+                                    Some(Frame::Item(v)) => {
+                                        let _ = evs_jobs.send(Ev::Jobs(v)).await;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        });
+                    }
+                    Cmd::JobKill {
+                        session_id,
+                        job_id,
+                    } => {
+                        let r = rpc
+                            .call(
+                                "job/kill",
+                                json!({
+                                    "request": { "sessionId": session_id, "jobId": job_id }
+                                }),
+                            )
+                            .await;
+                        eprintln!("[worker] job/kill {job_id}: {r:?}");
+                    }
+                    Cmd::Call {
+                        tag,
+                        endpoint,
+                        args,
+                    } => {
+                        let r = rpc.call(&endpoint, args).await;
+                        let _ = evs
+                            .send(Ev::Called {
+                                tag,
+                                endpoint,
+                                result: r.map_err(|e| e.to_string()),
+                            })
+                            .await;
+                    }
+                    Cmd::TerminalInput { term_id, data } => {
+                        let found = terminal_up.lock().await.get(&term_id).is_some();
+                        eprintln!("[worker] TerminalInput term={term_id} found={found} bytes={}", data.len());
+                        if let Some(tx) = terminal_up.lock().await.get(&term_id) {
+                            let _ = tx.send(TerminalUp::Write(data));
                         }
                     }
                     Cmd::Cancel => {
@@ -717,11 +1948,24 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             {
                                 Ok(_) => {
                                     eprintln!("[worker] cancel accepted");
-                                    let _ = evs.send(Ev::Line("(已取消)".into())).await;
+                                    let _ = evs.send(Ev::Line("(cancelled)".into())).await;
                                 }
                                 Err(err) => {
                                     let _ = evs.send(Ev::Error(format!("cancel failed: {err}"))).await;
                                 }
+                            }
+                        }
+                    }
+                    Cmd::CancelSession(session_id) => {
+                        if !session_id.is_empty() && !is_file_panel(&session_id) {
+                            match rpc
+                                .call("session/cancel", json!({
+                                    "request": { "sessionId": session_id }
+                                }))
+                                .await
+                            {
+                                Ok(_) => eprintln!("[worker] cancel accepted for {session_id}"),
+                                Err(err) => eprintln!("[worker] cancel {session_id} failed: {err}"),
                             }
                         }
                     }
@@ -731,7 +1975,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             let _ = evs
                                 .send(Ev::DshUpdate {
                                     done: false,
-                                    message: "正在下载并安装 dsh…".into(),
+                                    message: "downloading and installing dsh…".into(),
                                 })
                                 .await;
                             match dsh_host::install_dsh("latest").await {
@@ -740,7 +1984,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                                         .send(Ev::DshUpdate {
                                             done: true,
                                             message: format!(
-                                                "已更新到 v{}，关闭并重新打开 App 后生效。",
+                                                "Updated to v{}. Restart the app to apply.",
                                                 runtime.version
                                             ),
                                         })
@@ -750,7 +1994,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                                     let _ = evs
                                         .send(Ev::DshUpdate {
                                             done: true,
-                                            message: format!("更新失败：{err}"),
+                                            message: format!("update failed: {err}"),
                                         })
                                         .await;
                                 }
@@ -792,12 +2036,8 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             }
                         }
                     }
-                    Cmd::Prompt { text, request_id } => {
-                        eprintln!("[worker] Prompt cmd, current={current:?}");
-                        let Some(session_id) = current.clone() else {
-                            let _ = evs.send(Ev::Error("no session selected".into())).await;
-                            continue;
-                        };
+                    Cmd::Prompt { session_id, text, request_id } => {
+                        eprintln!("[worker] Prompt cmd, session={session_id}");
                         // follow 回放这条消息时带同一个 source.rpcId，用它压掉本地回显。
                         pending_echoes.push_back(request_id.clone());
                         if pending_echoes.len() > 16 {
@@ -826,25 +2066,22 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                     }
                 }
             }
-            term = terminal_out_rx.recv() => {
-                if let Some(value) = term {
-                    eprintln!("[worker] term frame: {}", value.to_string().chars().take(160).collect::<String>());
-                    if let Some(data) = value.get("data").and_then(|d| d.as_str()) {
-                        if value.get("type").and_then(|t| t.as_str()) == Some("output") {
-                            let _ = evs.send(Ev::TerminalOutput(data.to_string())).await;
-                        }
-                    }
-                }
-            }
             frame = frame_rx.recv() => {
-                if let Ok((gen, value)) = frame {
-                    if gen == generation.load(Ordering::SeqCst) {
+                if let Ok((session_id, mut value)) = frame {
+                    if std::env::var("OMD_TRACE_TOOLS").is_ok() {
+                        let raw = serde_json::to_string(&value).unwrap_or_default();
+                        eprintln!(
+                            "[trace] frame session={session_id} {}",
+                            &raw.chars().take(160).collect::<String>()
+                        );
+                    }
+                    {
                         if let Some(kind) = value.get("type").and_then(|v| v.as_str()) {
                             if kind == "assistant-stream" {
                                 let frame = value.get("frame").cloned().unwrap_or(Value::Null);
                                 match frame.get("type").and_then(|v| v.as_str()) {
                                     Some("start") => {
-                                        let _ = evs.send(Ev::StreamStart).await;
+                                        let _ = evs.send(Ev::StreamStart { session_id: session_id.clone() }).await;
                                     }
                                     Some("chunk") => {
                                         let chunk = frame.get("chunk").cloned().unwrap_or(Value::Null);
@@ -862,13 +2099,13 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                                             if let Some(text) =
                                                 chunk.get("text").and_then(|v| v.as_str())
                                             {
-                                                let _ = evs.send(Ev::StreamDelta(text.to_string())).await;
+                                                let _ = evs.send(Ev::StreamDelta { session_id: session_id.clone(), delta: text.to_string() }).await;
                                             }
                                         } else if chunk_type == "reasoning-delta" {
                                             if let Some(text) =
                                                 chunk.get("text").and_then(|v| v.as_str())
                                             {
-                                                let _ = evs.send(Ev::ReasoningDelta(text.to_string())).await;
+                                                let _ = evs.send(Ev::ReasoningDelta { session_id: session_id.clone(), delta: text.to_string() }).await;
                                             }
                                         }
                                     }
@@ -923,7 +2160,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             }
                         }
                         if event_type == Some("assistant/message") {
-                            let _ = evs.send(Ev::StreamEnd).await;
+                            let _ = evs.send(Ev::StreamEnd { session_id: session_id.clone() }).await;
                         }
                         if event_type == Some("turn/start") {
                             let _ = evs.send(Ev::AgentRunning(true)).await;
@@ -931,8 +2168,9 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                         if event_type == Some("turn/end") {
                             let _ = evs.send(Ev::AgentRunning(false)).await;
                         }
+                        stamp_tool_elapsed(&mut value, &mut tool_started);
                         if !skip_echo {
-                            let _ = evs.send(Ev::Event(value.clone())).await;
+                            let _ = evs.send(Ev::Event { session_id: session_id.clone(), value: value.clone() }).await;
                         }
                     }
                 }
@@ -993,7 +2231,7 @@ async fn refresh_sessions(rpc: &Rpc<'_>, evs: &Sender<Ev>) {
                 })
                 .unwrap_or_default();
             save_sessions_cache(&rows);
-            let _ = evs.send(Ev::Sessions(rows)).await;
+            let _ = evs.send(Ev::DshSessions(rows)).await;
         }
         Err(err) => {
             let _ = evs.send(Ev::Error(format!("session/list failed: {err}"))).await;
@@ -1001,7 +2239,7 @@ async fn refresh_sessions(rpc: &Rpc<'_>, evs: &Sender<Ev>) {
     }
 }
 
-/// host 在每轮注入的上下文，不是用户输入。
+/// host 在每轮注入的context，不是用户输入。
 fn is_injected(text: &str) -> bool {
     const MARKERS: [&str; 5] = [
         "<system-reminder>",
@@ -1084,7 +2322,7 @@ fn push_blocks(node: &Value, out: &mut String) {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-enum Block {
+enum TranscriptBlock {
     User { uid: u64, text: String },
     Assistant { uid: u64, text: String },
     Reasoning { uid: u64, text: String, expanded: bool },
@@ -1098,16 +2336,60 @@ enum Block {
         is_error: bool,
         running: bool,
         expanded: bool,
+        /// 从 tool/call 到 tool/result 的耗时（我们自己量的）
+        duration_ms: Option<u64>,
+        /// 从输出里 best-effort 解析出的退出码（dsh 不提供这个字段）
+        exit_code: Option<i32>,
     },
-    TurnDivider { turn: i64 },
     Image(Arc<RenderImage>),
     Notice(String),
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct StreamState {
+    /// 已收到的全部文本（可能比显示的多）
     text: String,
+    /// 已收到的字符总数（增量维护，避免每帧 chars().count()）
+    total_chars: usize,
+    /// 已经"打"出来的字符数
+    revealed: usize,
     reasoning: String,
+    /// 流是否已结束（结束后把尾巴吐完就收尾）
+    ended: bool,
+    /// 打字机 ticker 是否在跑
+    ticking: bool,
+}
+
+impl Default for StreamState {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            total_chars: 0,
+            revealed: 0,
+            reasoning: String::new(),
+            ended: false,
+            ticking: false,
+        }
+    }
+}
+
+/// 对"一条完整回复"做逐字显示（dsh 有时不推 text-delta，只有最终 message）。
+struct Typing {
+    uid: u64,
+    total: usize,
+    revealed: usize,
+    ticking: bool,
+}
+
+impl StreamState {
+    /// 当前应该显示的前缀（逐字打出来的部分）。
+    fn revealed_text(&self) -> String {
+        if self.revealed >= self.total_chars {
+            self.text.clone()
+        } else {
+            self.text.chars().take(self.revealed).collect()
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1148,8 +2430,26 @@ struct Root {
     selected: Option<String>,
     spaces: Vec<Space>,
     current_space: Option<String>,
-    show_switcher: bool,
-    show_sessions: bool,
+    /// 所有终端 pane（下 / 右 / 标签页）
+    panes: Vec<Block>,
+    /// 正在拖的分隔条：(pane_id, 起点像素, 起始尺寸) —— 旧版（保留给文件栏）
+    drag_pane: Option<(u64, f32, f32)>,
+    /// 布局树分隔条：(split_id, 分隔条序号, 起点像素, 起始权重)
+    drag_split: Option<(u64, usize, f32, Vec<f32>)>,
+    /// 拖动 panel 头：(leaf, 起点 x, 起点 y)
+    drag_leaf: Option<(u64, f32, f32)>,
+    /// 哪些 session 是终端 tab（渲染成整块终端而不是聊天）
+    term_tabs: std::collections::HashSet<String>,
+    /// 命令面板（Ctrl+K）：搜索 + 命令 / 会话 / 空间。
+    show_palette: bool,
+    palette_tab: PaletteTab,
+    palette_index: usize,
+    palette_input: Entity<InputState>,
+    _keys_sub: Option<Subscription>,
+    /// session/search 的结果 + 上次搜的词
+    search_hits: Vec<Value>,
+    search_query: String,
+    search_error: Option<String>,
     followed_once: bool,
     restored_ui: bool,
     current_model: String,
@@ -1157,16 +2457,150 @@ struct Root {
     context_window: Option<u64>,
     git_cache_cwd: String,
     git_cache: String,
+    git_status_root: String,
+    git_branch: String,
+    git_status: std::collections::HashMap<String, char>,
+    git_changes: Vec<GitChange>,
+    git_repo: bool,
+    git_error: Option<String>,
+    /// 文件栏正在显示改动列表，而不是文件树。
+    git_panel: bool,
+    /// 下一次提交走 `git commit --amend`。
+    git_amend: bool,
+    /// 文件栏标题上的「…」菜单。
+    files_menu: bool,
+    /// 点分支图标后，在图标行下面显示当前分支。
+    files_branch_line: bool,
     show_models: bool,
+    /// 模型选择器里的搜索框
+    model_input: Entity<InputState>,
+    /// 收藏的模型（"provider/model"）
+    model_favorites: std::collections::HashSet<String>,
+    /// panel 的自定义名字（dsh session id -> 名字），盖过 dsh 的自动标题
+    panel_names: std::collections::HashMap<String, String>,
+    /// 后台任务清单（job/list 的整份 rows）
+    jobs: Vec<Value>,
+    show_jobs: bool,
+    /// tab 下拉清单（Firefox 的"列出全部标签"）
+    show_tab_list: bool,
+    /// tab 条的横向滚动位置（切 tab 时自动滚到可见）
+    tab_scroll: ScrollHandle,
+    /// 布局还没量出来时先记下"要滚到哪个 tab"，下一帧再滚
+    pending_tab_scroll: Option<(usize, usize)>,
+    /// 每个 tab 的宽度（按标题文字估，夹在 56..220）
+    tab_widths: Vec<f32>,
+    /// 冒烟钩子：启动后自动按几次右箭头
+    scroll_tab_steps: usize,
+    settings_tab: SettingsTab,
+    /// pluginManager/listPlugins 的结果
+    plugins_doc: Value,
+    account_doc: Value,
+    settings_tab_error: Option<String>,
+    /// 左侧文件栏（纯 Rust 读盘，Tern 风格）
+    files_sidebar: bool,
+    files_root: String,
+    files_width: f32,
+    files_expanded: std::collections::HashSet<String>,
+    files_cache: std::collections::HashMap<String, Vec<FileItem>>,
+    files_selected: Option<String>,
+    /// 打开中的编辑器：panel id（`file:<path>`）→ 编辑器
+    /// LSP：后台线程请求端
+    lsp_tx: std::sync::mpsc::Sender<lsp::Cmd>,
+    /// LSP 事件发送端（provider 回传跨文件编辑用）
+    lsp_ev_tx: async_channel::Sender<lsp::Event>,
+    /// 待落到 open buffer 的跨文件编辑（render 里应用）
+    pending_workspace_edits: Vec<(String, Vec<lsp_types::TextEdit>)>,
+    /// LSP 事件循环（诊断回来 → 装饰）
+    _lsp_events: Option<Task<()>>,
+    /// 每个编辑器挂着的诊断装饰集合（path -> range/gutter）
+    editor_diags: std::collections::HashMap<
+        String,
+        (RangeDecorationCollection, GutterDecorationCollection),
+    >,
+    /// path -> (errors, warnings)
+    diag_counts: std::collections::HashMap<String, (usize, usize)>,
+    /// server key -> 状态
+    lsp_state: std::collections::HashMap<String, lsp::ServerState>,
+    /// 已经 didOpen 过的文件路径
+    lsp_active: std::collections::HashSet<String>,
+    /// 每个编辑器共享的"补全项 additionalTextEdits"缓存
+    completion_extras:
+        std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<lsp_types::TextEdit>)>>>>,
+    /// 接受补全后待应用的额外编辑（path, edits）——渲染里应用（那里才有 window）
+    pending_extra_edits: Vec<(String, Vec<lsp_types::TextEdit>)>,
+    /// 冒烟钩子：等第一个 LSP 文档打开后触发一次补全
+    lsp_complete_pending: bool,
+    /// 冒烟钩子：等第一个 LSP 文档打开后触发一次 code action
+    lsp_action_pending: bool,
+    /// 冒烟钩子：等第一个 LSP 文档打开后拉一次语义高亮
+    lsp_semantic_pending: bool,
+    /// 冒烟钩子：查一次补全并"接受"它，验证 additionalTextEdits
+    lsp_accept_pending: bool,
+    /// 冒烟钩子：给编辑器发两个真实按键，验证"打开就能编辑"
+    type_test_pending: bool,
+    /// 冒烟钩子：查一次 code action 并执行第一个（验证跨文件编辑）
+    lsp_apply_pending: bool,
+    /// 冒烟钩子：等空间就绪后走一次 panel 头分屏按钮的路径
+    split_click_pending: bool,
+    /// 冒烟钩子：等空间就绪后分屏装一个 dsh 面板
+    split_dsh_pending: bool,
+    /// 当前悬停展开的分屏菜单：(leaf, 方向)
+    split_hover: Option<(u64, SplitDir)>,
+    /// 正在等新会话落到哪一个分屏：(leaf, 方向)
+    pending_split: Option<(u64, SplitDir)>,
+    /// 最近点过的终端 pane。getCurrentPane 对不上 tty 时用它。
+    focused_pane: Option<u64>,
+    /// focusPane 落到下一次 render（那里才有 Window）。
+    focus_pending: Option<u64>,
+    /// pane 建好之前暂存 cwd 和启动命令。
+    pending_term_meta: std::collections::HashMap<u64, (Option<String>, Option<String>)>,
+    /// 非活跃会话的消息快照（切走时存，切回时取）
+    chat_snapshots: std::collections::HashMap<String, (Vec<TranscriptBlock>, usize)>,
+    /// 非活跃 dsh block 正在流式输出的文本
+    chat_streams: std::collections::HashMap<String, StreamState>,
+    /// 非活跃 chat pane 的滚动位置
+    chat_scrolls: std::collections::HashMap<u64, ScrollHandle>,
+    /// 关菜单的"代"计数：离开按钮后延迟关，进菜单则作废
+    split_hover_gen: u64,
+    /// 编辑器状态 + 语言（纯 Rust 读盘 + syntect 高亮）
+    editors: std::collections::HashMap<String, FileEditor>,
+    _editor_sub: Option<Subscription>,
+    /// InputEditsEvent 订阅（补全接受检测）
+    _edits_sub: Option<Subscription>,
+    /// settings/describe 的结果
+    settings_doc: Value,
+    settings_loading: bool,
+    settings_error: Option<String>,
+    /// 正在编辑的设置项：(ns, path, revision, 是否数字)
+    settings_edit: Option<(String, Vec<String>, i64, bool)>,
+    settings_input: Entity<InputState>,
+    plugins_input: Entity<InputState>,
+    /// 下一个新 panel 要挂进的 tab（panel 条的「+」用）
+    pending_panel_tab: Option<String>,
+    /// 拖动 panel：panel id + 锚点 x（每越过一档就挪一格）
+    tab_drag: Option<(String, f32)>,
+    /// 正在改名的是谁
+    renaming: Option<RenameTarget>,
+    rename_input: Entity<InputState>,
+    /// 改动列表底部的提交说明。和文件改名的输入框分开。
+    commit_input: Entity<InputState>,
     model_loading: bool,
     model_catalog: Value,
-    items: Vec<Block>,
-    term: Option<Term>,
-    term_screen: Vec<Vec<Span>>,
-    term_focus: FocusHandle,
-    show_terminal: bool,
+    items: Vec<TranscriptBlock>,
+    /// 只在尾部渲染这么多块（usize::MAX = 全显示）。
+    reveal_limit: usize,
+    reveal_running: bool,
     streaming: Option<StreamState>,
+    /// 刚发过消息，等下一条完整回复要逐字显示
+    awaiting_reply: bool,
+    /// 正在逐字显示的 block
+    typing: Option<Typing>,
     input: Entity<InputState>,
+    /// 每个分屏 dsh block 的独立输入框。
+    block_inputs: Vec<Entity<InputState>>,
+    block_input_sessions: Vec<Option<String>>,
+    block_clear_pending: Vec<usize>,
+    _block_input_subs: Vec<Subscription>,
     question_input: Entity<InputState>,
     question: Option<PendingQuestion>,
     show_settings: bool,
@@ -1185,15 +2619,676 @@ struct Root {
     _enter_sub: Subscription,
 }
 
+async fn serve_control(
+    path: PathBuf,
+    http: reqwest::Client,
+    base: url::Url,
+    mux: Mux,
+    evs: Sender<Ev>,
+    terminal_up: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<TerminalUp>>,
+        >,
+    >,
+    terminal_buffers: Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    let _ = std::fs::remove_file(&path);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let listener = match UnixListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("[control] bind {} failed: {err}", path.display());
+            return;
+        }
+    };
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    eprintln!("[control] listening on {}", path.display());
+
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let http = http.clone();
+        let base = base.clone();
+        let mux = mux.clone();
+        let evs = evs.clone();
+        let terminal_up = terminal_up.clone();
+        let terminal_buffers = terminal_buffers.clone();
+        tokio::spawn(async move {
+            let (read_half, mut write_half) = stream.into_split();
+            let mut lines = BufReader::new(read_half).lines();
+            let Ok(Some(line)) = lines.next_line().await else {
+                return;
+            };
+            let request: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+            let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            let params = request.get("params").cloned().unwrap_or(Value::Null);
+            let response = match method {
+                "block.list" => {
+                    let up = terminal_up.lock().await;
+                    let buffers = terminal_buffers.lock().await;
+                    let blocks: Vec<Value> = up
+                        .keys()
+                        .map(|id| {
+                            json!({
+                                "id": id,
+                                "kind": "terminal",
+                                "bytes": buffers.get(id).map(|text| text.len()).unwrap_or(0),
+                            })
+                        })
+                        .collect();
+                    json!({ "ok": true, "result": { "blocks": blocks } })
+                }
+                "block.createTerminal" => {
+                    let cwd = params
+                        .get("cwd")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("/tmp")
+                        .to_string();
+                    let command = params
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .map(|v| v.to_string());
+                    let rpc = Rpc::new(&http, &base);
+                    let created = match rpc
+                        .call("session/create", json!({ "request": { "cwd": cwd } }))
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            let _ = write_half
+                                .write_all(
+                                    json!({ "ok": false, "error": format!("session/create: {err}") })
+                                        .to_string()
+                                        .as_bytes(),
+                                )
+                                .await;
+                            let _ = write_half.write_all(b"\n").await;
+                            return;
+                        }
+                    };
+                    let Some(session_id) = created
+                        .get("sessionId")
+                        .and_then(|v| v.as_str())
+                        .map(|v| v.to_string())
+                    else {
+                        let _ = write_half
+                            .write_all(
+                                json!({ "ok": false, "error": "session/create returned no sessionId" })
+                                    .to_string()
+                                    .as_bytes(),
+                            )
+                            .await;
+                        let _ = write_half.write_all(b"\n").await;
+                        return;
+                    };
+                    let term_id = format!("omd-term-{}", uuid_like());
+                    if let Err(err) = rpc
+                        .call("terminal/create", json!({
+                            "agentId": session_id,
+                            "request": { "id": term_id.clone(), "cols": 100, "rows": 30 }
+                        }))
+                        .await
+                    {
+                        let _ = write_half
+                            .write_all(
+                                json!({ "ok": false, "error": format!("terminal/create: {err}") })
+                                    .to_string()
+                                    .as_bytes(),
+                            )
+                            .await;
+                        let _ = write_half.write_all(b"\n").await;
+                        return;
+                    }
+
+                    let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<TerminalUp>();
+                    terminal_up.lock().await.insert(term_id.clone(), up_tx.clone());
+                    terminal_buffers
+                        .lock()
+                        .await
+                        .insert(term_id.clone(), String::new());
+                    let pane_id = next_pane_id();
+                    let _ = evs
+                        .send(Ev::TerminalSession {
+                            pane_id,
+                            kind: BlockPlacement::Right,
+                            session_id: session_id.clone(),
+                            term_id: term_id.clone(),
+                        })
+                        .await;
+
+                    let mux_t = mux.clone();
+                    let evs_t = evs.clone();
+                    let buffers_t = terminal_buffers.clone();
+                    let tid = term_id.clone();
+                    let agent = session_id.clone();
+                    tokio::spawn(async move {
+                        let Ok(mut stream) = mux_t
+                            .open("terminal/attach", json!({ "agentId": agent, "id": tid.clone() }))
+                            .await
+                        else {
+                            return;
+                        };
+                        let mut seq = 0u64;
+                        seq += 1;
+                        stream.send_item(json!({
+                            "type": "write",
+                            "sequence": seq,
+                            "data": terminal_browser_prelude(),
+                        }));
+                        if let Some(command) = command {
+                            seq += 1;
+                            stream.send_item(json!({
+                                "type": "write",
+                                "sequence": seq,
+                                "data": format!("{command}\r"),
+                            }));
+                        }
+                        loop {
+                            tokio::select! {
+                                item = up_rx.recv() => {
+                                    let Some(item) = item else { break };
+                                    seq += 1;
+                                    match item {
+                                        TerminalUp::Write(data) => stream.send_item(json!({
+                                            "type": "write", "sequence": seq, "data": data,
+                                        })),
+                                        TerminalUp::Resize(cols, rows) => stream.send_item(json!({
+                                            "type": "resize", "sequence": seq, "cols": cols, "rows": rows,
+                                        })),
+                                    }
+                                }
+                                frame = stream.recv() => {
+                                    match frame {
+                                        Some(Frame::Item(value)) => {
+                                            let frame_type = value.get("type").and_then(|v| v.as_str());
+                                            if matches!(frame_type, Some("snapshot") | Some("output")) {
+                                                let data = if frame_type == Some("snapshot") {
+                                                    value.get("screen").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                                                } else {
+                                                    value.get("data").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                                                };
+                                                if !data.is_empty() {
+                                                    let mut buffers = buffers_t.lock().await;
+                                                    let entry = buffers
+                                                        .entry(tid.clone())
+                                                        .or_insert_with(String::new);
+                                                    entry.push_str(&data);
+                                                    if entry.len() > 2_000_000 {
+                                                        let cut = entry.len() - 2_000_000;
+                                                        entry.drain(..cut);
+                                                    }
+                                                }
+                                                let _ = evs_t
+                                                    .send(Ev::TerminalOutput {
+                                                        term_id: tid.clone(),
+                                                        data,
+                                                    })
+                                                    .await;
+                                            }
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    json!({
+                        "ok": true,
+                        "result": {
+                            "id": term_id,
+                            "sessionId": session_id,
+                            "paneId": pane_id,
+                        }
+                    })
+                }
+                "block.write" => {
+                    let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let data = params.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                    if let Some(tx) = terminal_up.lock().await.get(id) {
+                        let _ = tx.send(TerminalUp::Write(data.to_string()));
+                        json!({ "ok": true, "result": { "bytes": data.len() } })
+                    } else {
+                        json!({ "ok": false, "error": format!("unknown block {id}") })
+                    }
+                }
+                "hello" | "getCurrentPane" | "split" | "listPanes" | "neighbor" | "sendText"
+                | "pasteKey" | "focusPane" => {
+                    let id = request.get("id").cloned().unwrap_or(Value::Null);
+                    if method == "hello" {
+                        json!({
+                            "id": id,
+                            "result": {
+                                "name": "omd",
+                                "methods": ["getCurrentPane", "split", "listPanes", "neighbor", "sendText", "pasteKey", "focusPane"],
+                            }
+                        })
+                    } else {
+                        let call = match method {
+                            "getCurrentPane" => TbCall::Current {
+                                tty: params.get("tty").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                cwd: params
+                                    .get("cwd")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                                    .or_else(|| {
+                                        request
+                                            .get("caller")
+                                            .and_then(|v| v.get("cwd"))
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string())
+                                    }),
+                            },
+                            "listPanes" => TbCall::List,
+                            "neighbor" => TbCall::Neighbor {
+                                pane: params
+                                    .get("from")
+                                    .and_then(|v| v.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                direction: params
+                                    .get("direction")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                            },
+                            "split" => TbCall::Split {
+                                from: params
+                                    .get("from")
+                                    .and_then(|v| v.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                direction: params
+                                    .get("direction")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("right")
+                                    .to_string(),
+                                command: params
+                                    .get("command")
+                                    .and_then(|v| v.as_array())
+                                    .map(|items| {
+                                        items
+                                            .iter()
+                                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                                size: params.get("size").and_then(|v| v.as_f64()).map(|n| n as f32),
+                            },
+                            "sendText" => TbCall::Send {
+                                pane: params.get("pane").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                text: params.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            },
+                            "pasteKey" => TbCall::Paste {
+                                pane: params.get("pane").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            },
+                            _ => TbCall::Focus {
+                                pane: params.get("pane").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            },
+                        };
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        if evs
+                            .send(Ev::Tb {
+                                call,
+                                reply: reply_tx,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            json!({ "id": id, "error": { "message": "omd ui is gone" } })
+                        } else {
+                            match tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx).await {
+                                Ok(Ok(result)) => json!({ "id": id, "result": result }),
+                                Ok(Err(_)) => json!({ "id": id, "error": { "message": "omd dropped the request" } }),
+                                Err(_) => json!({ "id": id, "error": { "message": "omd did not answer" } }),
+                            }
+                        }
+                    }
+                }
+                "block.read" => {
+                    let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let cursor = params
+                        .get("cursor")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    let buffers = terminal_buffers.lock().await;
+                    if let Some(data) = buffers.get(id) {
+                        let start = cursor.min(data.len());
+                        let bytes = &data.as_bytes()[start..];
+                        let text = String::from_utf8_lossy(bytes).to_string();
+                        json!({
+                            "ok": true,
+                            "result": {
+                                "id": id,
+                                "data": text,
+                                "cursor": data.len(),
+                            }
+                        })
+                    } else {
+                        json!({ "ok": false, "error": format!("unknown block {id}") })
+                    }
+                }
+                _ => json!({ "ok": false, "error": format!("unknown method {method}") }),
+            };
+            let _ = write_half.write_all(response.to_string().as_bytes()).await;
+            let _ = write_half.write_all(b"\n").await;
+        });
+    }
+}
+
+
+fn same_cwd(a: &str, b: &str) -> bool {
+    !a.is_empty() && a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
 impl Root {
+    fn terminal_panes(&self) -> Vec<&Block> {
+        self.panes
+            .iter()
+            .filter(|pane| !pane.term_id.is_empty())
+            .collect()
+    }
+
+    fn pane_ref(pane: &Block) -> Value {
+        json!({
+            "id": pane.id.to_string(),
+            "tab": pane.tab_id.clone().unwrap_or_else(|| "main".to_string()),
+        })
+    }
+
+    fn tb_call(&mut self, call: TbCall) -> Value {
+        match call {
+            TbCall::Current { cwd, .. } => {
+                let terminals = self.terminal_panes();
+                let by_cwd = cwd.as_deref().and_then(|cwd| {
+                    let hits: Vec<&&Block> = terminals
+                        .iter()
+                        .filter(|pane| pane.cwd.as_deref().is_some_and(|dir| same_cwd(dir, cwd)))
+                        .filter(|pane| {
+                            !pane
+                                .command
+                                .as_deref()
+                                .is_some_and(|cmd| cmd.contains("terminal-browser"))
+                        })
+                        .collect();
+                    hits.iter()
+                        .find(|pane| Some(pane.id) == self.focused_pane)
+                        .or_else(|| hits.first())
+                        .map(|pane| Self::pane_ref(pane))
+                });
+                let pane = by_cwd.or_else(|| {
+                    self.focused_pane
+                        .and_then(|id| terminals.iter().find(|pane| pane.id == id))
+                        .or_else(|| terminals.last())
+                        .map(|pane| Self::pane_ref(pane))
+                });
+                json!({ "pane": pane })
+            }
+            TbCall::List => {
+                let panes: Vec<Value> = self
+                    .terminal_panes()
+                    .into_iter()
+                    .map(|pane| {
+                        json!({
+                            "id": pane.id.to_string(),
+                            "tab": pane.tab_id.clone().unwrap_or_else(|| "main".to_string()),
+                            "tty": Value::Null,
+                            "command": pane.command,
+                        })
+                    })
+                    .collect();
+                json!({ "panes": panes })
+            }
+            TbCall::Neighbor { pane, direction } => {
+                let id: u64 = pane.parse().unwrap_or(0);
+                let dir = match direction.as_str() {
+                    "left" => Some((SplitDir::Row, -1)),
+                    "right" => Some((SplitDir::Row, 1)),
+                    "up" => Some((SplitDir::Col, -1)),
+                    "down" => Some((SplitDir::Col, 1)),
+                    _ => None,
+                };
+                let found = dir.and_then(|(axis, delta)| {
+                    self.current_space
+                        .as_ref()
+                        .and_then(|sid| self.spaces.iter().find(|space| &space.id == sid))
+                        .and_then(|space| space.current_tab())
+                        .and_then(|tab| tab.layout.neighbor(id, axis, delta))
+                });
+                let pane = found.and_then(|leaf| {
+                    self.panes
+                        .iter()
+                        .find(|pane| pane.id == leaf)
+                        .map(Self::pane_ref)
+                });
+                json!({ "pane": pane })
+            }
+            TbCall::Split {
+                from,
+                direction,
+                command,
+                size,
+            } => {
+                let from_id: u64 = from.parse().unwrap_or(0);
+                let (axis, flip) = match direction.as_str() {
+                    "left" => (SplitDir::Row, true),
+                    "up" => (SplitDir::Col, true),
+                    "down" => (SplitDir::Col, false),
+                    _ => (SplitDir::Row, false),
+                };
+                let new_id = next_pane_id();
+                let cwd = self
+                    .panes
+                    .iter()
+                    .find(|pane| pane.id == from_id)
+                    .and_then(|pane| pane.cwd.clone())
+                    .or_else(|| {
+                        self.current_space.as_ref().and_then(|sid| {
+                            self.spaces
+                                .iter()
+                                .find(|space| &space.id == sid)
+                                .map(|space| space.cwd.clone())
+                        })
+                    });
+                if let Some(space) = self
+                    .current_space
+                    .clone()
+                    .and_then(|sid| self.spaces.iter_mut().find(|space| space.id == sid))
+                {
+                    if let Some(tab) = space
+                        .active_panel
+                        .clone()
+                        .and_then(|id| space.panels.iter_mut().find(|tab| tab.id == id))
+                    {
+                        let leaf = if tab.layout.has(from_id) { from_id } else { 0 };
+                        tab.layout.split(leaf, axis, new_id);
+                        if flip {
+                            tab.layout.swap_neighbor(new_id, axis, -1);
+                        }
+                        if let Some(weight) = size {
+                            tab.layout.set_leaf_weight(new_id, weight);
+                        }
+                        tab.maximized = None;
+                    }
+                }
+                let run = if command.is_empty() {
+                    None
+                } else {
+                    Some(shell_join(&command))
+                };
+                self.pending_term_meta
+                    .insert(new_id, (cwd.clone(), run.clone()));
+                let _ = self.cmds.send_blocking(Cmd::NewTerminal {
+                    pane_id: new_id,
+                    kind: axis.pane_kind(),
+                    cwd,
+                    run,
+                });
+                json!({})
+            }
+            TbCall::Send { pane, text } => {
+                if let Some(term_id) = self
+                    .panes
+                    .iter()
+                    .find(|item| item.id.to_string() == pane)
+                    .map(|item| item.term_id.clone())
+                    .filter(|id| !id.is_empty())
+                {
+                    let _ = self.cmds.send_blocking(Cmd::TerminalInput {
+                        term_id,
+                        data: text,
+                    });
+                }
+                json!({})
+            }
+            TbCall::Paste { pane } => {
+                if let Some(term_id) = self
+                    .panes
+                    .iter()
+                    .find(|item| item.id.to_string() == pane)
+                    .map(|item| item.term_id.clone())
+                    .filter(|id| !id.is_empty())
+                {
+                    let _ = self.cmds.send_blocking(Cmd::TerminalInput {
+                        term_id,
+                        data: "\u{16}".to_string(),
+                    });
+                }
+                json!({})
+            }
+            TbCall::Focus { pane } => {
+                if let Ok(id) = pane.parse::<u64>() {
+                    if self.panes.iter().any(|item| item.id == id) {
+                        self.focused_pane = Some(id);
+                        self.focus_pending = Some(id);
+                    }
+                }
+                json!({})
+            }
+        }
+    }
+
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        stamp("Root::new enter");
         eprintln!("[ui] root created");
         window.set_window_title("OMD");
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("What are we cooking?"));
+        // 浏览器块（实验）：CEF windowless 渲染，帧进 on_paint；CDP 端口留给 agent。
+        if std::env::var("OMD_BROWSER").is_ok() {
+            let url = std::env::var("OMD_BROWSER_URL")
+                .unwrap_or_else(|_| "https://example.com".to_string());
+            let scale = window.scale_factor();
+            let index = if std::env::var("OMD_BROWSER_CHILD").is_ok() {
+                // 原生子窗口：CEF 直接画进 GPUI 窗口，零拷贝。
+                let parent = match window.native_window_handle() {
+                    Some(gpui_kit::NativeWindowHandle::X11(id)) => Some(u64::from(id)),
+                    _ => None,
+                };
+                match parent {
+                    Some(parent) => {
+                        let index = browser::create_child(
+                            parent,
+                            (40. * scale) as i32,
+                            (120. * scale) as i32,
+                            (800. * scale) as i32,
+                            (520. * scale) as i32,
+                            &url,
+                        );
+                        eprintln!("[browser] child parent={parent:#x} index={index:?}");
+                        index
+                    }
+                    None => {
+                        eprintln!("[browser] no X11 parent, falling back to OSR");
+                        browser::create(1000, 700, &url)
+                    }
+                }
+            } else {
+                browser::create(1000, 700, &url)
+            };
+            eprintln!("[browser] created index={index:?}");
+            // CEF 的消息泵必须跑在 UI 线程上（external_message_pump）。
+            cx.spawn(async move |this, cx: &mut AsyncApp| {
+                let mut last_seq = u64::MAX;
+                let mut last_accel_seq = u64::MAX;
+                let mut shot_done = false;
+                let mut frames = 0u64;
+                let start = std::time::Instant::now();
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(8))
+                        .await;
+                    browser::pump();
+                    if let Some(index) = index {
+                        // GPU 路径：帧到了就请求一次重绘（GPUI 不会自己刷新）。
+                        if let Some(accel) = browser::latest_accel(index) {
+                            if accel.seq != last_accel_seq {
+                                last_accel_seq = accel.seq;
+                                let _ = this.update(cx, |_, cx| cx.notify());
+                                for handle in cx.update(|cx| cx.windows()) {
+                                    let _ = handle.update(cx, |_, window, _| window.refresh());
+                                }
+                                if std::env::var("OMD_BROWSER_DEBUG").is_ok() {
+                                    eprintln!("[pump] accel seq={} refreshed", accel.seq);
+                                }
+                            }
+                        }
+                        if let Some(frame) = browser::latest_frame(index) {
+                            if frame.seq != last_seq {
+                                last_seq = frame.seq;
+                                frames += 1;
+                                if frames <= 3 || frames % 30 == 0 {
+                                    eprintln!(
+                                        "[browser] frame #{frames} {}x{} {:.2}s",
+                                        frame.width,
+                                        frame.height,
+                                        start.elapsed().as_secs_f32()
+                                    );
+                                    if frames == 1 {
+                                        // 冒烟：首帧落盘，肉眼核对页面内容。
+                                        let mut rgba = frame.bgra.clone();
+                                        for px in rgba.chunks_exact_mut(4) {
+                                            px.swap(0, 2);
+                                        }
+                                        if let Some(img) = image::RgbaImage::from_raw(
+                                            frame.width,
+                                            frame.height,
+                                            rgba,
+                                        ) {
+                                            let _ = img.save("/tmp/cef-osr-frame.png");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .detach();
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Message… Enter to send · Shift+Enter for newline"));
         let question_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("自定义回答（可选）"));
-        // 启动即聚焦输入框
-        input.read(cx).focus_handle(cx).focus(window, cx);
+            cx.new(|cx| InputState::new(window, cx).placeholder("Custom answer (optional)"));
+        let model_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search models…"));
+        let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Name…"));
+        let commit_input = cx.new(|cx| InputState::new(window, cx).placeholder("Why this change..."));
+        let settings_input = cx.new(|cx| InputState::new(window, cx).placeholder("Value…"));
+        let plugins_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter plugins…"));
+        let palette_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Run a command or go to a pane…"));
+        // 启动即聚焦输入框（OMD_COMPACT=1 时故意不聚焦，用来看收起的输入条）
+        if std::env::var("OMD_COMPACT").is_ok() {
+            cx.focus_handle().focus(window, cx);
+        } else {
+            input.read(cx).focus_handle(cx).focus(window, cx);
+        }
 
         let enter_sub = cx.subscribe(&input, |this, input_entity, ev: &InputEvent, cx| {
             if let InputEvent::Change = ev {
@@ -1209,22 +3304,65 @@ impl Root {
                 }
             }
         });
+        let mut block_inputs: Vec<Entity<InputState>> = Vec::new();
+        let mut block_input_subs: Vec<Subscription> = Vec::new();
+        for slot in 0..64 {
+            let block_input = cx.new(|cx| {
+                InputState::new(window, cx).placeholder("Message… Enter to send")
+            });
+            let sub = cx.subscribe(&block_input, move |this, input_entity, ev: &InputEvent, cx| {
+                if let InputEvent::Change = ev {
+                    cx.notify();
+                }
+                if let InputEvent::PressEnter { shift, .. } = ev {
+                    if !*shift {
+                        this.send_block_prompt(slot, &input_entity, cx);
+                    }
+                }
+            });
+            block_inputs.push(block_input);
+            block_input_subs.push(sub);
+        }
         let (cmd_tx, cmd_rx) = async_channel::unbounded::<Cmd>();
         let (ev_tx, ev_rx) = async_channel::unbounded::<Ev>();
         spawn_worker(cmd_rx, ev_tx);
+        stamp("worker spawned");
 
         let evs = ev_rx.clone();
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             eprintln!("[ui] event loop started");
-            while let Ok(ev) = evs.recv().await {
-                eprintln!("[ui] event received");
+            // 批量应用：baseline 回放/流式增量会一次性推很多帧，逐条 notify 会让 UI 把整份
+            // transcript 重建几十上百次。先排干队列，再单次 apply+notify。
+            while let Ok(first) = evs.recv().await {
+                let mut batch = vec![first];
+                while let Ok(next) = evs.try_recv() {
+                    batch.push(next);
+                    if batch.len() >= 4096 {
+                        break;
+                    }
+                }
+                eprintln!("[ui] event received x{}", batch.len());
+                let ev_start = std::time::Instant::now();
+                let mut names: Vec<&'static str> = Vec::new();
                 let ok = this.update(cx, |root, cx| {
-                    root.apply(ev);
+                    for ev in batch {
+                        if names.len() < 4 {
+                            names.push(ev_name(&ev));
+                        }
+                        root.apply(ev, cx);
+                    }
+                    if root.reveal_pending() {
+                        root.start_reveal(cx);
+                    }
                     cx.notify();
                     // 后台数据到达时强制请求重绘：Wayland 下被遮挡/未激活的窗口
                     // 没有持续的 frame callback，仅 notify 可能不触发绘制
                     cx.refresh_windows();
                 });
+                let ev_ms = ev_start.elapsed().as_secs_f64() * 1000.0;
+                if ev_ms >= 3.0 {
+                    stamp(format!("apply {:?} took {ev_ms:.2}ms", names));
+                }
                 if ok.is_err() {
                     break;
                 }
@@ -1232,10 +3370,27 @@ impl Root {
         })
         .detach();
 
-        let (spaces, current_space, selected, saved_model, saved_provider) = load_ui_state();
+        let state = load_ui_state();
+        let (spaces, current_space, selected, saved_model, saved_provider) = (
+            state.spaces,
+            state.current_space,
+            state.selected,
+            state.model,
+            state.provider,
+        );
+        stamp(format!("load_ui_state done ({} spaces)", spaces.len()));
         let restored_ui = !spaces.is_empty() || current_space.is_some();
         let model_catalog = load_model_cache().unwrap_or(Value::Null);
-        Self {
+        stamp("load_model_cache done");
+        stamp("Term::new done");
+        // LSP：后台线程 + 事件循环（诊断回来 → 给编辑器挂装饰）
+        let (lsp_tx, lsp_ev_tx, lsp_rx) = lsp::spawn();
+        let lsp_events = Some(cx.spawn(async move |this, cx| {
+            while let Ok(event) = lsp_rx.recv().await {
+                let _ = this.update(cx, |root, cx| root.handle_lsp_event(event, cx));
+            }
+        }));
+        let mut root = Self {
             cmds: cmd_tx,
             evs: ev_rx,
             host: "starting dsh…".into(),
@@ -1243,8 +3398,19 @@ impl Root {
             selected,
             spaces,
             current_space,
-            show_switcher: false,
-            show_sessions: false,
+            panes: Vec::new(),
+            drag_pane: None,
+            drag_split: None,
+            drag_leaf: None,
+            term_tabs: state.term_tabs.iter().cloned().collect(),
+            show_palette: false,
+            palette_tab: PaletteTab::All,
+            palette_index: 0,
+            palette_input,
+            _keys_sub: None,
+            search_hits: Vec::new(),
+            search_query: String::new(),
+            search_error: None,
             followed_once: false,
             restored_ui,
             current_model: if saved_model.is_empty() {
@@ -1256,16 +3422,91 @@ impl Root {
             context_window: None,
             git_cache_cwd: String::new(),
             git_cache: String::new(),
+            git_status_root: String::new(),
+            git_branch: String::new(),
+            git_status: std::collections::HashMap::new(),
+            git_changes: Vec::new(),
+            git_repo: false,
+            git_error: None,
+            git_panel: false,
+            git_amend: false,
+            files_menu: false,
+            files_branch_line: false,
             show_models: false,
+            model_input,
+            model_favorites: state.model_favorites.iter().cloned().collect(),
+            panel_names: state.panel_names.iter().cloned().collect(),
+            jobs: Vec::new(),
+            show_jobs: false,
+            show_tab_list: false,
+            tab_scroll: ScrollHandle::new(),
+            pending_tab_scroll: None,
+            tab_widths: Vec::new(),
+            scroll_tab_steps: 0,
+            settings_tab: SettingsTab::General,
+            plugins_doc: Value::Null,
+            account_doc: Value::Null,
+            settings_tab_error: None,
+            files_sidebar: state.files_sidebar,
+            files_root: state.files_root.clone(),
+            files_width: state.files_width.clamp(180., 480.),
+            files_expanded: state.files_expanded.iter().cloned().collect(),
+            files_cache: std::collections::HashMap::new(),
+            files_selected: None,
+            editors: std::collections::HashMap::new(),
+            lsp_tx,
+            lsp_ev_tx,
+            _lsp_events: lsp_events,
+            editor_diags: std::collections::HashMap::new(),
+            diag_counts: std::collections::HashMap::new(),
+            lsp_state: std::collections::HashMap::new(),
+            lsp_active: std::collections::HashSet::new(),
+            completion_extras: std::collections::HashMap::new(),
+            pending_extra_edits: Vec::new(),
+            pending_workspace_edits: Vec::new(),
+            lsp_complete_pending: std::env::var("OMD_LSP_COMPLETE").is_ok(),
+            lsp_action_pending: std::env::var("OMD_LSP_ACTION").is_ok(),
+            lsp_semantic_pending: std::env::var("OMD_LSP_SEMANTIC").is_ok(),
+            lsp_accept_pending: std::env::var("OMD_LSP_ACCEPT").is_ok(),
+            type_test_pending: std::env::var("OMD_TYPE_TEST").is_ok(),
+            lsp_apply_pending: std::env::var("OMD_LSP_APPLY").is_ok(),
+            split_click_pending: std::env::var("OMD_SPLIT_CLICK").is_ok(),
+            split_dsh_pending: std::env::var("OMD_SPLIT_DSH").is_ok(),
+    split_hover: None,
+    pending_split: None,
+    focused_pane: None,
+    focus_pending: None,
+    pending_term_meta: std::collections::HashMap::new(),
+            chat_snapshots: std::collections::HashMap::new(),
+            chat_streams: std::collections::HashMap::new(),
+            chat_scrolls: std::collections::HashMap::new(),
+            split_hover_gen: 0,
+            _editor_sub: None,
+            _edits_sub: None,
+            settings_doc: Value::Null,
+            settings_loading: false,
+            settings_error: None,
+            settings_edit: None,
+            settings_input,
+            plugins_input,
+            pending_panel_tab: None,
+            tab_drag: None,
+            renaming: None,
+            rename_input,
+            commit_input,
             model_loading: false,
             model_catalog,
             items: Vec::new(),
-            term: Term::new(100, 30),
-            term_screen: Vec::new(),
-            term_focus: cx.focus_handle(),
-            show_terminal: false,
+            reveal_limit: usize::MAX,
+            reveal_running: false,
             streaming: None,
+            awaiting_reply: false,
+            typing: None,
             input,
+            block_inputs,
+            block_input_sessions: vec![None; 64],
+            block_clear_pending: Vec::new(),
+            _block_input_subs: block_input_subs,
             question_input,
             question: None,
             show_settings: false,
@@ -1282,18 +3523,237 @@ impl Root {
             pending_clear: false,
             pending_question_clear: false,
             _enter_sub: enter_sub,
+        };
+        // 开发用：用合成块压测 UI 构建（首个 render + 布局/pkg 成本）。
+        if let Ok(n) = std::env::var("OMD_STRESS_BLOCKS") {
+            let n: usize = n.trim().parse().unwrap_or(0);
+            for i in 0..n {
+                root.items.push(TranscriptBlock::Assistant {
+                    uid: block_uid(),
+                    text: format!(
+                        "stress block #{i}\n\n这是压测用的段落，带 `inline code` 与列表：\n\n- item a\n- item b\n\n```rust\nfn f{i}() -> u32 {{ {i} }}\n```\n"
+                    ),
+                });
+            }
+            // OMD_STRESS_FULL=1 → 一次全铺（A/B 对照用）
+            root.reveal_limit = if std::env::var("OMD_STRESS_FULL").is_ok() {
+                usize::MAX
+            } else {
+                FIRST_PAINT_BLOCKS
+            };
+            stamp(format!("stress blocks injected: {n} (reveal={})", root.reveal_limit));
         }
+        if std::env::var("OMD_NEW_SESSION").is_ok() {
+            let cwd = root
+                .current_space
+                .as_ref()
+                .and_then(|id| root.spaces.iter().find(|space| &space.id == id))
+                .map(|space| space.cwd.clone());
+            let _ = root.cmds.send_blocking(Cmd::NewSession { cwd });
+            stamp("new dsh session requested via OMD_NEW_SESSION");
+        }
+        if std::env::var("OMD_TUI_TEST").is_ok() {
+            let cwd = root
+                .current_space
+                .as_ref()
+                .and_then(|id| root.spaces.iter().find(|space| &space.id == id))
+                .map(|space| space.cwd.clone());
+            let _ = root.cmds.send_blocking(Cmd::NewTerminal {
+                pane_id: next_pane_id(),
+                kind: BlockPlacement::Panel,
+                cwd,
+                run: Some(dsh_tui_command()),
+            });
+            stamp("dsh tui pane requested via OMD_TUI_TEST");
+        }
+        if std::env::var("OMD_SPLIT_TEST").is_ok() {
+            // 冒烟：一次加三个 pane（下 / 右 / 下），验证多分屏
+            for kind in [BlockPlacement::Bottom, BlockPlacement::Right, BlockPlacement::Bottom] {
+                let cwd = root
+                    .current_space
+                    .as_ref()
+                    .and_then(|id| root.spaces.iter().find(|space| &space.id == id))
+                    .map(|space| space.cwd.clone());
+                let _ = root.cmds.send_blocking(Cmd::NewTerminal {
+                    pane_id: next_pane_id(),
+                    kind,
+                    cwd,
+                    run: None,
+                });
+            }
+            stamp("split test: 3 panes requested");
+        }
+        if std::env::var("OMD_NEW_TERM_TAB").is_ok() {
+            let cwd = root
+                .current_space
+                .as_ref()
+                .and_then(|id| root.spaces.iter().find(|space| &space.id == id))
+                .map(|space| space.cwd.clone());
+            let _ = root.cmds.send_blocking(Cmd::NewTerminal {
+                pane_id: next_pane_id(),
+                kind: BlockPlacement::Panel,
+                cwd,
+                run: None,
+            });
+            stamp("terminal tab requested via OMD_NEW_TERM_TAB");
+        }
+        if std::env::var("OMD_MOVE_PANEL").is_ok() {
+            // 冒烟：把第二个 panel 往右挪一格，验证顺序与持久化
+            let second = root
+                .current_space
+                .as_ref()
+                .and_then(|id| root.spaces.iter().find(|space| &space.id == id))
+                .and_then(|space| space.panels.get(1).map(|tab| tab.id.clone()));
+            if let Some(tab_id) = second {
+                root.move_tab(&tab_id, 1, cx);
+                stamp(format!("moved tab {tab_id} right via OMD_MOVE_PANEL"));
+            }
+        }
+        if let Ok(query) = std::env::var("OMD_SEARCH") {
+            root.show_palette = true;
+            let q = query.clone();
+            let _ = root.cmds.send_blocking(Cmd::Call {
+                tag: "session/search".to_string(),
+                endpoint: "session/search".to_string(),
+                args: json!({ "request": { "query": q } }),
+            });
+            stamp(format!("palette search {query} via OMD_SEARCH"));
+        }
+        // 恢复出来的侧栏：把根目录和展开的目录读一遍（否则显示空）
+        if root.files_sidebar && !root.files_root.is_empty() {
+            let root_dir = root.files_root.clone();
+            root.files_load(&root_dir);
+            root.files_load_expanded();
+        }
+        if std::env::var("OMD_OPEN_FILES").is_ok() {
+            root.files_sidebar = true;
+            root.files_sync_root(cx);
+            stamp("files sidebar opened via OMD_OPEN_FILES");
+        }
+        if let Ok(which) = std::env::var("OMD_OPEN_SETTINGS") {
+            root.show_settings = true;
+            let tab = match which.as_str() {
+                "plugins" => SettingsTab::Plugins,
+                "account" => SettingsTab::Account,
+                _ => SettingsTab::General,
+            };
+            root.open_settings_tab(tab, window, cx);
+            stamp(format!("settings opened ({}) via env", tab.label()));
+        }
+        if std::env::var("OMD_OPEN_MODELS").is_ok() {
+            root.show_models = true;
+            let _ = root.cmds.send_blocking(Cmd::ModelCatalog);
+            stamp("model picker opened via OMD_OPEN_MODELS");
+        }
+        if let Ok(index) = std::env::var("OMD_CLOSE_TAB") {
+            let index: usize = index.parse().unwrap_or(1);
+            let target = root
+                .current_space
+                .as_ref()
+                .and_then(|id| root.spaces.iter().find(|space| &space.id == id))
+                .and_then(|space| space.panels.get(index.saturating_sub(1)))
+                .map(|tab| tab.id.clone());
+            if let Some(tab_id) = target {
+                root.close_whole_tab(&tab_id, cx);
+                stamp(format!("closed tab {tab_id} via OMD_CLOSE_TAB"));
+            }
+        }
+        root.scroll_tab_steps = std::env::var("OMD_SCROLL_TABS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        if let Ok(index) = std::env::var("OMD_ACTIVATE_TAB") {
+            let index: usize = index.parse().unwrap_or(1);
+            let target = root
+                .current_space
+                .as_ref()
+                .and_then(|id| root.spaces.iter().find(|space| &space.id == id))
+                .and_then(|space| space.panels.get(index.saturating_sub(1)))
+                .map(|tab| tab.id.clone());
+            if let Some(tab_id) = target {
+                root.activate_tab(tab_id, cx);
+                stamp(format!("activated tab #{index} via OMD_ACTIVATE_TAB"));
+            }
+        }
+        if std::env::var("OMD_OPEN_TAB_LIST").is_ok() {
+            root.show_tab_list = true;
+            stamp("tab list opened via OMD_OPEN_TAB_LIST");
+        }
+        if let Ok(tab) = std::env::var("OMD_OPEN_PALETTE") {
+            // 冒烟钩子：空格/任意值 = 全部，spaces = 空间，panels = dsh 会话，commands = 命令
+            root.palette_tab = match tab.as_str() {
+                "panels" | "sessions" | "tabs" => PaletteTab::Tabs,
+                "commands" => PaletteTab::Commands,
+                "spaces" => PaletteTab::Spaces,
+                _ => PaletteTab::All,
+            };
+            root.show_palette = true;
+            stamp(format!("palette opened via OMD_OPEN_PALETTE ({tab})"));
+        }
+        // 键盘拦截：Commands面板的 ↑↓/↵/esc 要抢在输入框的键绑定之前。
+        let weak = cx.entity().downgrade();
+        let keys_sub = cx.intercept_keystrokes(move |event: &KeystrokeEvent, window, cx| {
+            let Some(handle) = weak.upgrade() else {
+                return;
+            };
+            // update 返回"是否更新成功"；真正的消费结果走这个槽位。
+            let mut consumed = false;
+            handle.update(cx, |root, cx| {
+                consumed = root.handle_global_key(&event.keystroke, window, cx);
+            });
+            if consumed {
+                cx.stop_propagation();
+            }
+        });
+        root._keys_sub = Some(keys_sub);
+        // 还原持久化的 panel 布局（terminal 重新拉起，editor 重新打开文件）
+        let pending: Vec<(String, String, Value)> = root
+            .spaces
+            .iter()
+            .flat_map(|space| {
+                space.panels.iter().filter_map(|tab| {
+                    tab.pending_layout
+                        .clone()
+                        .map(|layout| (space.id.clone(), tab.id.clone(), layout))
+                })
+            })
+            .collect();
+        for (space_id, tab_id, value) in pending {
+            let cwd = root
+                .spaces
+                .iter()
+                .find(|space| space.id == space_id)
+                .map(|space| space.cwd.clone())
+                .unwrap_or_else(|| "/".to_string());
+            let layout = root.materialize_layout(&value, &tab_id, &cwd, window, cx);
+            if let Some(space) = root.spaces.iter_mut().find(|space| space.id == space_id) {
+                if let Some(tab) = space.panels.iter_mut().find(|tab| tab.id == tab_id) {
+                    tab.layout = layout;
+                    tab.pending_layout = None;
+                }
+            }
+        }
+        if let Ok(path) = std::env::var("OMD_OPEN_FILE") {
+            root.open_file_panel(path.clone(), window, cx);
+            stamp(format!("editor opened {path} via OMD_OPEN_FILE"));
+        }
+        stamp("Root::new done");
+        root
     }
 
-    fn apply(&mut self, ev: Ev) {
+    fn apply(&mut self, ev: Ev, cx: &mut Context<Self>) {
         match ev {
             Ev::HostReady(base) => {
                 eprintln!("[ui] host ready: {base}");
                 eprintln!("[ui] AUTOTERM check: {:?}", std::env::var("DSH_GUI_AUTOTERM"));
                 if std::env::var("DSH_GUI_AUTOTERM").is_ok() {
                     eprintln!("[ui] AUTOTERM firing");
-                    self.show_terminal = true;
-                    let r = self.cmds.send_blocking(Cmd::NewTerminal);
+                    let r = self.cmds.send_blocking(Cmd::NewTerminal {
+                        pane_id: next_pane_id(),
+                        kind: BlockPlacement::Bottom,
+                        cwd: None,
+                        run: None,
+                    });
                     eprintln!("[ui] AUTOTERM sent: {r:?}");
                 }
                 self.host = base;
@@ -1313,8 +3773,9 @@ impl Root {
                 self.show_models = false;
                 self.save_state();
             }
-            Ev::Sessions(rows) => {
+            Ev::DshSessions(rows) => {
                 eprintln!("[ui] sessions loaded: {}", rows.len());
+                let split_dsh_probe = self.split_dsh_pending;
                 let mut next_spaces: Vec<Space> = Vec::new();
                 for row in &rows {
                     let cwd = if row.cwd.trim().is_empty() {
@@ -1327,17 +3788,37 @@ impl Root {
                         continue;
                     }
                     let old = self.spaces.iter().find(|space| space.id == id);
-                    let mut tabs = old.map(|space| space.tabs.clone()).unwrap_or_default();
-                    tabs.retain(|tab| rows.iter().any(|row| &row.id == tab));
-                    let active = old
-                        .and_then(|space| space.active.clone())
-                        .filter(|tab| tabs.contains(tab));
+                    let mut tabs = old.map(|space| space.panels.clone()).unwrap_or_default();
+                    // 丢掉已经不存在的 panel；空的 tab 也跟着消失
+                    for tab in tabs.iter_mut() {
+                        tab.blocks
+                            .retain(|panel| is_file_panel(panel) || rows.iter().any(|row| &row.id == panel));
+                        if tab
+                            .active
+                            .as_deref()
+                            .is_some_and(|panel| !tab.blocks.iter().any(|p| p == panel))
+                        {
+                            tab.active = tab.blocks.first().cloned();
+                        }
+                    }
+                    tabs.retain(|tab| {
+                        let mut leaves = Vec::new();
+                        tab.layout.leaves(&mut leaves);
+                        !tab.blocks.is_empty() || leaves.iter().any(|leaf| *leaf != 0)
+                    });
+                    let active_panel = old
+                        .and_then(|space| space.active_panel.clone())
+                        .filter(|tab_id| tabs.iter().any(|tab| &tab.id == tab_id))
+                        .or_else(|| tabs.first().map(|tab| tab.id.clone()));
+                    let name = old
+                        .map(|space| space.name.clone())
+                        .unwrap_or_else(|| space_name(&cwd));
                     next_spaces.push(Space {
                         id,
-                        name: space_name(&cwd),
+                        name,
                         cwd: normalize_cwd(&cwd),
-                        tabs,
-                        active,
+                        panels: tabs,
+                        active_panel,
                     });
                 }
                 self.spaces = next_spaces;
@@ -1353,7 +3834,7 @@ impl Root {
                 if self
                     .selected
                     .as_deref()
-                    .is_some_and(|id| !rows.iter().any(|row| row.id == id))
+                    .is_some_and(|id| !is_file_panel(id) && !rows.iter().any(|row| row.id == id))
                 {
                     self.selected = None;
                 }
@@ -1365,10 +3846,8 @@ impl Root {
                         if let Some(space) =
                             self.spaces.iter_mut().find(|space| space.id == space_id)
                         {
-                            if !space.tabs.iter().any(|tab| tab == &selected) {
-                                space.tabs.push(selected.clone());
-                            }
-                            space.active = Some(selected.clone());
+                            space.attach_panel(&selected);
+                            space.activate_panel(&selected);
                         }
                         self.current_space = Some(space_id);
                     }
@@ -1380,15 +3859,11 @@ impl Root {
                         if let Some(space) =
                             self.spaces.iter().find(|space| space.id == space_id)
                         {
-                            if let Some(active) =
-                                space.active.clone().or_else(|| space.tabs.first().cloned())
+                            if let Some(panel) = space
+                                .current_tab()
+                                .and_then(|tab| tab.active.clone().or_else(|| tab.blocks.first().cloned()))
                             {
-                                self.selected = Some(active.clone());
-                                if let Some(space) =
-                                    self.spaces.iter_mut().find(|space| space.id == space_id)
-                                {
-                                    space.active = Some(active);
-                                }
+                                self.selected = Some(panel);
                             }
                         }
                     }
@@ -1412,10 +3887,8 @@ impl Root {
                         if let Some(space) =
                             self.spaces.iter_mut().find(|space| space.id == space_id)
                         {
-                            if !space.tabs.iter().any(|tab| tab == &row.id) {
-                                space.tabs.push(row.id.clone());
-                            }
-                            space.active = Some(row.id.clone());
+                            space.attach_panel(&row.id);
+                            space.activate_panel(&row.id);
                         }
                         self.current_space = Some(space_id);
                         self.selected = Some(row.id.clone());
@@ -1425,7 +3898,10 @@ impl Root {
                 if !self.followed_once {
                     if let Some(selected) = self.selected.clone() {
                         self.followed_once = true;
-                        let _ = self.cmds.send_blocking(Cmd::Follow(selected));
+                        let _ = self.cmds.send_blocking(Cmd::Follow(selected.clone()));
+                        let _ = self
+                            .cmds
+                            .send_blocking(Cmd::JobsWatch { session_id: Some(selected) });
                     }
                 }
 
@@ -1433,10 +3909,32 @@ impl Root {
                     let _ = self.cmds.send_blocking(Cmd::NewSession { cwd: None });
                 }
                 self.sessions = rows;
+                let open_blocks: Vec<String> = self
+                    .spaces
+                    .iter()
+                    .flat_map(|space| {
+                        space
+                            .panels
+                            .iter()
+                            .flat_map(|panel| panel.blocks.iter().cloned())
+                    })
+                    .filter(|block_id| !is_file_panel(block_id))
+                    .collect();
+                for block_id in open_blocks {
+                    self.assign_block_input(&block_id);
+                }
+                if split_dsh_probe && !self.spaces.is_empty() {
+                    self.split_dsh_pending = false;
+                    self.split_with_dsh(0, SplitDir::Row, cx);
+                    stamp("split_with_dsh(0, Row) via OMD_SPLIT_DSH");
+                }
                 self.save_state();
             }
             Ev::FollowStart(session_id) => {
                 eprintln!("[ui] follow {session_id}");
+                // baseline 回放会一次推整段历史：先只铺尾部，其余按帧补。
+                self.reveal_limit = FIRST_PAINT_BLOCKS;
+                self.reveal_running = false;
                 let cwd = self
                     .sessions
                     .iter()
@@ -1453,10 +3951,8 @@ impl Root {
                     .unwrap_or_else(|| "/".to_string());
                 let space_id = self.ensure_space(&cwd);
                 if let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) {
-                    if !space.tabs.iter().any(|tab| tab == &session_id) {
-                        space.tabs.push(session_id.clone());
-                    }
-                    space.active = Some(session_id.clone());
+                    space.attach_panel(&session_id);
+                    space.activate_panel(&session_id);
                 }
                 self.current_space = Some(space_id);
                 self.selected = Some(session_id);
@@ -1468,11 +3964,13 @@ impl Root {
                 self.approval = None;
                 self.error = None;
             }
-            Ev::Event(value) => {
-                let stick = self.at_bottom();
-                self.handle_event(&value);
-                if stick {
-                    self.scroll.scroll_to_bottom();
+            Ev::Event { session_id, value } => {
+                if self.selected.as_deref() == Some(session_id.as_str()) {
+                    let stick = self.at_bottom();
+                    self.handle_event(&value);
+                    if stick {
+                        self.scroll.scroll_to_bottom();
+                    }
                 }
             }
             Ev::Line(line) => {
@@ -1480,7 +3978,7 @@ impl Root {
                     eprintln!("[ui] line: {}", line.chars().take(100).collect::<String>());
                 }
                 let stick = self.at_bottom();
-                self.push_block(Block::Notice(line));
+                self.push_block(TranscriptBlock::Notice(line));
                 if stick {
                     self.scroll.scroll_to_bottom();
                 }
@@ -1489,35 +3987,74 @@ impl Root {
                 match decode_image(&b64) {
                     Some(img) => {
                         eprintln!("[ui] image decoded {:?}x{:?}", img.size(0).width, img.size(0).height);
-                        self.push_block(Block::Image(Arc::new(img)));
+                        self.push_block(TranscriptBlock::Image(Arc::new(img)));
                     }
-                    None => self.push_block(Block::Notice("!! 图片解码失败".into())),
+                    None => self.push_block(TranscriptBlock::Notice("!! image decode failed".into())),
                 }
             }
-            Ev::StreamStart => {
-                eprintln!("[ui] stream start");
-                self.streaming.get_or_insert_with(StreamState::default);
-            }
-            Ev::StreamDelta(delta) => {
-                let state = self.streaming.get_or_insert_with(StreamState::default);
-                if state.text.len() < 3 {
-                    eprintln!("[ui] stream delta: {delta:?}");
-                }
-                state.text.push_str(&delta);
-                if self.at_bottom() {
-                    self.scroll.scroll_to_bottom();
-                }
-            }
-            Ev::ReasoningDelta(delta) => {
-                let state = self.streaming.get_or_insert_with(StreamState::default);
-                state.reasoning.push_str(&delta);
-                if self.at_bottom() {
-                    self.scroll.scroll_to_bottom();
+            Ev::StreamStart { session_id } => {
+                eprintln!("[ui] stream start {session_id}");
+                if self.selected.as_deref() == Some(session_id.as_str()) {
+                    let state = self.streaming.get_or_insert_with(StreamState::default);
+                    state.ended = false;
+                } else {
+                    let state = self
+                        .chat_streams
+                        .entry(session_id)
+                        .or_insert_with(StreamState::default);
+                    state.ended = false;
                 }
             }
-            Ev::StreamEnd => {
-                eprintln!("[ui] stream end");
-                self.streaming = None;
+            Ev::StreamDelta { session_id, delta } => {
+                if self.selected.as_deref() == Some(session_id.as_str()) {
+                    let state = self.streaming.get_or_insert_with(StreamState::default);
+                    state.total_chars += delta.chars().count();
+                    state.text.push_str(&delta);
+                    self.ensure_stream_ticker(cx);
+                } else {
+                    let state = self
+                        .chat_streams
+                        .entry(session_id)
+                        .or_insert_with(StreamState::default);
+                    state.total_chars += delta.chars().count();
+                    state.text.push_str(&delta);
+                }
+            }
+            Ev::ReasoningDelta { session_id, delta } => {
+                if self.selected.as_deref() == Some(session_id.as_str()) {
+                    let state = self.streaming.get_or_insert_with(StreamState::default);
+                    state.reasoning.push_str(&delta);
+                    if self.at_bottom() {
+                        self.scroll.scroll_to_bottom();
+                    }
+                } else {
+                    let state = self
+                        .chat_streams
+                        .entry(session_id)
+                        .or_insert_with(StreamState::default);
+                    state.reasoning.push_str(&delta);
+                }
+            }
+            Ev::StreamEnd { session_id } => {
+                eprintln!("[ui] stream end {session_id}");
+                if self.selected.as_deref() == Some(session_id.as_str()) {
+                    if let Some(state) = self.streaming.as_mut() {
+                        state.ended = true;
+                        self.ensure_stream_ticker(cx);
+                    }
+                } else if let Some(mut state) = self.chat_streams.remove(&session_id) {
+                    state.ended = true;
+                    if !state.text.is_empty() {
+                        self.chat_snapshots
+                            .entry(session_id)
+                            .or_insert((Vec::new(), usize::MAX))
+                            .0
+                            .push(TranscriptBlock::Assistant {
+                                uid: block_uid(),
+                                text: state.text,
+                            });
+                    }
+                }
             }
             Ev::Connection(up) => {
                 self.connected = up;
@@ -1526,13 +4063,281 @@ impl Root {
                     self.error = None;
                 }
             }
-            Ev::TerminalOutput(data) => {
-                if let Some(t) = self.term.as_mut() {
-                    t.feed(&data);
-                    self.term_screen = t.render_rows();
+            Ev::TerminalOutput { term_id, data } => {
+                if let Some(pane) = self
+                    .panes
+                    .iter_mut()
+                    .find(|pane| pane.term_id == term_id)
+                {
+                    if let Some(term) = pane.term.as_mut() {
+                        term.feed(&data);
+                        pane.screen = term.render_rows();
+                        pane.images = term.images().to_vec();
+                        if std::env::var("OMD_TRACE_TOOLS").is_ok() {
+                            let text: String = pane
+                                .screen
+                                .iter()
+                                .map(|row| {
+                                    row.iter().map(|span| span.text.as_str()).collect::<String>()
+                                })
+                                .filter(|line| !line.trim().is_empty())
+                                .collect::<Vec<_>>()
+                                .join(" / ");
+                            eprintln!(
+                                "[trace] term {term_id} <- {} bytes, rows={} | {}",
+                                data.len(),
+                                pane.screen.len(),
+                                text.chars().rev().take(300).collect::<String>().chars().rev().collect::<String>()
+                            );
+                        }
+                    }
                 }
             }
             Ev::TerminalScreen(_screen) => {}
+            Ev::Jobs(frame) => {
+                let count = frame
+                    .get("jobs")
+                    .and_then(|v| v.as_array())
+                    .map(|rows| rows.len())
+                    .unwrap_or(0);
+                eprintln!("[ui] jobs frame: {count} rows");
+                self.jobs = frame
+                    .get("jobs")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                cx.notify();
+            }
+            Ev::Called {
+                tag,
+                endpoint,
+                result,
+            } => {
+                eprintln!("[ui] rpc {endpoint} tag={tag} ok={}", result.is_ok());
+                match result {
+                    Ok(value) => match tag.as_str() {
+                        "plugins/list" => {
+                            let count = value
+                                .as_array()
+                                .map(|items| items.len())
+                                .or_else(|| {
+                                    value.get("plugins").and_then(|v| v.as_array()).map(|i| i.len())
+                                })
+                                .unwrap_or(0);
+                            eprintln!("[ui] plugins list: {count} entries");
+                            self.plugins_doc = value;
+                        }
+                        "account/state" => {
+                            let keys = value
+                                .as_object()
+                                .map(|map| map.keys().cloned().collect::<Vec<_>>().join(","))
+                                .unwrap_or_else(|| value.to_string());
+                            eprintln!("[ui] account state keys: {keys}");
+                            self.account_doc = value;
+                        }
+                        "plugins/toggle" => {
+                            // 重新拉一遍清单
+                            let _ = self.cmds.send_blocking(Cmd::Call {
+                                tag: "plugins/list".to_string(),
+                                endpoint: "pluginManager/listPlugins".to_string(),
+                                args: json!({}),
+                            });
+                        }
+                        "session/search" => {
+                            self.search_error = None;
+                            self.search_hits = value
+                                .get("items")
+                                .and_then(|v| v.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                        }
+                        "settings/describe" => {
+                            let names: Vec<String> = value
+                                .get("namespaces")
+                                .and_then(|v| v.as_array())
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .map(|ns| {
+                                            let id = ns.get("ns").and_then(|v| v.as_str()).unwrap_or("?");
+                                            let fields = ns
+                                                .get("value")
+                                                .and_then(|v| v.as_object())
+                                                .map(|m| m.len())
+                                                .unwrap_or(0);
+                                            format!("{id}({fields})")
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            eprintln!("[ui] settings namespaces: {}", names.join(", "));
+                            self.settings_doc = value;
+                            self.settings_loading = false;
+                            self.settings_error = None;
+                        }
+                        _ => {
+                            if tag.starts_with("settings/") {
+                                // 写完重新读一遍
+                                self.reload_settings();
+                            }
+                        }
+                    },
+                    Err(err) => {
+                        eprintln!("[ui] rpc error {endpoint}: {}", err.chars().take(300).collect::<String>());
+                        if tag == "plugins/list" || tag == "account/state" || tag == "plugins/toggle" {
+                            self.settings_tab_error =
+                                Some(err.chars().take(160).collect::<String>());
+                        }
+                        if tag == "session/search" {
+                            self.search_error = Some(if err.contains("search is disabled") {
+                                "session search is disabled in this deployment".to_string()
+                            } else {
+                                err.chars().take(120).collect()
+                            });
+                        }
+                        if tag.starts_with("settings/") || tag == "settings/describe" {
+                            self.settings_loading = false;
+                            self.settings_error = Some(format!("{endpoint}: {err}"));
+                        }
+                    }
+                }
+                cx.notify();
+            }
+            Ev::SessionCreated(session_id) => {
+                eprintln!("[ui] session created {session_id}");
+                self.assign_block_input(&session_id);
+                if let Some((leaf, dir)) = self.pending_split.take() {
+                    // 分屏装 dsh：新会话直接进这个 tab 的新 pane
+                    let focus = cx.focus_handle();
+                    let pane_id = next_pane_id();
+                    let mut pane = Block::new(pane_id, dir.pane_kind(), focus);
+                    pane.session = Some(session_id.clone());
+                    let tab_id = self
+                        .current_space
+                        .as_ref()
+                        .and_then(|id| self.spaces.iter().find(|space| &space.id == id))
+                        .and_then(|space| space.active_panel.clone());
+                    pane.tab_id = tab_id.clone();
+                    self.panes.push(pane);
+                    if let Some(space) = self
+                        .current_space
+                        .clone()
+                        .and_then(|id| self.spaces.iter_mut().find(|space| space.id == id))
+                    {
+                        if let Some(tab) = space
+                            .active_panel
+                            .clone()
+                            .and_then(|id| space.panels.iter_mut().find(|tab| tab.id == id))
+                        {
+                            tab.layout.split(leaf, dir, pane_id);
+                            tab.maximized = None;
+                            tab.blocks.push(session_id.clone());
+                        }
+                    }
+                    let _ = self.cmds.send_blocking(Cmd::Watch(session_id.clone()));
+                    // 注意：不切活跃聊天。新 pane 先显示空会话，
+                    // 点它才 switch_to_chat，避免两边显示同一份内容。
+                    self.save_state();
+                    cx.notify();
+                    return;
+                }
+                if let Some(tab_id) = self.pending_panel_tab.take() {
+                    // 挂进指定 tab（「+」新建 panel）
+                    if let Some(space) = self
+                        .current_space
+                        .clone()
+                        .and_then(|id| self.spaces.iter_mut().find(|space| space.id == id))
+                    {
+                        if let Some(tab) = space.panels.iter_mut().find(|tab| tab.id == tab_id) {
+                            tab.blocks.push(session_id.clone());
+                            tab.active = Some(session_id.clone());
+                            space.active_panel = Some(tab_id.clone());
+                        } else {
+                            space.attach_panel(&session_id);
+                            space.activate_panel(&session_id);
+                        }
+                    }
+                    self.selected = Some(session_id.clone());
+                    self.items.clear();
+                    let _ = self.cmds.send_blocking(Cmd::Follow(session_id.clone()));
+                    self.save_state();
+                    cx.notify();
+                } else {
+                    self.open_tab(session_id, cx);
+                }
+            }
+            Ev::Tb { call, reply } => {
+                let result = self.tb_call(call);
+                let _ = reply.send(result);
+                cx.notify();
+            }
+            Ev::TerminalSession {
+                pane_id,
+                kind,
+                session_id,
+                term_id,
+            } => {
+                eprintln!("[ui] terminal pane {pane_id} kind={} session={session_id}", kind.as_str());
+                let focus = cx.focus_handle();
+                let current_tab = self
+                    .current_space
+                    .as_ref()
+                    .and_then(|id| self.spaces.iter().find(|space| &space.id == id))
+                    .and_then(|space| space.active_panel.clone());
+                let meta = self.pending_term_meta.remove(&pane_id);
+                let space_cwd = self
+                    .current_space
+                    .as_ref()
+                    .and_then(|id| self.spaces.iter().find(|space| &space.id == id))
+                    .map(|space| space.cwd.clone());
+                let (meta_cwd, meta_cmd) = meta.unwrap_or((None, None));
+                if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) {
+                    pane.tab_id = current_tab.clone();
+                    pane.session = Some(session_id.clone());
+                    pane.term_id = term_id;
+                    pane.focus = focus;
+                    if meta_cwd.is_some() || meta_cmd.is_some() {
+                        pane.cwd = meta_cwd.or(space_cwd);
+                        pane.command = meta_cmd;
+                    } else if pane.cwd.is_none() {
+                        pane.cwd = space_cwd;
+                    }
+                } else {
+                    let mut pane = Block::new(pane_id, kind, focus);
+                    pane.tab_id = current_tab.clone();
+                    pane.session = Some(session_id.clone());
+                    pane.term_id = term_id;
+                    pane.cwd = meta_cwd.or(space_cwd);
+                    pane.command = meta_cmd;
+                    self.panes.push(pane);
+                }
+                // 老的/外来的 pane（没有进过布局树）：默认挂在 chat 右边
+                {
+                    let space_id = self.current_space.clone();
+                    if let Some(space) = space_id
+                        .and_then(|id| self.spaces.iter_mut().find(|space| space.id == id))
+                    {
+                        let tab_id = space.active_panel.clone();
+                        if let Some(tab) = tab_id
+                            .and_then(|id| space.panels.iter_mut().find(|tab| tab.id == id))
+                        {
+                            if !tab.layout.has(pane_id) {
+                                tab.layout.split(0, SplitDir::Row, pane_id);
+                            }
+                        }
+                    }
+                }
+                if std::env::var("OMD_MAXIMIZE").is_ok() {
+                    // 冒烟：新 pane 直接最大化
+                    let _ = self.toggle_maximize(pane_id, cx);
+                }
+                if kind == BlockPlacement::Panel {
+                    self.term_tabs.insert(session_id.clone());
+                    self.open_tab(session_id, cx);
+                }
+                self.save_state();
+                cx.notify();
+            }
             Ev::AgentRunning(running) => {
                 self.agent_running = running;
             }
@@ -1564,12 +4369,35 @@ impl Root {
             }
             Ev::Error(err) => {
                 self.error = Some(err.clone());
-                self.push_block(Block::Notice(format!("!! {err}")));
+                // 同一条错误连续来（比如 daemon 一时连不上，多个 pane 各报一次）
+                // 只在转写里留一条，别刷屏
+                let text = format!("!! {err}");
+                let duplicate = matches!(
+                    self.items.last(),
+                    Some(TranscriptBlock::Notice(last)) if last == &text
+                ) || self
+                    .items
+                    .iter()
+                    .rev()
+                    .take(6)
+                    .any(|block| matches!(block, TranscriptBlock::Notice(other) if other == &text));
+                if !duplicate {
+                    self.push_block(TranscriptBlock::Notice(text));
+                }
             }
         }
     }
 
     fn session_title(&self, id: &str) -> String {
+        if let Some(path) = id.strip_prefix(FILE_PANEL_PREFIX) {
+            return PathBuf::from(path)
+                .file_name()
+                .map(|name| name.to_string_lossy().chars().take(26).collect::<String>())
+                .unwrap_or_else(|| path.to_string());
+        }
+        if let Some(name) = self.panel_names.get(id) {
+            return name.chars().take(26).collect();
+        }
         self.sessions
             .iter()
             .find(|row| row.id == id)
@@ -1581,7 +4409,7 @@ impl Root {
                 };
                 title.chars().take(26).collect()
             })
-            .unwrap_or_else(|| "会话".to_string())
+            .unwrap_or_else(|| "session".to_string())
     }
 
     fn ensure_space(&mut self, cwd: &str) -> String {
@@ -1591,8 +4419,8 @@ impl Root {
                 id: id.clone(),
                 name: space_name(cwd),
                 cwd: normalize_cwd(cwd),
-                tabs: Vec::new(),
-                active: None,
+                panels: Vec::new(),
+                active_panel: None,
             });
         }
         id
@@ -1602,6 +4430,191 @@ impl Root {
         self.sessions
             .iter()
             .any(|row| space_id_for(&row.cwd) == space.id && row.running)
+    }
+
+    /// 把磁盘上的布局 JSON 还原成布局树 + pane（terminal 会重新拉起）。
+    fn materialize_layout(
+        &mut self,
+        value: &Value,
+        tab_id: &str,
+        cwd: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Layout {
+        if let Some(leaf) = value.get("leaf").and_then(|v| v.as_str()) {
+            if leaf == "chat" {
+                if let Some(session_id) = value.get("session").and_then(|v| v.as_str()) {
+                    let id = next_pane_id();
+                    let mut pane = Block::new(id, BlockPlacement::Right, cx.focus_handle());
+                    pane.tab_id = Some(tab_id.to_string());
+                    pane.session = Some(session_id.to_string());
+                    self.panes.push(pane);
+                    self.assign_block_input(session_id);
+                    let _ = self.cmds.send_blocking(Cmd::Watch(session_id.to_string()));
+                    return Layout::Leaf(id);
+                }
+                return Layout::Leaf(0);
+            }
+            if leaf == "media" {
+                let path = value
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let kind = value
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .and_then(MediaKind::parse)
+                    .or_else(|| media_kind_for(&path));
+                if path.is_empty() || !std::path::Path::new(&path).exists() {
+                    return Layout::Leaf(0);
+                }
+                let Some(kind) = kind else {
+                    return Layout::Leaf(0);
+                };
+                let id = next_pane_id();
+                let mut pane = Block::new(id, BlockPlacement::Right, cx.focus_handle());
+                pane.tab_id = Some(tab_id.to_string());
+                pane.media_path = Some(path.clone());
+                pane.media_kind = Some(kind);
+                if kind.inline() {
+                    pane.media_image = load_media_image(&path).map(std::sync::Arc::new);
+                }
+                self.panes.push(pane);
+                return Layout::Leaf(id);
+            }
+            if leaf == "editor" {
+                let path = value
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if path.is_empty() || !std::path::Path::new(&path).exists() {
+                    return Layout::Leaf(0);
+                }
+                self.ensure_editor(path.clone(), window, cx);
+                let id = next_pane_id();
+                let mut pane = Block::new(id, BlockPlacement::Right, cx.focus_handle());
+                pane.tab_id = Some(tab_id.to_string());
+                pane.editor_path = Some(path);
+                self.panes.push(pane);
+                return Layout::Leaf(id);
+            }
+            if leaf == "terminal" {
+                if let (Some(session_id), Some(term_id)) = (
+                    value.get("session").and_then(|v| v.as_str()),
+                    value.get("id").and_then(|v| v.as_str()),
+                ) {
+                    let id = next_pane_id();
+                    let mut pane = Block::new(id, BlockPlacement::Right, cx.focus_handle());
+                    pane.tab_id = Some(tab_id.to_string());
+                    pane.session = Some(session_id.to_string());
+                    pane.term_id = term_id.to_string();
+                    self.panes.push(pane);
+                    let _ = self.cmds.send_blocking(Cmd::AttachTerminal {
+                        pane_id: id,
+                        session_id: session_id.to_string(),
+                        term_id: term_id.to_string(),
+                    });
+                    return Layout::Leaf(id);
+                }
+            }
+            let id = next_pane_id();
+            let mut pane = Block::new(id, BlockPlacement::Right, cx.focus_handle());
+            pane.tab_id = Some(tab_id.to_string());
+            self.panes.push(pane);
+            let _ = self.cmds.send_blocking(Cmd::NewTerminal {
+                pane_id: id,
+                kind: BlockPlacement::Panel,
+                cwd: Some(cwd.to_string()),
+                run: None,
+            });
+            return Layout::Leaf(id);
+        }
+
+        let dir = if value.get("dir").and_then(|v| v.as_str()) == Some("col") {
+            SplitDir::Col
+        } else {
+            SplitDir::Row
+        };
+        let children_json = value
+            .get("children")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut children: Vec<Layout> = children_json
+            .iter()
+            .map(|child| self.materialize_layout(child, tab_id, cwd, window, cx))
+            .collect();
+        if children.is_empty() {
+            return Layout::Leaf(0);
+        }
+        if children.len() == 1 {
+            return children.remove(0);
+        }
+        let mut sizes: Vec<f32> = value
+            .get("sizes")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_f64().map(|size| size as f32))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if sizes.len() != children.len() {
+            sizes = vec![1.0 / children.len() as f32; children.len()];
+        }
+        Layout::Split {
+            id: next_split_id(),
+            dir,
+            sizes,
+            children,
+        }
+    }
+
+    /// 布局树 → JSON（leaf 只存种类，pane id 不跨进程）。
+    fn layout_json(&self, layout: &Layout) -> Value {
+        match layout {
+            Layout::Leaf(id) => {
+                if *id == 0 {
+                    return json!({ "leaf": "chat" });
+                }
+                match self.panes.iter().find(|pane| pane.id == *id) {
+                    Some(pane) => {
+                        if let Some(path) = pane.media_path.as_deref() {
+                            json!({
+                                "leaf": "media",
+                                "path": path,
+                                "kind": pane.media_kind.unwrap_or(MediaKind::Image).as_str(),
+                            })
+                        } else if let Some(path) = pane.editor_path.as_deref() {
+                            json!({ "leaf": "editor", "path": path })
+                        } else if pane.term_id.is_empty() {
+                            // 没有终端 = 分屏里的 dsh 聊天面板
+                            json!({ "leaf": "chat", "session": pane.session.clone() })
+                        } else {
+                            json!({
+                                "leaf": "terminal",
+                                "session": pane.session,
+                                "id": pane.term_id,
+                            })
+                        }
+                    }
+                    None => json!({ "leaf": "terminal" }),
+                }
+            }
+            Layout::Split {
+                dir,
+                sizes,
+                children,
+                ..
+            } => json!({
+                "dir": if *dir == SplitDir::Row { "row" } else { "col" },
+                "sizes": sizes,
+                "children": children.iter().map(|child| self.layout_json(child)).collect::<Vec<_>>(),
+            }),
+        }
     }
 
     fn save_state(&self) {
@@ -1614,8 +4627,18 @@ impl Root {
                     "id": space.id,
                     "name": space.name,
                     "cwd": space.cwd,
-                    "tabs": space.tabs,
-                    "active": space.active,
+                    "active_panel": space.active_panel,
+                    "tabs": space
+                        .panels
+                        .iter()
+                        .map(|tab| json!({
+                            "id": tab.id,
+                            "name": tab.name,
+                            "panels": tab.blocks,
+                            "active": tab.active,
+                            "layout": self.layout_json(&tab.layout),
+                        }))
+                        .collect::<Vec<_>>(),
                 })
             })
             .collect();
@@ -1625,6 +4648,17 @@ impl Root {
             "selected": self.selected,
             "model": self.current_model,
             "provider": self.current_provider,
+            "term_tabs": self.term_tabs.iter().cloned().collect::<Vec<_>>(),
+            "files_sidebar": self.files_sidebar,
+            "files_root": self.files_root,
+            "files_width": self.files_width,
+            "files_expanded": self.files_expanded.iter().cloned().collect::<Vec<_>>(),
+            "model_favorites": self.model_favorites.iter().cloned().collect::<Vec<_>>(),
+            "panel_names": self
+                .panel_names
+                .iter()
+                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                .collect::<serde_json::Map<String, Value>>(),
         });
         let Some(parent) = path.parent() else { return };
         if std::fs::create_dir_all(parent).is_err() {
@@ -1640,6 +4674,24 @@ impl Root {
     }
 
     fn open_tab(&mut self, id: String, cx: &mut Context<Self>) {
+        if is_file_panel(&id) {
+            let cwd = self
+                .current_space
+                .as_ref()
+                .and_then(|space_id| self.spaces.iter().find(|space| &space.id == space_id))
+                .map(|space| space.cwd.clone())
+                .unwrap_or_else(|| "/".to_string());
+            let space_id = self.ensure_space(&cwd);
+            if let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) {
+                space.attach_panel(&id);
+                space.activate_panel(&id);
+            }
+            self.current_space = Some(space_id);
+            self.selected = Some(id);
+            self.save_state();
+            cx.notify();
+            return;
+        }
         let cwd = self
             .sessions
             .iter()
@@ -1654,29 +4706,37 @@ impl Root {
             .unwrap_or_else(|| "/".to_string());
         let space_id = self.ensure_space(&cwd);
         if let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) {
-            if !space.tabs.iter().any(|tab| tab == &id) {
-                space.tabs.push(id.clone());
-            }
-            space.active = Some(id.clone());
+            space.attach_panel(&id);
+            space.activate_panel(&id);
         }
         let changed = self.selected.as_deref() != Some(id.as_str());
+        eprintln!("[ui] open_tab {id} space={space_id} changed={changed}");
         self.current_space = Some(space_id);
         self.selected = Some(id.clone());
-        self.show_switcher = false;
-        self.show_sessions = false;
         self.followed_once = true;
         if changed {
-            let _ = self.cmds.send_blocking(Cmd::Follow(id));
+            // Clear right away so the switch is visible before the follow stream lands.
+            self.items.clear();
+            self.streaming = None;
+            self.question = None;
+            self.approval = None;
+            self.error = None;
+            let _ = self.cmds.send_blocking(Cmd::Follow(id.clone()));
+            let _ = self
+                .cmds
+                .send_blocking(Cmd::JobsWatch { session_id: Some(id) });
         }
         self.save_state();
         cx.notify();
+        cx.refresh_windows();
     }
 
+    /// 关掉一个 panel；它所在的 tab 空了就一起删掉。
     fn close_tab(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(space_index) = self
             .spaces
             .iter()
-            .position(|space| space.tabs.iter().any(|tab| tab == id))
+            .position(|space| space.all_panels().iter().any(|panel| panel == id))
         else {
             return;
         };
@@ -1684,28 +4744,51 @@ impl Root {
         let mut space_now_empty = false;
         {
             let space = &mut self.spaces[space_index];
-            let Some(position) = space.tabs.iter().position(|tab| tab == id) else {
+            let Some(tab_index) = space.panels.iter().position(|tab| tab.blocks.iter().any(|p| p == id))
+            else {
                 return;
             };
-            space.tabs.remove(position);
-            if space.active.as_deref() == Some(id) {
-                if let Some(tab) = space
-                    .tabs
-                    .get(position)
-                    .or_else(|| space.tabs.get(position.saturating_sub(1)))
-                    .cloned()
-                {
-                    space.active = Some(tab.clone());
-                    next = Some(tab);
-                } else {
-                    space.active = None;
+            let tab_id = space.panels[tab_index].id.clone();
+            let position = space.panels[tab_index]
+                .blocks
+                .iter()
+                .position(|panel| panel == id)
+                .unwrap_or(0);
+            space.panels[tab_index].blocks.retain(|panel| panel != id);
+            if space.panels[tab_index].blocks.is_empty() {
+                space.panels.remove(tab_index);
+                if space.active_panel.as_deref() == Some(tab_id.as_str()) {
+                    space.active_panel = space
+                        .panels
+                        .get(tab_index)
+                        .or_else(|| space.panels.get(tab_index.saturating_sub(1)))
+                        .map(|tab| tab.id.clone());
+                }
+                if space.panels.is_empty() {
                     space_now_empty = true;
                 }
+            } else if space.panels[tab_index].active.as_deref() == Some(id) {
+                space.panels[tab_index].active = space.panels[tab_index]
+                    .blocks
+                    .get(position)
+                    .or_else(|| space.panels[tab_index].blocks.get(position.saturating_sub(1)))
+                    .cloned();
             }
+            if !space_now_empty {
+                next = space
+                    .current_tab()
+                    .and_then(|tab| tab.active.clone().or_else(|| tab.blocks.first().cloned()));
+            }
+        }
+        if is_file_panel(id) {
+            self.editors.remove(id);
         }
         if let Some(next) = next {
             self.selected = Some(next.clone());
-            let _ = self.cmds.send_blocking(Cmd::Follow(next));
+            let _ = self.cmds.send_blocking(Cmd::Follow(next.clone()));
+            let _ = self
+                .cmds
+                .send_blocking(Cmd::JobsWatch { session_id: Some(next) });
         } else if space_now_empty && self.selected.as_deref() == Some(id) {
             self.selected = None;
             self.items.clear();
@@ -1715,24 +4798,218 @@ impl Root {
         cx.notify();
     }
 
+    /// 关掉整个 tab（× 按钮）：里面的 terminal / editor 一起释放。
+    fn close_whole_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        let Some(space_index) = self
+            .spaces
+            .iter()
+            .position(|space| space.panels.iter().any(|tab| tab.id == tab_id))
+        else {
+            return;
+        };
+        let mut leaves: Vec<u64> = Vec::new();
+        let mut panels: Vec<String> = Vec::new();
+        let mut next_selected: Option<String> = None;
+        let mut space_empty = false;
+        let mut space_cwd = String::new();
+        {
+            let space = &mut self.spaces[space_index];
+            let Some(index) = space.panels.iter().position(|tab| tab.id == tab_id) else {
+                return;
+            };
+            let tab = space.panels.remove(index);
+            panels = tab.blocks.clone();
+            tab.layout.leaves(&mut leaves);
+            if space.active_panel.as_deref() == Some(tab_id) {
+                space.active_panel = space
+                    .panels
+                    .get(index)
+                    .or_else(|| space.panels.get(index.saturating_sub(1)))
+                    .map(|tab| tab.id.clone());
+            }
+            space_empty = space.panels.is_empty();
+            space_cwd = space.cwd.clone();
+            next_selected = space
+                .current_tab()
+                .and_then(|tab| tab.active.clone().or_else(|| tab.blocks.first().cloned()));
+        }
+        // 终端在 dsh 侧还活着：显式关掉 PTY，别把进程留着
+        for term_id in self
+            .panes
+            .iter()
+            .filter(|pane| leaves.contains(&pane.id) && !pane.term_id.is_empty())
+            .map(|pane| pane.term_id.clone())
+            .collect::<Vec<_>>()
+        {
+            let _ = self.cmds.send_blocking(Cmd::Call {
+                tag: "terminal-close".to_string(),
+                endpoint: "terminal/close".to_string(),
+                args: json!({ "id": term_id }),
+            });
+        }
+        // dsh 会话跟着 tab 一起释放；终端 session 由上面的 terminal/close 处理。
+        for panel in &panels {
+            if !is_file_panel(panel) && !self.term_tabs.contains(panel) {
+                let _ = self.cmds.send_blocking(Cmd::CancelSession(panel.clone()));
+            }
+        }
+        // chat 的 Leaf(0) 是全局兜底 pane，不随 tab 删
+        self.panes
+            .retain(|pane| pane.id == 0 || !leaves.contains(&pane.id));
+        for panel in &panels {
+            if let Some(path) = panel.strip_prefix(FILE_PANEL_PREFIX) {
+                self.close_editor_state(path, &**cx);
+            }
+        }
+        let selected_gone = self
+            .selected
+            .as_deref()
+            .is_some_and(|sel| panels.iter().any(|panel| panel == sel));
+        if selected_gone || space_empty {
+            self.selected = next_selected.clone();
+            if let Some(next) = next_selected {
+                let _ = self.cmds.send_blocking(Cmd::Follow(next.clone()));
+                let _ = self
+                    .cmds
+                    .send_blocking(Cmd::JobsWatch { session_id: Some(next) });
+            } else {
+                self.items.clear();
+                self.streaming = None;
+            }
+        }
+        eprintln!(
+            "[ui] close tab {tab_id} → active {:?} (剩余 {} tab)",
+            self.spaces
+                .get(space_index)
+                .and_then(|space| space.active_panel.clone()),
+            self.spaces
+                .get(space_index)
+                .map(|space| space.panels.len())
+                .unwrap_or(0)
+        );
+        if self.show_tab_list && self.spaces.iter().all(|space| space.panels.is_empty()) {
+            self.show_tab_list = false;
+        }
+        // 空间被关空：自动补一个 dsh 会话，别留一块空白
+        if space_empty && self.current_space.as_deref() == Some(self.spaces[space_index].id.as_str()) {
+            let _ = self.cmds.send_blocking(Cmd::NewSession {
+                cwd: Some(space_cwd),
+            });
+        }
+        self.save_state();
+        cx.notify();
+    }
+
+    /// 左右箭头：按可视宽度的 fraction 滚动 tab 条。
+    fn scroll_tabs_by(&mut self, fraction: f32, cx: &mut Context<Self>) {
+        const GAP: f32 = 3.;
+        let viewport = f32::from(self.tab_scroll.bounds().size.width);
+        if viewport <= 0. || self.tab_widths.is_empty() {
+            return;
+        }
+        let content: f32 = self.tab_widths.iter().sum::<f32>()
+            + (self.tab_widths.len() as f32 - 1.).max(0.) * GAP;
+        let max = (content - viewport).max(0.);
+        if max <= 0. {
+            return;
+        }
+        // 注意：gpui 的滚动偏移是负值，范围 -max..=0，设正数会被夹回 0
+        let current = -f32::from(self.tab_scroll.offset().x);
+        let target = (current + viewport * fraction).clamp(0., max);
+        self.tab_scroll.set_offset(point(px(-target), px(0.)));
+        stamp(format!(
+            "[tabs] arrow scroll {current} -> {target} (max {max}, step {fraction}, now {})",
+            -f32::from(self.tab_scroll.offset().x)
+        ));
+        cx.notify();
+    }
+
+    /// 把第 index 个 tab 滚到可视区（Firefox 行为：切 tab 时跟过去）。
+    fn scroll_tab_into_view(&mut self, index: usize, tab_count: usize, cx: &mut Context<Self>) {
+        // 第一帧还没量出宽度：记下来，下一帧补
+        if f32::from(self.tab_scroll.bounds().size.width) <= 0. {
+            self.pending_tab_scroll = Some((index, tab_count));
+            return;
+        }
+        self.apply_tab_scroll(index, tab_count);
+        cx.notify();
+    }
+
+    /// 真正设置 tab 条横向偏移（居中该 tab，夹在 0..max）。
+    fn apply_tab_scroll(&mut self, index: usize, tab_count: usize) {
+        let viewport = f32::from(self.tab_scroll.bounds().size.width);
+        let widths = &self.tab_widths;
+        if viewport <= 0. || tab_count == 0 || index >= widths.len() {
+            return;
+        }
+        const GAP: f32 = 3.;
+        let content: f32 = widths.iter().sum::<f32>() + (widths.len() as f32 - 1.).max(0.) * GAP;
+        let max = (content - viewport).max(0.);
+        if max <= 0. {
+            self.tab_scroll.set_offset(point(px(0.), px(0.)));
+            return;
+        }
+
+        let before: f32 = widths[..index].iter().sum::<f32>() + index as f32 * GAP;
+        let center = before + widths[index] / 2. - viewport / 2.;
+        let target = center.clamp(0., max);
+        self.tab_scroll.set_offset(point(px(-target), px(0.)));
+        stamp(format!(
+            "[tabs] scroll to #{index} viewport={viewport} content={content} target={target} offset={}",
+            -f32::from(self.tab_scroll.offset().x)
+        ));
+    }
+
+    /// 点 tab 头：切到这个 tab，并显示它的 active panel。
+    fn activate_tab(&mut self, tab_id: String, cx: &mut Context<Self>) {
+        let Some(space_id) = self.current_space.clone() else {
+            return;
+        };
+        let mut panel = None;
+        if let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) {
+            if let Some(tab) = space.panels.iter_mut().find(|tab| tab.id == tab_id) {
+                space.active_panel = Some(tab_id.clone());
+                if tab.active.is_none() {
+                    tab.active = tab.blocks.first().cloned();
+                }
+                panel = tab.active.clone();
+            }
+        }
+        eprintln!("[ui] activate tab {tab_id}");
+        if let Some(panel) = panel {
+            self.open_tab(panel, cx);
+        }
+        // 切过去之后把它滚进可视区
+        let position = self
+            .spaces
+            .iter()
+            .find(|space| space.id == space_id)
+            .and_then(|space| {
+                space
+                    .panels
+                    .iter()
+                    .position(|tab| tab.id == tab_id)
+                    .map(|index| (index, space.panels.len()))
+            });
+        if let Some((index, count)) = position {
+            self.scroll_tab_into_view(index, count, cx);
+        }
+    }
+
     fn switch_space(&mut self, id: String, cx: &mut Context<Self>) {
+        eprintln!("[ui] switch_space -> {id}");
         let active = self
             .spaces
             .iter()
             .find(|space| space.id == id)
-            .and_then(|space| space.active.clone().or_else(|| space.tabs.first().cloned()));
+            .and_then(|space| {
+                space
+                    .current_tab()
+                    .and_then(|tab| tab.active.clone().or_else(|| tab.blocks.first().cloned()))
+            });
         if let Some(active) = active {
-            if let Some(space) = self.spaces.iter_mut().find(|space| space.id == id) {
-                space.active = Some(active.clone());
-            }
-            self.current_space = Some(id);
-            self.show_switcher = false;
-            self.show_sessions = false;
-            self.selected = Some(active.clone());
-            self.followed_once = true;
-            let _ = self.cmds.send_blocking(Cmd::Follow(active));
-            self.save_state();
-            cx.notify();
+            eprintln!("[ui] switch_space: reopen tab {active}");
+            self.open_tab(active, cx);
             return;
         }
 
@@ -1757,26 +5034,2281 @@ impl Root {
             })
             .cloned();
         if let Some(row) = best {
+            eprintln!("[ui] switch_space: adopt session {}", row.id);
             self.open_tab(row.id, cx);
             return;
         }
 
+        // Nothing to adopt: start a session in that folder so switching never no-ops.
+        let cwd = self
+            .spaces
+            .iter()
+            .find(|space| space.id == id)
+            .map(|space| space.cwd.clone())
+            .unwrap_or_else(|| id.clone());
+        eprintln!("[ui] switch_space: no session in {cwd}, creating one");
         self.current_space = Some(id);
-        self.show_switcher = false;
-        self.show_sessions = false;
         self.selected = None;
         self.items.clear();
         self.streaming = None;
         self.save_state();
+        let _ = self.cmds.send_blocking(Cmd::NewSession { cwd: Some(cwd) });
+        cx.notify();
+        cx.refresh_windows();
+    }
+
+    /// 是否还有没铺出来的历史块。
+    fn reveal_pending(&self) -> bool {
+        self.reveal_limit < self.items.len()
+    }
+
+    /// 多铺一块历史；返回是否还有剩余。
+    fn reveal_more(&mut self) -> bool {
+        if self.reveal_limit >= self.items.len() {
+            self.reveal_limit = usize::MAX;
+            return false;
+        }
+        self.reveal_limit = self.reveal_limit.saturating_add(REVEAL_STEP);
+        self.reveal_limit < self.items.len()
+    }
+
+    /// 每帧补一批历史块，直到All铺完。
+    fn start_reveal(&mut self, cx: &mut Context<Self>) {
+        if self.reveal_running {
+            return;
+        }
+        self.reveal_running = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(8))
+                    .await;
+                let more = match this.update(cx, |root, cx| {
+                    let more = root.reveal_more();
+                    if root.at_bottom() {
+                        root.scroll.scroll_to_bottom();
+                    }
+                    if !more {
+                        root.reveal_running = false;
+                    }
+                    cx.notify();
+                    cx.refresh_windows();
+                    more
+                }) {
+                    Ok(more) => more,
+                    Err(_) => break,
+                };
+                if !more {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 开始编辑某个设置项（点一下值）。
+    #[allow(clippy::too_many_arguments)]
+    fn begin_setting_edit(
+        &mut self,
+        ns: String,
+        path: Vec<String>,
+        revision: i64,
+        is_number: bool,
+        current: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_input
+            .update(cx, |state, cx| state.set_value(current, window, cx));
+        self.settings_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        self.settings_edit = Some((ns, path, revision, is_number));
         cx.notify();
     }
 
-    fn push_block(&mut self, block: Block) {
+    /// 提交设置项编辑：字符串/数字都走 settings/mutate。
+    fn commit_setting_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((ns, path, revision, is_number)) = self.settings_edit.take() else {
+            return;
+        };
+        let raw = self.settings_input.read(cx).value().trim().to_string();
+        let value = if is_number {
+            match raw.parse::<f64>() {
+                Ok(number) => json!(number),
+                Err(_) => {
+                    self.settings_error = Some(format!("not a number: {raw}"));
+                    self.input.read(cx).focus_handle(cx).focus(window, cx);
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            json!(raw)
+        };
+        self.write_setting(&ns, path, value, Some(revision));
+        self.input.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    /// 左栏根目录：当前 session 的 cwd。
+    fn workspace_root(&self) -> String {
+        let cwd = self
+            .current_space
+            .as_ref()
+            .and_then(|id| self.spaces.iter().find(|space| &space.id == id))
+            .map(|space| space.cwd.clone())
+            .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".into()));
+        std::env::var("OMD_FILES_DIR").unwrap_or(cwd)
+    }
+
+    fn files_sync_root(&mut self, cx: &mut Context<Self>) {
+        self.files_set_root(self.workspace_root(), cx);
+    }
+
+    /// 让 git 面板跟着当前 space。根目录没变且状态已经读过时不再跑 git。
+    fn ensure_git_root(&mut self, cx: &mut Context<Self>) {
+        let root = self.workspace_root();
+        if self.files_root != root {
+            self.git_status_root.clear();
+            self.files_set_root(root, cx);
+        } else if self.git_status_root != self.files_root {
+            self.refresh_git_status();
+        }
+    }
+
+    /// 改动列表画在文件栏里，不另开一列，也不放进窗口顶栏。
+    fn open_git_changes(&mut self, cx: &mut Context<Self>) {
+        self.files_sidebar = true;
+        self.files_menu = false;
+        self.git_panel = true;
+        self.git_error = None;
+        self.git_status_root.clear();
+        self.ensure_git_root(cx);
+        self.save_state();
+        cx.notify();
+    }
+
+    fn refresh_git_status(&mut self) {
+        if self.git_status_root == self.files_root {
+            return;
+        }
+        self.git_status_root = self.files_root.clone();
+        match git_status_map(&self.files_root) {
+            Some((branch, status, changes)) => {
+                self.git_cache = git_summary_text(&branch, &changes);
+                self.git_cache_cwd = self.files_root.clone();
+                self.git_branch = branch;
+                self.git_status = status;
+                self.git_changes = changes;
+                self.git_repo = true;
+            }
+            None => {
+                self.git_branch.clear();
+                self.git_status.clear();
+                self.git_changes.clear();
+                self.git_repo = false;
+                if self.git_cache_cwd == self.files_root || self.git_cache_cwd.is_empty() {
+                    self.git_cache.clear();
+                    self.git_cache_cwd = self.files_root.clone();
+                }
+            }
+        }
+    }
+
+    fn file_op_dir(&self) -> String {
+        if let Some(path) = self.files_selected.as_deref() {
+            let p = PathBuf::from(path);
+            if p.is_dir() {
+                return path.to_string();
+            }
+            if let Some(parent) = p.parent() {
+                return parent.display().to_string();
+            }
+        }
+        self.files_root.clone()
+    }
+
+    fn run_git(&mut self, args: &[&str]) -> bool {
+        let name = args.first().copied().unwrap_or("git");
+        let ok = match std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.files_root)
+            .args(args)
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                eprintln!("[git] {name} ok");
+                self.git_error = None;
+                true
+            }
+            Ok(output) => {
+                let err = String::from_utf8_lossy(&output.stderr);
+                let line = err
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or("git failed");
+                let line: String = line.chars().take(180).collect();
+                eprintln!("[git] {name} failed: {line}");
+                self.git_error = Some(line);
+                false
+            }
+            Err(err) => {
+                eprintln!("[git] {name} failed: {err}");
+                self.git_error = Some(err.to_string());
+                false
+            }
+        };
+        self.git_status_root.clear();
+        self.git_cache_cwd.clear();
+        self.refresh_git_status();
+        ok
+    }
+
+    fn git_stage_path(&mut self, path: &str) {
+        self.run_git(&["add", "--", path]);
+    }
+
+    fn git_unstage_path(&mut self, path: &str) {
+        self.run_git(&["restore", "--staged", "--", path]);
+    }
+
+    fn focus_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        cx.notify();
+    }
+
+    fn draft_git_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let message = draft_commit_message(&self.git_changes);
+        self.commit_input
+            .update(cx, |state, cx| state.set_value(message, window, cx));
+        self.focus_commit(window, cx);
+    }
+
+    fn submit_git_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let value = self.commit_input.read(cx).value().trim().to_string();
+        if value.is_empty() {
+            self.git_error = Some("commit message is empty".to_string());
+            self.focus_commit(window, cx);
+            return;
+        }
+        let ok = if self.git_amend {
+            self.run_git(&["commit", "--amend", "-m", &value])
+        } else {
+            self.run_git(&["commit", "-m", &value])
+        };
+        if ok {
+            self.commit_input
+                .update(cx, |state, cx| state.set_value(String::new(), window, cx));
+            self.git_amend = false;
+            self.input.read(cx).focus_handle(cx).focus(window, cx);
+        } else {
+            self.focus_commit(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn files_set_root(&mut self, root: String, cx: &mut Context<Self>) {
+        if self.files_root != root {
+            self.files_expanded.clear();
+            self.files_cache.clear();
+            self.files_selected = None;
+        }
+        self.files_root = root;
+        self.refresh_git_status();
+        self.files_load(&self.files_root.clone());
+        self.files_load_expanded();
+        self.save_state();
+        cx.notify();
+    }
+
+    /// 只读一个目录，写进缓存。
+    fn files_load(&mut self, dir: &str) {
+        if self.files_cache.contains_key(dir) {
+            return;
+        }
+        let items = read_dir_items(dir);
+        self.files_cache.insert(dir.to_string(), items);
+    }
+
+    /// 恢复出来的展开集合，需要把每个目录都读一遍。
+    fn files_load_expanded(&mut self) {
+        let dirs: Vec<String> = self.files_expanded.iter().cloned().collect();
+        for dir in dirs {
+            self.files_load(&dir);
+        }
+    }
+
+    fn files_toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.files_sidebar = !self.files_sidebar;
+        if self.files_sidebar {
+            self.files_sync_root(cx);
+        }
+        self.save_state();
+        cx.notify();
+    }
+
+    /// 点目录：展开/收起。
+    fn files_toggle_dir(&mut self, path: String, cx: &mut Context<Self>) {
+        if self.files_expanded.remove(&path) {
+            // 收起了
+        } else {
+            self.files_load(&path);
+            self.files_expanded.insert(path);
+        }
+        self.save_state();
+        cx.notify();
+    }
+
+    /// 扁平化成渲染行：(depth, path, name, is_dir, expanded, size)
+    fn files_rows(&self) -> Vec<(u32, String, String, bool, bool, u64)> {
+        fn walk(
+            me: &Root,
+            dir: &str,
+            depth: u32,
+            out: &mut Vec<(u32, String, String, bool, bool, u64)>,
+        ) {
+            let Some(items) = me.files_cache.get(dir) else {
+                return;
+            };
+            for item in items {
+                let path = PathBuf::from(dir).join(&item.name).display().to_string();
+                let expanded = item.dir && me.files_expanded.contains(&path);
+                out.push((
+                    depth,
+                    path.clone(),
+                    item.name.clone(),
+                    item.dir,
+                    expanded,
+                    item.size,
+                ));
+                if expanded {
+                    walk(me, &path, depth + 1, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, &self.files_root.clone(), 0, &mut out);
+        out
+    }
+
+    /// 打开一个 Media block。图片/GIF 内嵌；视频/音频交给系统默认播放器。
+    fn open_media_panel(
+        &mut self,
+        path: String,
+        kind: MediaKind,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self
+            .panes
+            .iter()
+            .find(|pane| pane.media_path.as_deref() == Some(path.as_str()))
+        {
+            let _ = pane;
+            cx.notify();
+            return;
+        }
+        let current_tab = self
+            .current_space
+            .as_ref()
+            .and_then(|id| self.spaces.iter().find(|space| &space.id == id))
+            .and_then(|space| space.active_panel.clone());
+        eprintln!("[ui] open media {} kind={}", path, kind.as_str());
+        let pane_id = next_pane_id();
+        let mut pane = Block::new(pane_id, BlockPlacement::Right, cx.focus_handle());
+        pane.tab_id = current_tab.clone();
+        pane.media_path = Some(path.clone());
+        pane.media_kind = Some(kind);
+        pane.size = 560.;
+        if kind.inline() {
+            pane.media_image = load_media_image(&path).map(std::sync::Arc::new);
+        }
+        self.panes.push(pane);
+        if let Some(space_id) = self.current_space.clone() {
+            if let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) {
+                if let Some(tab_id) = current_tab.or_else(|| space.active_panel.clone()) {
+                    if let Some(tab) = space.panels.iter_mut().find(|tab| tab.id == tab_id) {
+                        tab.layout.add_right(pane_id);
+                        tab.maximized = None;
+                        eprintln!("[ui] media pane {pane_id} added to tab {tab_id} layout={:?}", tab.layout);
+                    } else {
+                        eprintln!("[ui] media pane {pane_id}: tab {tab_id} missing");
+                    }
+                } else {
+                    eprintln!("[ui] media pane {pane_id}: no active tab in {space_id}");
+                }
+            }
+        } else {
+            eprintln!("[ui] media pane {pane_id}: no current space");
+        }
+        self.files_selected = Some(path);
+        self.save_state();
+        cx.notify();
+    }
+
+    /// 打开文件为 panel（成熟 Editor：rope buffer + syntect 高亮 + 折叠）。
+    fn open_file_panel(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(kind) = media_kind_for(&path) {
+            self.open_media_panel(path, kind, window, cx);
+            return;
+        }
+        // 已经开着这个文件的 panel：聚焦即可
+        if let Some(pane) = self
+            .panes
+            .iter()
+            .find(|pane| pane.editor_path.as_deref() == Some(path.as_str()))
+        {
+            let focus = pane.focus.clone();
+            focus.focus(window, cx);
+            cx.notify();
+            return;
+        }
+        self.ensure_editor(path.clone(), window, cx);
+        // 作为右侧 panel 挂进当前 tab
+        let tab_override = self
+            .current_space
+            .as_ref()
+            .and_then(|id| self.spaces.iter().find(|space| &space.id == id))
+            .and_then(|space| space.active_panel.clone());
+        let current_tab = self
+            .current_space
+            .as_ref()
+            .and_then(|id| self.spaces.iter().find(|space| &space.id == id))
+            .and_then(|space| space.active_panel.clone());
+        let pane_id = next_pane_id();
+        let mut pane = Block::new(pane_id, BlockPlacement::Right, cx.focus_handle());
+        pane.tab_id = current_tab.clone();
+        pane.editor_path = Some(path.clone());
+        pane.size = 560.;
+        self.panes.push(pane);
+        // 插进布局树（chat 右边）
+        if let Some(space_id) = self.current_space.clone() {
+            if let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) {
+                if let Some(tab_id) = tab_override.clone().or_else(|| space.active_panel.clone()) {
+                    if let Some(tab) = space.panels.iter_mut().find(|tab| tab.id == tab_id) {
+                        tab.layout.add_right(pane_id);
+                        tab.maximized = None;
+                    }
+                }
+            }
+        }
+        self.files_selected = Some(path.clone());
+        // 打开文件就把焦点给编辑器（否则 Ctrl+. / F12 这些 action 没有接收者）
+        if let Some(editor) = self.editors.get(&file_panel_id(&path)) {
+            let state = editor.state.clone();
+            state.update(cx, |state, cx| {
+                state.focus_handle(cx).focus(window, cx);
+            });
+        }
+        self.save_state();
+        cx.notify();
+    }
+
+    /// 关掉一个文件的编辑器：释放缓存 + 通知语言服务器 + 清诊断。
+    ///
+    /// 有未保存改动先写盘——现在还没有"是否保存"的对话框，宁可存下来也别丢。
+    fn close_editor_state(&mut self, path: &str, cx: &App) {
+        let key = file_panel_id(path);
+        if let Some(editor) = self.editors.get(&key) {
+            if editor.dirty {
+                let text = editor.state.read(cx).value().to_string();
+                match std::fs::write(path, text) {
+                    Ok(()) => eprintln!("[ui] 关闭前自动保存 {path}"),
+                    Err(error) => eprintln!("[ui] 关闭前保存 {path} 失败: {error}"),
+                }
+            }
+        }
+        self.editors.remove(&key);
+        self.editor_diags.remove(&key);
+        self.diag_counts.remove(&key);
+        if self.lsp_active.remove(path) {
+            let _ = self.lsp_tx.send(lsp::Cmd::Close {
+                path: path.to_string(),
+            });
+        }
+    }
+
+    /// 编辑器文本变了：如果刚插入的正是某个补全项，把它的 additionalTextEdits 排队。
+    fn apply_completion_extras(
+        &mut self,
+        path: &str,
+        key: &str,
+        event: &gpui_kit::component::input::InputEditsEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(extras) = self.completion_extras.get(key).cloned() else {
+            return;
+        };
+        let edits = event.edits();
+        let Some((edit, text_after)) = edits.last() else {
+            return;
+        };
+        let inserted_len = edit
+            .new_end_byte
+            .saturating_sub(edit.start_byte)
+            .saturating_sub(edit.old_end_byte.saturating_sub(edit.start_byte));
+        if inserted_len == 0 || edit.start_byte + inserted_len > text_after.len() {
+            return;
+        }
+        let inserted = text_after
+            .slice(edit.start_byte..edit.start_byte + inserted_len)
+            .to_string();
+        let inserted = inserted.trim();
+        if inserted.is_empty() {
+            return;
+        }
+
+        let taken = {
+            let mut cache = extras.lock().unwrap();
+            cache
+                .iter()
+                .position(|(label, _)| label.trim() == inserted)
+                .map(|index| cache.remove(index))
+        };
+        let Some((label, extra_edits)) = taken else {
+            return;
+        };
+        eprintln!(
+            "[lsp] 补全 {} 带了 {} 条附加编辑",
+            label,
+            extra_edits.len()
+        );
+        self.pending_extra_edits
+            .push((path.to_string(), extra_edits));
+        cx.notify();
+    }
+
+    /// LSP 事件：诊断回来就挂到对应编辑器上。
+    fn handle_lsp_event(&mut self, event: lsp::Event, cx: &mut Context<Self>) {
+        match event {
+            lsp::Event::Server { key, state } => {
+                if state == lsp::ServerState::Failed {
+                    eprintln!("[lsp] {key} 启动失败（没装？）");
+                }
+                self.lsp_state.insert(key, state);
+                cx.notify();
+            }
+            lsp::Event::ApplyWorkspaceEdit { edits } => {
+                for (path, text_edits) in edits {
+                    let key = file_panel_id(&path);
+                    if self.editors.contains_key(&key) {
+                        // 开着的文件：交给编辑器（下次渲染应用，光标/撤销都在）
+                        self.pending_workspace_edits
+                            .push((path.clone(), text_edits));
+                    } else {
+                        // 没开的文件：直接改磁盘
+                        match std::fs::read_to_string(&path) {
+                            Ok(text) => {
+                                let updated = lsp::apply_text_edits(&text, &text_edits);
+                                match std::fs::write(&path, updated) {
+                                    Ok(()) => eprintln!(
+                                        "[lsp] workspace edit 写入 {path}（{} 处）",
+                                        text_edits.len()
+                                    ),
+                                    Err(error) => eprintln!(
+                                        "[lsp] workspace edit 写 {path} 失败: {error}"
+                                    ),
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("[lsp] workspace edit 读 {path} 失败: {error}")
+                            }
+                        }
+                    }
+                }
+                cx.notify();
+            }
+            lsp::Event::Diagnostics { path, items } => {
+                self.apply_diagnostics(path, items, cx);
+                if self.type_test_pending && !self.editors.is_empty() {
+                    self.type_test_pending = false;
+                    let state = self.editors.values().next().map(|e| e.state.clone());
+                    // 必须放到异步任务里：在 Root::update 内部 dispatch 按键会让
+                    // InputEvent::Change 回调重入 Root（panic）
+                    cx.spawn(async move |_, cx| {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(600))
+                            .await;
+                        cx.update(|cx| {
+                            if let Some(handle) = cx.windows().into_iter().next() {
+                                let _ = handle.update(cx, |_, window, cx| {
+                                    if let Some(state) = state.clone() {
+                                        let focused =
+                                            state.read(cx).focus_handle(cx).is_focused(window);
+                                        eprintln!("[ui] type test: editor focused = {focused}");
+                                        // 直接用编辑器插入接口（真实键入走 IME，这里只验证
+                                        // "能编辑 + 改动会同步给 LSP"）
+                                        let _ = state.update(cx, |state, cx| {
+                                            state.insert("hi", window, cx);
+                                        });
+                                    }
+                                });
+                            }
+                        });
+                        if let Some(state) = state {
+                            let text = cx.update(|cx| state.read(cx).value().to_string());
+                            eprintln!(
+                                "[ui] type test: len={} tail={:?}",
+                                text.len(),
+                                text.chars().rev().take(8).collect::<String>()
+                            );
+                        }
+                    })
+                    .detach();
+                }
+                if self.lsp_apply_pending {
+                    self.lsp_apply_pending = false;
+                    if let Some((apply_path, apply_text)) = self
+                        .editors
+                        .values()
+                        .find(|editor| self.lsp_active.contains(&editor.path))
+                        .map(|editor| {
+                            (
+                                editor.path.clone(),
+                                editor.state.read(cx).value().to_string(),
+                            )
+                        })
+                    {
+                        let providers = lsp::Providers::with_events(
+                            self.lsp_tx.clone(),
+                            apply_path.clone(),
+                            self.lsp_ev_tx.clone(),
+                        );
+                        let state = self
+                            .editors
+                            .get(&file_panel_id(&apply_path))
+                            .map(|editor| editor.state.clone());
+                        let task = lsp::request_code_actions(
+                            &self.lsp_tx,
+                            &apply_path,
+                            &apply_text,
+                            0..1,
+                            cx,
+                        );
+                        cx.spawn(async move |_, cx| {
+                            let actions = task.await.unwrap_or_default();
+                            let Some(action) = actions.into_iter().next() else {
+                                eprintln!("[lsp] apply probe: 没有 code action");
+                                return;
+                            };
+                            eprintln!("[lsp] apply probe: 执行 {}", action.title);
+                            cx.update(|cx| {
+                                if let (Some(state), Some(handle)) =
+                                    (state, cx.windows().into_iter().next())
+                                {
+                                    let _ = handle.update(cx, |_, window, cx| {
+                                        use gpui_kit::component::input::CodeActionProvider as _;
+                                        let _task = providers.perform_code_action(
+                                            state, action, true, window, cx,
+                                        );
+                                        _task.detach();
+                                    });
+                                }
+                            });
+                        })
+                        .detach();
+                        stamp("[lsp] apply probe by OMD_LSP_APPLY");
+                    }
+                }
+                if self.lsp_accept_pending {
+                    self.lsp_accept_pending = false;
+                    if let Some((accept_path, accept_text)) = self
+                        .editors
+                        .values()
+                        .find(|editor| self.lsp_active.contains(&editor.path))
+                        .map(|editor| {
+                            (
+                                editor.path.clone(),
+                                editor.state.read(cx).value().to_string(),
+                            )
+                        })
+                    {
+                        let providers = lsp::Providers::new(self.lsp_tx.clone(), accept_path.clone());
+                        self.completion_extras
+                            .insert(file_panel_id(&accept_path), providers.extras());
+                        let state = self
+                            .editors
+                            .get(&file_panel_id(&accept_path))
+                            .map(|editor| editor.state.clone());
+                        let rope =
+                            gpui_kit::component::input::Rope::from(accept_text.as_str());
+                        let offset = accept_text.len();
+                        if let (Some(state), Some(handle)) = (state, cx.windows().into_iter().next())
+                        {
+                            let _ = handle.update(cx, |_, window, cx| {
+                                use gpui_kit::component::input::CompletionProvider as _;
+                                providers
+                                    .completions(
+                                        &rope,
+                                        offset,
+                                        lsp_types::CompletionContext {
+                                            trigger_kind:
+                                                lsp_types::CompletionTriggerKind::INVOKED,
+                                            trigger_character: None,
+                                        },
+                                        window,
+                                        cx,
+                                    )
+                                    .detach();
+                            });
+                            // 等缓存填好，再"接受"这个补全（模拟用户按 Panel）
+                            let accept_state = state.clone();
+                            cx.spawn(async move |_, cx| {
+                                cx.background_executor()
+                                    .timer(std::time::Duration::from_millis(1200))
+                                    .await;
+                                cx.update(|cx| {
+                                    if let Some(handle) = cx.windows().into_iter().next() {
+                                        let _ = handle.update(cx, |_, window, cx| {
+                                            let _ = accept_state.update(cx, |state, cx| {
+                                                state.insert("println!", window, cx);
+                                            });
+                                        });
+                                    }
+                                });
+                            })
+                            .detach();
+                            stamp("[lsp] completion accept probe by OMD_LSP_ACCEPT");
+                        }
+                    }
+                }
+                if self.lsp_semantic_pending {
+                    self.lsp_semantic_pending = false;
+                    if let Some((semantic_path, semantic_text)) = self
+                        .editors
+                        .values()
+                        .find(|editor| self.lsp_active.contains(&editor.path))
+                        .map(|editor| {
+                            (
+                                editor.path.clone(),
+                                editor.state.read(cx).value().to_string(),
+                            )
+                        })
+                    {
+                        let providers = lsp::Providers::new(self.lsp_tx.clone(), semantic_path.clone());
+                        let text = gpui_kit::component::input::Rope::from(semantic_text.as_str());
+                        let len = text.len();
+                        if let Some(handle) = cx.windows().into_iter().next() {
+                            let _ = handle.update(cx, |_, window, cx| {
+                                let task =
+                                    <lsp::Providers as gpui_kit::component::input::DocumentRangeSemanticTokensProvider>::semantic_tokens(
+                                        &providers, &text, 0..len, window, cx,
+                                    );
+                                cx.foreground_executor()
+                                    .spawn(async move {
+                                        let _ = task.await;
+                                    })
+                                    .detach();
+                            });
+                            stamp(format!(
+                                "[lsp] semantic tokens queried by OMD_LSP_SEMANTIC ({semantic_path})"
+                            ));
+                        }
+                    }
+                }
+                if self.lsp_action_pending {
+                    self.lsp_action_pending = false;
+                    if let Some(state) = self
+                        .editors
+                        .values()
+                        .find(|editor| self.lsp_active.contains(&editor.path))
+                        .map(|editor| editor.state.clone())
+                    {
+                        let (action_path, action_text) = self
+                            .editors
+                            .values()
+                            .find(|editor| self.lsp_active.contains(&editor.path))
+                            .map(|editor| {
+                                (editor.path.clone(), editor.state.read(cx).value().to_string())
+                            })
+                            .unwrap_or_default();
+                        let task = lsp::request_code_actions(
+                            &self.lsp_tx,
+                            &action_path,
+                            &action_text,
+                            0..1,
+                            cx,
+                        );
+                        cx.spawn(async move |_, _| {
+                            let _ = task.await;
+                        })
+                        .detach();
+                        stamp(format!(
+                            "[lsp] code actions queried by OMD_LSP_ACTION ({action_path})"
+                        ));
+                    }
+                }
+                if self.lsp_complete_pending {
+                    self.lsp_complete_pending = false;
+                    if let Some(state) = self
+                        .editors
+                        .values()
+                        .find(|editor| self.lsp_active.contains(&editor.path))
+                        .map(|editor| editor.state.clone())
+                    {
+                        if let Some(handle) = cx.windows().into_iter().next() {
+                            let _ = handle.update(cx, |_, window, cx| {
+                                let _ = state.update(cx, |state, cx| {
+                                    state.show_completions(window, cx);
+                                });
+                            });
+                            stamp(format!(
+                                "[lsp] show_completions dispatched by OMD_LSP_COMPLETE ({})",
+                                self.editors
+                                    .values()
+                                    .find(|editor| self.lsp_active.contains(&editor.path))
+                                    .map(|editor| editor.path.clone())
+                                    .unwrap_or_default()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 把诊断转成 range/gutter 装饰（error 红、warning 琥珀、info 蓝）。
+    fn apply_diagnostics(
+        &mut self,
+        path: String,
+        items: Vec<lsp::Diagnostic>,
+        cx: &mut Context<Self>,
+    ) {
+        let key = file_panel_id(&path);
+        let Some(editor) = self.editors.get(&key) else {
+            return;
+        };
+        let state = editor.state.clone();
+        let text = state.read(cx).value().to_string();
+        let mut ranges: Vec<RangeDecoration> = Vec::new();
+        let mut gutters: Vec<GutterDecoration> = Vec::new();
+        let mut errors = 0usize;
+        let mut warnings = 0usize;
+        for item in &items {
+            let start = lsp::offset_for(&text, item.line, item.start);
+            let end = lsp::offset_for(&text, item.end_line, item.end).max(start + 1);
+            let (fill, solid) = match item.severity {
+                1 => {
+                    errors += 1;
+                    (rgba(0xff56631f), rgba(0xff5663ff))
+                }
+                2 => {
+                    warnings += 1;
+                    (rgba(0xc9a15a1f), rgba(0xc9a15aff))
+                }
+                3 => (rgba(0x00b4ff14), rgba(0x00b4ffcc)),
+                _ => (rgba(0x9ca3b014), rgba(0x9ca3b0aa)),
+            };
+            ranges.push(
+                RangeDecoration::new(start..end)
+                    .with_style(RangeDecorationStyle::Fill)
+                    .with_color(Hsla::from(fill)),
+            );
+            let line_start = text[..start].rfind('\n').map(|index| index + 1).unwrap_or(0);
+            gutters.push(
+                GutterDecoration::new(line_start..start.max(line_start))
+                    .with_color(Hsla::from(solid)),
+            );
+        }
+        self.diag_counts.insert(key.clone(), (errors, warnings));
+        if let Some((range_dec, gutter_dec)) = self.editor_diags.get(&key).cloned() {
+            // 注意：set() 内部会 update 编辑器实体，不能再包在 state.update 里（会重入 panic）
+            range_dec.set(ranges, cx);
+            gutter_dec.set(gutters, cx);
+        } else {
+            let created = state.update(cx, |state, cx| {
+                (
+                    state.create_range_decorations_collection(ranges, cx),
+                    state.create_gutter_decorations_collection(gutters, cx),
+                )
+            });
+            self.editor_diags.insert(key, created);
+        }
+        eprintln!(
+            "[lsp] {} diagnostics: {} ({} errors, {} warnings)",
+            short_path(&path),
+            items.len(),
+            errors,
+            warnings
+        );
+        cx.notify();
+    }
+
+    /// 保证某个文件已经有编辑器状态（没有就建）。
+    fn ensure_editor(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        let key = file_panel_id(&path);
+        if !self.editors.contains_key(&key) {
+            let text = read_text_preview(&path);
+            let language = PathBuf::from(&path)
+                .extension()
+                .map(|ext| ext.to_string_lossy().to_string())
+                .unwrap_or_else(|| "text".to_string());
+            let tab_width = tab_size_for(&language);
+            let state = cx.new(|cx| {
+                EditorState::new(window, cx)
+                    .default_value(text.clone())
+                    .language(language.clone())
+                    .tab_size(gpui_kit::component::input::TabSize {
+                        tab_size: tab_width,
+                        hard_tabs: false,
+                    })
+            });
+            let editor_key = key.clone();
+            let editor_path = path.clone();
+            let lsp_path = path.clone();
+            let sub = cx.subscribe(&state, move |this, state, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    if let Some(editor) = this.editors.get_mut(&editor_key) {
+                        editor.dirty = true;
+                    }
+                    // 推给语言服务器（full sync；超过 4MB 的文件不推，免得卡）
+                    if this.lsp_active.contains(&editor_path) {
+                        let text = state.read(cx).value().to_string();
+                        if text.len() < 4 * 1024 * 1024 {
+                            let _ = this.lsp_tx.send(lsp::Cmd::Change {
+                                path: editor_path.clone(),
+                                text,
+                            });
+                        }
+                    }
+                    cx.notify();
+                }
+            });
+            self._editor_sub = Some(sub);
+            let chars = state.read(cx).value().to_string().chars().count();
+            eprintln!("[ui] editor loaded {path} ({chars} chars)");
+            self.editors.insert(
+                key,
+                FileEditor {
+                    path: path.clone(),
+                    language,
+                    state,
+                    dirty: false,
+                },
+            );
+            // 有对应语言服务器就打开文档（didOpen 之后诊断才会来）
+            if lsp::server_for(&lsp_path).is_some() {
+                self.lsp_active.insert(lsp_path.clone());
+                let providers = lsp::Providers::with_events(
+                    self.lsp_tx.clone(),
+                    lsp_path.clone(),
+                    self.lsp_ev_tx.clone(),
+                );
+                // 接受补全后要把 additionalTextEdits（自动 import）补上
+                self.completion_extras
+                    .insert(file_panel_id(&lsp_path), providers.extras());
+                let extras_path = lsp_path.clone();
+                let extras_key = file_panel_id(&lsp_path);
+                let edits_sub = cx.subscribe(
+                    &self.editors.get(&extras_key).unwrap().state.clone(),
+                    move |this, _, event: &gpui_kit::component::input::InputEditsEvent, cx| {
+                        this.apply_completion_extras(&extras_path, &extras_key, event, cx);
+                    },
+                );
+                self._edits_sub = Some(edits_sub);
+
+                if let Some(editor_state) = self
+                    .editors
+                    .get(&file_panel_id(&lsp_path))
+                    .map(|editor| editor.state.clone())
+                {
+                    editor_state.update(cx, |state, _cx| {
+                        let lsp = state.lsp_mut();
+                        lsp.completion_provider =
+                            Some(std::rc::Rc::new(providers.clone()));
+                        lsp.hover_provider = Some(std::rc::Rc::new(providers.clone()));
+                        lsp.definition_provider = Some(std::rc::Rc::new(providers.clone()));
+                        lsp.code_action_providers
+                            .push(std::rc::Rc::new(providers.clone()));
+                        lsp.semantic_tokens_provider =
+                            Some(std::rc::Rc::new(providers.clone()));
+                        // 触发一次语言特性刷新（语义高亮要等这次刷新才会发请求）
+                        state.refresh(_cx);
+                    });
+                }
+                let _ = self.lsp_tx.send(lsp::Cmd::Open {
+                    path: lsp_path,
+                    text,
+                });
+            } else {
+                eprintln!("[lsp] 没有可用的语言服务器: {path}");
+            }
+        }
+    }
+
+    /// Ctrl+S：把所有改过的编辑器写回磁盘。
+    fn save_file_editor(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .editors
+            .iter()
+            .filter(|(_, editor)| editor.dirty)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let Some(editor) = self.editors.get(&id) else {
+                continue;
+            };
+            let path = editor.path.clone();
+            let text = editor.state.read(cx).value().to_string();
+            match std::fs::write(&path, text.clone()) {
+                Ok(()) => {
+                    if let Some(editor) = self.editors.get_mut(&id) {
+                        editor.dirty = false;
+                    }
+                    if self.lsp_active.contains(&path) {
+                        let _ = self.lsp_tx.send(lsp::Cmd::Save {
+                            path: path.clone(),
+                            text,
+                        });
+                    }
+                    eprintln!("[ui] saved {path}");
+                }
+                Err(err) => eprintln!("[ui] save failed {path}: {err}"),
+            }
+        }
+        cx.notify();
+    }
+
+    /// 切设置分页时按需加载数据。
+    fn open_settings_tab(&mut self, tab: SettingsTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_tab = tab;
+        self.settings_tab_error = None;
+        match tab {
+            SettingsTab::General => self.reload_settings(),
+            SettingsTab::Plugins => {
+                self.plugins_input
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+                let _ = self.cmds.send_blocking(Cmd::Call {
+                    tag: "plugins/list".to_string(),
+                    endpoint: "pluginManager/listPlugins".to_string(),
+                    args: json!({}),
+                });
+            }
+            SettingsTab::Account => {
+                let _ = self.cmds.send_blocking(Cmd::Call {
+                    tag: "account/state".to_string(),
+                    endpoint: "account/getState".to_string(),
+                    args: json!({}),
+                });
+            }
+        }
+    }
+
+    /// 读一遍 dsh 的 settings（settings/describe）。
+    fn reload_settings(&mut self) {
+        self.settings_loading = true;
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "settings/describe".to_string(),
+            endpoint: "settings/describe".to_string(),
+            args: json!({}),
+        });
+    }
+
+    /// 写一个设置项：settings/mutate + 一个 path op。
+    fn write_setting(&mut self, ns: &str, path: Vec<String>, value: Value, revision: Option<i64>) {
+        let mut args = json!({
+            "ns": ns,
+            "ops": [{ "op": "set", "path": path, "value": value }],
+        });
+        if let Some(rev) = revision {
+            args["expectedRevision"] = json!(rev);
+        }
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "settings/mutate".to_string(),
+            endpoint: "settings/mutate".to_string(),
+            args,
+        });
+    }
+
+    /// 把 panel 在它所在 session 的 tabs 里左右挪一格。
+    fn move_tab(&mut self, tab_id: &str, delta: isize, cx: &mut Context<Self>) {
+        let Some(space) = self
+            .spaces
+            .iter_mut()
+            .find(|space| space.panels.iter().any(|tab| tab.id == tab_id))
+        else {
+            return;
+        };
+        let Some(index) = space.panels.iter().position(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let target = index as isize + delta;
+        if target < 0 || target as usize >= space.panels.len() {
+            return;
+        }
+        let tab = space.panels.remove(index);
+        space.panels.insert(target as usize, tab);
+        self.save_state();
+        cx.notify();
+    }
+
+    /// 拖动中：按水平位移一格一格挪。
+    fn drag_tab(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some((panel_id, anchor)) = self.tab_drag.clone() else {
+            return;
+        };
+        if ev.pressed_button != Some(MouseButton::Left) {
+            self.tab_drag = None;
+            cx.notify();
+            return;
+        }
+        let x = f32::from(ev.position.x);
+        // 不知道 tab 实际宽度，用一档固定位移近似（约半个 tab）
+        let step = 64.;
+        if x - anchor > step {
+            self.move_tab(&panel_id, 1, cx);
+            self.tab_drag = Some((panel_id, x));
+        } else if anchor - x > step {
+            self.move_tab(&panel_id, -1, cx);
+            self.tab_drag = Some((panel_id, x));
+        }
+    }
+
+    /// 开始改名：把当前名字填进输入框并聚焦。
+    fn begin_rename(&mut self, target: RenameTarget, window: &mut Window, cx: &mut Context<Self>) {
+        let current = match &target {
+            RenameTarget::Space(space_id) => self
+                .spaces
+                .iter()
+                .find(|space| &space.id == space_id)
+                .map(|space| space.name.clone())
+                .unwrap_or_default(),
+            RenameTarget::Panel(tab_id) => self
+                .current_space
+                .as_ref()
+                .and_then(|id| self.spaces.iter().find(|space| &space.id == id))
+                .and_then(|space| space.panels.iter().find(|tab| &tab.id == tab_id))
+                .map(|tab| {
+                    let index = self
+                        .spaces
+                        .iter()
+                        .find(|space| space.panels.iter().any(|t| t.id == tab.id))
+                        .and_then(|space| space.panels.iter().position(|t| t.id == tab.id))
+                        .unwrap_or(0);
+                    tab_display_name(tab, index)
+                })
+                .unwrap_or_default(),
+            RenameTarget::Block(session_id) => self.session_title(session_id),
+            RenameTarget::File(path) => PathBuf::from(path)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            RenameTarget::NewFile(_) | RenameTarget::NewDir(_) => String::new(),
+        };
+        self.rename_input
+            .update(cx, |state, cx| state.set_value(current, window, cx));
+        self.rename_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        self.renaming = Some(target);
+        cx.notify();
+    }
+
+    /// 提交改名（空名字 = 恢复默认）。
+    fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.renaming.take() else {
+            return;
+        };
+        let value = self.rename_input.read(cx).value().trim().to_string();
+        let mut back_to_chat = true;
+        match target {
+            RenameTarget::Space(space_id) => {
+                if let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) {
+                    if value.is_empty() {
+                        space.name = space_name(&space.cwd);
+                    } else {
+                        space.name = value;
+                    }
+                }
+            }
+            RenameTarget::Panel(tab_id) => {
+                if let Some(space) = self
+                    .current_space
+                    .clone()
+                    .and_then(|id| self.spaces.iter_mut().find(|space| space.id == id))
+                {
+                    if let Some(tab) = space.panels.iter_mut().find(|tab| tab.id == tab_id) {
+                        // 输入的就是默认名（tab N）→ 当作没改名，仍然跟着编号走
+                        let default_name = format!("tab {}", tab.number.max(1));
+                        tab.name = if value == default_name { String::new() } else { value };
+                    }
+                }
+            }
+            RenameTarget::Block(session_id) => {
+                if value.is_empty() {
+                    self.panel_names.remove(&session_id);
+                } else {
+                    let _ = self.cmds.send_blocking(Cmd::Call {
+                        tag: "session/rename".to_string(),
+                        endpoint: "session/rename".to_string(),
+                        args: json!({ "sessionId": session_id.clone(), "title": value.clone() }),
+                    });
+                    self.panel_names.insert(session_id, value);
+                }
+            }
+            RenameTarget::File(old_path) => {
+                if !value.is_empty() && !self.editors.contains_key(&file_panel_id(&old_path)) {
+                    let old = PathBuf::from(&old_path);
+                    if let Some(parent) = old.parent() {
+                        let next = parent.join(&value);
+                        match std::fs::rename(&old, &next) {
+                            Ok(()) => {
+                                self.files_selected = Some(next.display().to_string());
+                                self.files_cache.clear();
+                                self.files_load(&self.files_root.clone());
+                                self.files_load_expanded();
+                                self.refresh_git_status();
+                            }
+                            Err(err) => eprintln!("[files] rename failed: {err}"),
+                        }
+                    }
+                } else if !value.is_empty() {
+                    eprintln!("[files] close the editor before renaming {old_path}");
+                }
+            }
+            RenameTarget::NewFile(dir) => {
+                if !value.is_empty() {
+                    let path = PathBuf::from(&dir).join(&value);
+                    match std::fs::OpenOptions::new().create_new(true).write(true).open(&path) {
+                        Ok(_) => {
+                            self.files_cache.clear();
+                            self.files_load(&self.files_root.clone());
+                            self.files_load_expanded();
+                            self.refresh_git_status();
+                            let path = path.display().to_string();
+                            self.files_selected = Some(path.clone());
+                            self.open_file_panel(path, window, cx);
+                        }
+                        Err(err) => eprintln!("[files] create failed: {err}"),
+                    }
+                }
+            }
+            RenameTarget::NewDir(dir) => {
+                if !value.is_empty() {
+                    let path = PathBuf::from(&dir).join(&value);
+                    if let Err(err) = std::fs::create_dir_all(&path) {
+                        eprintln!("[files] mkdir failed: {err}");
+                    } else {
+                        self.files_cache.clear();
+                        self.files_load(&self.files_root.clone());
+                        self.files_load_expanded();
+                        self.refresh_git_status();
+                    }
+                }
+            }
+        }
+        self.save_state();
+        if back_to_chat {
+            self.input.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.renaming.take().is_some() {
+            self.input.read(cx).focus_handle(cx).focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// 新建一个终端 pane（下 / 右 / 标签页）。可以重复加，互不影响。
+    /// 从指定 panel 分出一个新的 terminal panel（布局树里一分为二）。
+    /// 悬停到分屏按钮：立刻展开菜单（同一时刻只开一个）。
+    fn open_split_menu(&mut self, leaf: u64, dir: SplitDir, cx: &mut Context<Self>) {
+        self.split_hover_gen = self.split_hover_gen.wrapping_add(1);
+        if self.split_hover != Some((leaf, dir)) {
+            self.split_hover = Some((leaf, dir));
+            cx.notify();
+        }
+    }
+
+    /// 离开按钮/菜单：延迟 240ms 关，期间进菜单会把代计数作废。
+    fn close_split_menu_soon(&mut self, cx: &mut Context<Self>) {
+        self.split_hover_gen = self.split_hover_gen.wrapping_add(1);
+        let generation = self.split_hover_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(240))
+                .await;
+            let _ = this.update(cx, |root, cx| {
+                if root.split_hover_gen == generation && root.split_hover.is_some() {
+                    root.split_hover = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 关掉一个 dsh block：释放它的会话，并把空出来的 tab 收掉。
+    fn close_chat_pane(&mut self, pane_id: u64, session: &str, cx: &mut Context<Self>) {
+        let is_dsh = !is_file_panel(session) && !self.term_tabs.contains(session);
+        if is_dsh {
+            let _ = self.cmds.send_blocking(Cmd::CancelSession(session.to_string()));
+        }
+
+        let mut next_panel: Option<String> = None;
+        if let Some(space_id) = self.current_space.clone() {
+            if let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) {
+                if let Some(index) = space
+                    .panels
+                    .iter()
+                    .position(|tab| tab.blocks.iter().any(|panel| panel == session) || tab.layout.has(pane_id))
+                {
+                    let tab_id = space.panels[index].id.clone();
+                    let tab = &mut space.panels[index];
+                    tab.layout.remove(pane_id);
+                    tab.blocks.retain(|panel| panel != session);
+                    if tab.maximized == Some(pane_id) {
+                        tab.maximized = None;
+                    }
+                    if tab.active.as_deref() == Some(session) {
+                        tab.active = tab.blocks.first().cloned();
+                    }
+                    let mut leaves = Vec::new();
+                    tab.layout.leaves(&mut leaves);
+                    let empty = tab.blocks.is_empty() && leaves.len() <= 1;
+                    if empty {
+                        space.panels.remove(index);
+                        if space.active_panel.as_deref() == Some(tab_id.as_str()) {
+                            space.active_panel = space
+                                .panels
+                                .get(index)
+                                .or_else(|| space.panels.get(index.saturating_sub(1)))
+                                .map(|tab| tab.id.clone());
+                        }
+                    }
+                }
+                next_panel = space
+                    .current_tab()
+                    .and_then(|tab| tab.active.clone().or_else(|| tab.blocks.first().cloned()))
+                    .or_else(|| {
+                        space.panels.iter().find_map(|tab| {
+                            tab.active.clone().or_else(|| tab.blocks.first().cloned())
+                        })
+                    });
+            }
+        }
+
+        self.panes.retain(|pane| pane.id != pane_id);
+        self.chat_scrolls.remove(&pane_id);
+        self.release_block_input(session);
+
+        if self.selected.as_deref() == Some(session) {
+            if let Some(next) = next_panel {
+                self.switch_to_chat(next, cx);
+            } else {
+                self.selected = None;
+                self.items.clear();
+                self.streaming = None;
+                self.agent_running = false;
+            }
+        }
+        self.save_state();
+        cx.notify();
+    }
+
+    /// 分屏装一个 dsh 面板：先建会话，等 SessionCreated 再插进布局。
+    fn split_with_dsh(&mut self, leaf: u64, dir: SplitDir, cx: &mut Context<Self>) {
+        self.pending_split = Some((leaf, dir));
+        let cwd = self
+            .current_space
+            .as_ref()
+            .and_then(|id| self.spaces.iter().find(|space| &space.id == id))
+            .map(|space| space.cwd.clone());
+        let _ = self.cmds.send_blocking(Cmd::NewSession { cwd });
+        cx.notify();
+    }
+
+    /// 切到某个会话当"活动聊天"：先把旧的存快照，再恢复新的。
+    fn switch_to_chat(&mut self, session: String, cx: &mut Context<Self>) {
+        if self.selected.as_deref() == Some(session.as_str()) {
+            return;
+        }
+        if let Some(old) = self.selected.clone() {
+            self.chat_snapshots
+                .insert(old.clone(), (self.items.clone(), self.reveal_limit));
+            if let Some(stream) = self.streaming.take() {
+                self.chat_streams.insert(old, stream);
+            }
+        }
+        let (items, reveal) = self
+            .chat_snapshots
+            .remove(session.as_str())
+            .unwrap_or((Vec::new(), usize::MAX));
+        self.items = items;
+        self.reveal_limit = reveal;
+        self.streaming = self.chat_streams.remove(&session);
+        self.typing = None;
+        self.awaiting_reply = false;
+        self.selected = Some(session.clone());
+        let _ = self.cmds.send_blocking(Cmd::Follow(session.clone()));
+        let _ = self
+            .cmds
+            .send_blocking(Cmd::JobsWatch { session_id: Some(session) });
+        cx.notify();
+    }
+
+    /// 新建一个 dsh 会话（「+」和分屏按钮的默认动作）。
+    fn new_dsh_session(&mut self, cx: &mut Context<Self>) {
+        let cwd = self
+            .current_space
+            .as_ref()
+            .and_then(|id| self.spaces.iter().find(|space| &space.id == id))
+            .map(|space| space.cwd.clone());
+        let _ = self.cmds.send_blocking(Cmd::NewSession { cwd });
+        cx.notify();
+    }
+
+    fn split_pane(&mut self, leaf: u64, dir: SplitDir, cx: &mut Context<Self>) {
+        let pane_id = next_pane_id();
+        let cwd = self
+            .current_space
+            .as_ref()
+            .and_then(|space_id| self.spaces.iter().find(|space| &space.id == space_id))
+            .map(|space| space.cwd.clone());
+        let Some(space_id) = self.current_space.clone() else {
+            return;
+        };
+        if let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) {
+            let Some(tab_id) = space.active_panel.clone() else {
+                return;
+            };
+            if let Some(tab) = space.panels.iter_mut().find(|tab| tab.id == tab_id) {
+                tab.layout.split(leaf, dir, pane_id);
+                tab.maximized = None;
+            }
+        }
+        let _ = self.cmds.send_blocking(Cmd::NewTerminal {
+            pane_id,
+            kind: dir.pane_kind(),
+            cwd,
+            run: None,
+        });
+        cx.notify();
+    }
+
+    /// 最大化/还原一个 panel（Herdr 的 ↙）
+    fn toggle_maximize(&mut self, pane_id: u64, cx: &mut Context<Self>) {
+        let Some(space_id) = self.current_space.clone() else {
+            return;
+        };
+        if let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) {
+            let Some(tab_id) = space.active_panel.clone() else {
+                return;
+            };
+            if let Some(tab) = space.panels.iter_mut().find(|tab| tab.id == tab_id) {
+                tab.maximized = if tab.maximized == Some(pane_id) {
+                    None
+                } else {
+                    Some(pane_id)
+                };
+            }
+        }
+        cx.notify();
+    }
+
+    fn close_pane(&mut self, pane_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let (term_id, session, editor_path) = self
+            .panes
+            .iter()
+            .find(|pane| pane.id == pane_id)
+            .map(|pane| {
+                (
+                    pane.term_id.clone(),
+                    pane.session.clone(),
+                    pane.editor_path.clone(),
+                )
+            })
+            .unwrap_or_default();
+        if !term_id.is_empty() {
+            let _ = self.cmds.send_blocking(Cmd::Call {
+                tag: "terminal-close".to_string(),
+                endpoint: "terminal/close".to_string(),
+                args: json!({ "id": term_id }),
+            });
+        }
+        if let Some(session) = session.as_deref() {
+            if !is_file_panel(session) && !self.term_tabs.contains(session) {
+                let _ = self.cmds.send_blocking(Cmd::CancelSession(session.to_string()));
+            }
+        }
+        if let Some(path) = editor_path {
+            self.close_editor_state(&path, &**cx);
+        }
+        if let Some(space_id) = self.current_space.clone() {
+            if let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) {
+                for tab in space.panels.iter_mut() {
+                    tab.layout.remove(pane_id);
+                    if let Some(session) = session.as_deref() {
+                        tab.blocks.retain(|panel| panel != session);
+                        if tab.active.as_deref() == Some(session) {
+                            tab.active = tab.blocks.first().cloned();
+                        }
+                    }
+                    if tab.maximized == Some(pane_id) {
+                        tab.maximized = None;
+                    }
+                }
+            }
+        }
+        self.panes.retain(|pane| pane.id != pane_id);
+        if let Some(session) = session.as_deref() {
+            self.release_block_input(session);
+        }
+        self.drag_pane = None;
+        self.input.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn send_terminal_key(&mut self, term_id: &str, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+        let encoded = self
+            .panes
+            .iter()
+            .find(|pane| pane.term_id == term_id)
+            .and_then(|pane| pane.term.as_ref())
+            .and_then(|term| {
+                let (key, mods, text, unshifted) = ghostty_key(keystroke)?;
+                Some(term.encode_key(key, mods, &text, unshifted))
+            })
+            .filter(|bytes| !bytes.is_empty())
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+            .or_else(|| key_to_bytes(keystroke));
+        let Some(data) = encoded else {
+            return false;
+        };
+        let _ = self
+            .cmds
+            .send_blocking(Cmd::TerminalInput { term_id: term_id.to_string(), data });
+        true
+    }
+
+    /// 当前拿到键盘焦点的 pane 的 term_id（用于把按键路由到对应终端）。
+    fn focused_term(&self, window: &Window, cx: &App) -> Option<String> {
+        self.panes
+            .iter()
+            .find(|pane| pane.focus.contains_focused(window, cx))
+            .filter(|pane| !pane.term_id.is_empty())
+            .map(|pane| pane.term_id.clone())
+    }
+
+    /// 拖拽分隔条：按鼠标位移改 pane 尺寸。
+    fn drag_pane_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // 拖 panel 头：和同 split 的邻居交换
+        if let Some((leaf, start_x, start_y)) = self.drag_leaf {
+            if ev.pressed_button != Some(MouseButton::Left) {
+                self.drag_leaf = None;
+                cx.notify();
+            } else {
+                let dx = f32::from(ev.position.x) - start_x;
+                let dy = f32::from(ev.position.y) - start_y;
+                let (dir, delta) = if dx.abs() > dy.abs() {
+                    (SplitDir::Row, if dx > 90. { 1 } else if dx < -90. { -1 } else { 0 })
+                } else {
+                    (SplitDir::Col, if dy > 70. { 1 } else if dy < -70. { -1 } else { 0 })
+                };
+                if delta != 0 {
+                    if let Some(space_id) = self.current_space.clone() {
+                        if let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id)
+                        {
+                            if let Some(tab_id) = space.active_panel.clone() {
+                                if let Some(tab) = space.panels.iter_mut().find(|tab| tab.id == tab_id)
+                                {
+                                    tab.layout.swap_neighbor(leaf, dir, delta);
+                                }
+                            }
+                        }
+                    }
+                    self.drag_leaf = Some((leaf, f32::from(ev.position.x), f32::from(ev.position.y)));
+                    cx.notify();
+                }
+                return;
+            }
+        }
+        // 布局树分隔条
+        if let Some((split_id, index, start, sizes)) = self.drag_split.clone() {
+            if ev.pressed_button != Some(MouseButton::Left) {
+                self.drag_split = None;
+                cx.notify();
+            } else {
+                let vertical = true;
+                let pos = if vertical {
+                    f32::from(ev.position.x)
+                } else {
+                    f32::from(ev.position.y)
+                };
+                let span = if vertical {
+                    f32::from(window.viewport_size().width)
+                } else {
+                    f32::from(window.viewport_size().height)
+                }
+                .max(1.);
+                let delta = (pos - start) / span;
+                let mut next = sizes.clone();
+                if index + 1 < next.len() {
+                    let total = next[index] + next[index + 1];
+                    let left = (next[index] + delta).clamp(0.08, total - 0.08);
+                    next[index] = left;
+                    next[index + 1] = total - left;
+                    if let Some(space_id) = self.current_space.clone() {
+                        if let Some(space) =
+                            self.spaces.iter_mut().find(|space| space.id == space_id)
+                        {
+                            if let Some(tab_id) = space.active_panel.clone() {
+                                if let Some(tab) =
+                                    space.panels.iter_mut().find(|tab| tab.id == tab_id)
+                                {
+                                    tab.layout.set_sizes(split_id, next);
+                                }
+                            }
+                        }
+                    }
+                }
+                cx.notify();
+                return;
+            }
+        }
+        let Some((pane_id, start, start_size)) = self.drag_pane else {
+            return;
+        };
+        if ev.pressed_button != Some(MouseButton::Left) {
+            // 松开发生在窗口外（收不到 mouse_up）时兜底收尾
+            self.drag_pane = None;
+            cx.notify();
+            return;
+        }
+        let x = f32::from(ev.position.x);
+        let y = f32::from(ev.position.y);
+        let viewport_w = f32::from(window.viewport_size().width);
+        let viewport_h = f32::from(window.viewport_size().height);
+        if pane_id == 0 {
+            // 左侧文件栏的宽度：分隔条在右边缘，往右拖 = 变宽
+            let max = (viewport_w - 360.).max(PANE_WIDTH_MIN);
+            self.files_width = (start_size + (x - start)).clamp(180., max);
+            cx.notify();
+            return;
+        }
+        if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) {
+            match pane.kind {
+                // 分隔条在 pane 左侧：往右拖 = 变窄
+                BlockPlacement::Right => {
+                    let max = (viewport_w - 320.).max(PANE_WIDTH_MIN);
+                    pane.size = (start_size - (x - start)).clamp(PANE_WIDTH_MIN, max);
+                }
+                BlockPlacement::Bottom => {
+                    let max = (viewport_h - 160.).max(PANE_HEIGHT_MIN);
+                    pane.size = (start_size - (y - start)).clamp(PANE_HEIGHT_MIN, max);
+                }
+                BlockPlacement::Panel => {}
+            }
+        }
+        cx.notify();
+    }
+
+    fn end_pane_drag(&mut self, cx: &mut Context<Self>) {
+        if self.drag_pane.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Commands面板（搜索 + Commands / Panels / Spaces）
+    // ------------------------------------------------------------------
+
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_palette_on(PaletteTab::All, window, cx);
+    }
+
+    /// 以指定分类打开面板（Spaces按钮 → Spaces，Ctrl+K → All）。
+    fn open_palette_on(&mut self, tab: PaletteTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_palette = true;
+        self.palette_tab = tab;
+        self.palette_index = 0;
+        self.palette_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.palette_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        cx.notify();
+    }
+
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_palette = false;
+        self.palette_index = 0;
+        self.input.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn palette_query(&self, cx: &Context<Self>) -> String {
+        self.palette_input.read(cx).value().to_string()
+    }
+
+    /// 面板条目：Commands / 当前空间的 dsh sessions / Spaces。query 做大小写无关子串匹配。
+    fn palette_entries(&self, query: &str) -> Vec<PaletteEntry> {
+        let query = query.trim().to_lowercase();
+        let mut entries: Vec<PaletteEntry> = Vec::new();
+        let space = self
+            .current_space
+            .as_ref()
+            .and_then(|id| self.spaces.iter().find(|space| &space.id == id));
+        let space_name = space.map(|space| space.name.clone()).unwrap_or_default();
+        let tabs = space.map(|space| space.all_panels()).unwrap_or_default();
+
+        if matches!(self.palette_tab, PaletteTab::All | PaletteTab::Commands) {
+            let commands: [(PaletteAction, &str, String); 9] = [
+                (
+                    PaletteAction::NewSession,
+                    "New panel",
+                    format!("New panel in {space_name}"),
+                ),
+                (
+                    PaletteAction::TermPane(BlockPlacement::Bottom),
+                    "Terminal · bottom",
+                    "stacked".to_string(),
+                ),
+                (
+                    PaletteAction::TermPane(BlockPlacement::Right),
+                    "Terminal · right",
+                    "side by side".to_string(),
+                ),
+                (
+                    PaletteAction::OpenModels,
+                    "Switch model",
+                    "pick provider / model".to_string(),
+                ),
+                (
+                    PaletteAction::OpenFiles,
+                    "Files",
+                    "browse the session working directory".to_string(),
+                ),
+                (
+                    PaletteAction::OpenSettings,
+                    "Settings",
+                    "engine version, status and theme".to_string(),
+                ),
+                (
+                    PaletteAction::GitStageAll,
+                    "Git · stage all",
+                    "git add -A in the file root".to_string(),
+                ),
+                (
+                    PaletteAction::GitUnstageAll,
+                    "Git · unstage all",
+                    "git reset in the file root".to_string(),
+                ),
+                (
+                    PaletteAction::GitCommit,
+                    "Git · commit",
+                    "commit staged changes with a message".to_string(),
+                ),
+            ];
+            for (action, label, sub) in commands {
+                entries.push(PaletteEntry {
+                    section: "Commands",
+                    label: label.to_string(),
+                    tag: String::new(),
+                    sub,
+                    badge: None,
+                    dot: None,
+                    action,
+                });
+            }
+        }
+
+        if matches!(self.palette_tab, PaletteTab::All | PaletteTab::Tabs) {
+            // Navigation is space -> tab; a tab owns its panels. Session rows
+            // are deliberately not a palette category: thousands of persisted
+            // conversations are not a navigation hierarchy.
+            for space in &self.spaces {
+                for tab in &space.panels {
+                    let tab_label = tab.label(|panel| self.session_title(panel));
+                    entries.push(PaletteEntry {
+                        section: "Tabs",
+                        label: format!("{} / {}", space.name, tab_label),
+                        tag: space.name.clone(),
+                        sub: format!("{} block(s)", tab.blocks.len()),
+                        badge: None,
+                        dot: Some(if self.current_space.as_deref() == Some(space.id.as_str()) {
+                            0x00d98a
+                        } else {
+                            0x2c3340
+                        }),
+                        action: PaletteAction::OpenTab {
+                            space_id: space.id.clone(),
+                            tab_id: tab.id.clone(),
+                        },
+                    });
+                }
+            }
+        }
+
+        if matches!(self.palette_tab, PaletteTab::All | PaletteTab::Spaces) {
+            for space in &self.spaces {
+                let current = self.current_space.as_deref() == Some(space.id.as_str());
+                entries.push(PaletteEntry {
+                    section: "Spaces",
+                    label: space.name.clone(),
+                    tag: format!(
+                        "{} panels{}",
+                        space.panels.len(),
+                        if current { " · current" } else { "" }
+                    ),
+                    sub: short_cwd(&space.cwd),
+                    badge: None,
+                    dot: Some(if current { 0x00d98a } else { 0x2c3340 }),
+                    action: PaletteAction::SwitchSpace(space.id.clone()),
+                });
+            }
+        }
+
+        if !query.is_empty() {
+            entries.retain(|entry| {
+                entry.label.to_lowercase().contains(&query)
+                    || entry.tag.to_lowercase().contains(&query)
+                    || entry.sub.to_lowercase().contains(&query)
+                    || entry.section.contains(&query)
+            });
+        }
+        if query.chars().count() >= 2 {
+            if let Some(err) = &self.search_error {
+                entries.push(PaletteEntry {
+                    section: "Matches",
+                    label: err.clone(),
+                    tag: "search".to_string(),
+                    sub: String::new(),
+                    badge: None,
+                    dot: Some(0xff5663),
+                    action: PaletteAction::NewSession,
+                });
+            }
+            for hit in &self.search_hits {
+                let session_id = hit
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if session_id.is_empty() {
+                    continue;
+                }
+                let snippet = hit
+                    .get("snippet")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .replace('\n', " ");
+                let label: String = snippet.chars().take(76).collect();
+                let tail: String = session_id.chars().rev().take(6).collect();
+                entries.push(PaletteEntry {
+                    section: "Matches",
+                    label: if label.trim().is_empty() {
+                        "(no snippet)".to_string()
+                    } else {
+                        label
+                    },
+                    tag: format!("···{}", tail.chars().rev().collect::<String>()),
+                    sub: String::new(),
+                    badge: None,
+                    dot: Some(0x00b4ff),
+                    action: PaletteAction::OpenSession(session_id),
+                });
+            }
+        }
+        entries
+    }
+
+    fn palette_step(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let query = self.palette_query(cx);
+        let len = self.palette_entries(&query).len();
+        if len == 0 {
+            self.palette_index = 0;
+        } else {
+            let current = self.palette_index.min(len - 1) as isize;
+            self.palette_index = (current + delta).rem_euclid(len as isize) as usize;
+        }
+        cx.notify();
+    }
+
+    fn palette_activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.palette_query(cx);
+        let entries = self.palette_entries(&query);
+        let Some(action) = entries.get(self.palette_index).map(|entry| entry.action.clone()) else {
+            return;
+        };
+        self.show_palette = false;
+        let keep_focus = matches!(action, PaletteAction::GitCommit);
+        match action {
+            PaletteAction::OpenSession(id) => self.open_tab(id, cx),
+            PaletteAction::OpenTab { space_id, tab_id } => {
+                self.current_space = Some(space_id);
+                self.activate_tab(tab_id, cx);
+            }
+            PaletteAction::SwitchSpace(id) => self.switch_space(id, cx),
+            PaletteAction::NewSession => {
+                let cwd = self
+                    .current_space
+                    .as_ref()
+                    .and_then(|id| self.spaces.iter().find(|space| &space.id == id))
+                    .map(|space| space.cwd.clone());
+                let _ = self.cmds.send_blocking(Cmd::NewSession { cwd });
+            }
+            PaletteAction::TermPane(kind) => {
+                let dir = if kind == BlockPlacement::Right {
+                    SplitDir::Row
+                } else {
+                    SplitDir::Col
+                };
+                self.split_pane(0, dir, cx)
+            }
+            PaletteAction::GitStageAll => {
+                self.open_git_changes(cx);
+                self.run_git(&["add", "-A"]);
+            }
+            PaletteAction::GitUnstageAll => {
+                self.open_git_changes(cx);
+                self.run_git(&["reset"]);
+            }
+            PaletteAction::GitCommit => {
+                self.open_git_changes(cx);
+                self.focus_commit(window, cx);
+            }
+            PaletteAction::OpenModels => {
+                self.show_models = true;
+                let empty = self
+                    .model_catalog
+                    .get("groups")
+                    .and_then(|value| value.as_array())
+                    .map_or(true, |groups| groups.is_empty());
+                if empty {
+                    self.model_loading = true;
+                    let _ = self.cmds.send_blocking(Cmd::ModelCatalog);
+                }
+            }
+            PaletteAction::OpenFiles => self.files_toggle_sidebar(cx),
+            PaletteAction::OpenSettings => {
+                self.show_settings = true;
+                self.open_settings_tab(SettingsTab::General, window, cx);
+            }
+        }
+        if !keep_focus {
+            self.input.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// 全局快捷键：Ctrl+K 开面板；面板开着时接管 ↑↓ / ↵ / esc / tab。
+    /// 返回 true 表示已消费，调用方会 `stop_propagation()`（否则 Enter 会被输入框吃掉）。
+    fn handle_global_key(
+        &mut self,
+        keystroke: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let ctrl = keystroke.modifiers.control || keystroke.modifiers.platform;
+        let key = keystroke.key.as_str();
+        // 命令面板里：输入变了就顺带查一次全库搜索
+        if self.show_palette {
+            let query = self.palette_input.read(cx).value().trim().to_string();
+            if query.chars().count() >= 2 {
+                if query != self.search_query {
+                    self.search_query = query.clone();
+                    let _ = self.cmds.send_blocking(Cmd::Call {
+                        tag: "session/search".to_string(),
+                        endpoint: "session/search".to_string(),
+                        args: json!({ "request": { "query": query } }),
+                    });
+                }
+            } else if !self.search_query.is_empty() {
+                self.search_query.clear();
+                self.search_hits.clear();
+            }
+        }
+        // 编辑器打开时：Ctrl+S 存盘 / Esc 关闭
+        if self
+            .selected
+            .as_deref()
+            .is_some_and(is_file_panel)
+        {
+            if ctrl && key == "s" {
+                self.save_file_editor(cx);
+                return true;
+            }
+            if key == "escape" {
+                if let Some(panel_id) = self.selected.clone() {
+                    self.close_tab(&panel_id, cx);
+                }
+                return true;
+            }
+        }
+        if self.files_sidebar && key == "f2" {
+            if let Some(path) = self.files_selected.clone() {
+                if std::path::Path::new(&path).is_file() && !self.editors.contains_key(&file_panel_id(&path)) {
+                    self.begin_rename(RenameTarget::File(path), window, cx);
+                    return true;
+                }
+            }
+        }
+        // 设置项编辑中：Enter 提交 / Esc 取消
+        if self.settings_edit.is_some() {
+            return match key {
+                "enter" => {
+                    self.commit_setting_edit(window, cx);
+                    true
+                }
+                "escape" => {
+                    self.settings_edit = None;
+                    self.input.read(cx).focus_handle(cx).focus(window, cx);
+                    cx.notify();
+                    true
+                }
+                _ => false,
+            };
+        }
+        // 改名中：Enter 提交 / Esc 取消（要抢在输入框键绑定之前）
+        if self.renaming.is_some() {
+            return match key {
+                "enter" => {
+                    self.commit_rename(window, cx);
+                    true
+                }
+                "escape" => {
+                    self.cancel_rename(window, cx);
+                    true
+                }
+                _ => false,
+            };
+        }
+        if self.git_panel
+            && self
+                .commit_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
+            return match key {
+                "enter" => {
+                    self.submit_git_commit(window, cx);
+                    true
+                }
+                "escape" => {
+                    self.input.read(cx).focus_handle(cx).focus(window, cx);
+                    cx.notify();
+                    true
+                }
+                _ => false,
+            };
+        }
+        // 模型选择器开着时，esc 关掉（搜索框有自己的焦点）
+        if key == "escape" && self.show_models {
+            self.show_models = false;
+            self.input.read(cx).focus_handle(cx).focus(window, cx);
+            cx.notify();
+            return true;
+        }
+        if !self.show_palette {
+            if ctrl && !keystroke.modifiers.shift && key == "k" {
+                self.open_palette(window, cx);
+                return true;
+            }
+            if ctrl && keystroke.modifiers.shift {
+                // xkb 下 Shift+1 的 key 名是 exclam 之类，这里补齐 1..9
+                let digit = match key {
+                    "exclam" => Some(1),
+                    "at" => Some(2),
+                    "numbersign" => Some(3),
+                    "dollar" => Some(4),
+                    "percent" => Some(5),
+                    "asciicircum" => Some(6),
+                    "ampersand" => Some(7),
+                    "asterisk" => Some(8),
+                    "parenleft" => Some(9),
+                    other => other.parse::<usize>().ok(),
+                };
+                if let Some(index) = digit.filter(|index| (1..=9).contains(index)) {
+                    return self.jump_tab(index, cx);
+                }
+            }
+            return false;
+        }
+        match key {
+            "escape" => {
+                self.close_palette(window, cx);
+                true
+            }
+            "up" => {
+                self.palette_step(-1, cx);
+                true
+            }
+            "down" => {
+                self.palette_step(1, cx);
+                true
+            }
+            "enter" => {
+                self.palette_activate(window, cx);
+                true
+            }
+            "tab" => {
+                self.palette_tab = self.palette_tab.next();
+                self.palette_index = 0;
+                cx.notify();
+                true
+            }
+            "p" if ctrl => {
+                self.palette_step(-1, cx);
+                true
+            }
+            "n" if ctrl => {
+                self.palette_step(1, cx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Ctrl+Shift+N：跳到当前Spaces第 N 个 tab。
+    fn jump_tab(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        let Some(space) = self
+            .current_space
+            .as_ref()
+            .and_then(|id| self.spaces.iter().find(|space| &space.id == id))
+        else {
+            return false;
+        };
+        let panels = space.all_panels();
+        let Some(id) = panels.get(index - 1).cloned() else {
+            return false;
+        };
+        self.open_tab(id, cx);
+        true
+    }
+
+    /// 打字机：每 ~8ms 把积压的字符吐一点出来，模拟 omp/pi 那种逐字上屏。
+    fn ensure_stream_ticker(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.streaming.as_mut() else {
+            return;
+        };
+        if state.ticking {
+            return;
+        }
+        state.ticking = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(8))
+                    .await;
+                let keep = match this.update(cx, |root, cx| root.tick_stream(cx)) {
+                    Ok(keep) => keep,
+                    Err(_) => break,
+                };
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 返回 false 表示 ticker 该停了。
+    fn tick_stream(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(state) = self.streaming.as_mut() else {
+            return false;
+        };
+        let backlog = state.total_chars.saturating_sub(state.revealed);
+        if backlog == 0 {
+            if state.ended {
+                self.streaming = None;
+                cx.notify();
+                cx.refresh_windows();
+                return false;
+            }
+            // 等新 token：保持 ticker，不重绘
+            return true;
+        }
+        // 积压越多每拍多吐一点，但封顶，避免又变成"一次蹦完"
+        let step = (backlog / 6).clamp(1, 16);
+        state.revealed = (state.revealed + step).min(state.total_chars);
+        if self.at_bottom() {
+            self.scroll.scroll_to_bottom();
+        }
+        cx.notify();
+        cx.refresh_windows();
+        true
+    }
+
+    fn push_block(&mut self, block: TranscriptBlock) {
+        // 自己刚发的消息引出的完整回复：逐字打出来（dsh 不一定推 text-delta）
+        if self.awaiting_reply {
+            if let TranscriptBlock::Assistant { uid, text } = &block {
+                let total = text.chars().count();
+                if total > 0 {
+                    self.awaiting_reply = false;
+                    self.typing = Some(Typing {
+                        uid: *uid,
+                        total,
+                        revealed: 0,
+                        ticking: false,
+                    });
+                }
+            }
+        }
         self.items.push(block);
         if self.items.len() > 800 {
             let drop = self.items.len() - 800;
             self.items.drain(0..drop);
         }
+    }
+
+    /// 逐字显示 ticker：和流式那条共用节奏（8ms 一拍，一拍 1~几个字）。
+    fn ensure_typing_ticker(&mut self, cx: &mut Context<Self>) {
+        let Some(typing) = self.typing.as_mut() else {
+            return;
+        };
+        if typing.ticking {
+            return;
+        }
+        typing.ticking = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(8))
+                    .await;
+                let keep = match this.update(cx, |root, cx| root.tick_typing(cx)) {
+                    Ok(keep) => keep,
+                    Err(_) => break,
+                };
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn tick_typing(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(typing) = self.typing.as_mut() else {
+            return false;
+        };
+        let backlog = typing.total.saturating_sub(typing.revealed);
+        if backlog == 0 {
+            self.typing = None;
+            cx.notify();
+            cx.refresh_windows();
+            return false;
+        }
+        // 一拍一个字左右；积压太多（长回复）就稍微加速，避免永远追不上
+        let step = 1 + backlog / 240;
+        typing.revealed = (typing.revealed + step).min(typing.total);
+        if self.at_bottom() {
+            self.scroll.scroll_to_bottom();
+        }
+        cx.notify();
+        cx.refresh_windows();
+        true
     }
 
     /// Whether the transcript is parked at the bottom (including a fresh,
@@ -1830,7 +7362,7 @@ impl Root {
                 if text.is_empty() || is_injected(text) {
                     return;
                 }
-                self.push_block(Block::User {
+                self.push_block(TranscriptBlock::User {
                     uid: block_uid(),
                     text: text.to_string(),
                 });
@@ -1843,7 +7375,7 @@ impl Root {
                             Some("reasoning") => {
                                 if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
                                     if !text.trim().is_empty() {
-                                        self.push_block(Block::Reasoning {
+                                        self.push_block(TranscriptBlock::Reasoning {
                                             uid: block_uid(),
                                             text: text.to_string(),
                                             expanded: false,
@@ -1855,7 +7387,7 @@ impl Root {
                             Some("text") => {
                                 if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
                                     if !text.trim().is_empty() {
-                                        self.push_block(Block::Assistant {
+                                        self.push_block(TranscriptBlock::Assistant {
                                             uid: block_uid(),
                                             text: text.to_string(),
                                         });
@@ -1870,7 +7402,7 @@ impl Root {
                 if !pushed {
                     let text = extract_text(&data);
                     if !text.trim().is_empty() {
-                        self.push_block(Block::Assistant {
+                        self.push_block(TranscriptBlock::Assistant {
                             uid: block_uid(),
                             text: text.trim().to_string(),
                         });
@@ -1885,7 +7417,7 @@ impl Root {
                 let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
                 let arguments = data.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
                 let (summary, pretty) = tool_args(name, arguments);
-                self.push_block(Block::Tool {
+                self.push_block(TranscriptBlock::Tool {
                     uid: block_uid(),
                     call_id: call_id.to_string(),
                     name: name.to_string(),
@@ -1894,10 +7426,20 @@ impl Root {
                     output: None,
                     is_error: false,
                     running: true,
-                    expanded: false,
+                    // 压测/排障时（OMD_TRACE_TOOLS=1）默认展开，省得手点
+                    expanded: std::env::var("OMD_TRACE_TOOLS").is_ok(),
+                    duration_ms: None,
+                    exit_code: None,
                 });
             }
             "tool/result" => {
+                if std::env::var("OMD_TRACE_TOOLS").is_ok() {
+                    let raw = serde_json::to_string(&data).unwrap_or_default();
+                    eprintln!(
+                        "[trace] tool/result {}",
+                        &raw.chars().take(900).collect::<String>()
+                    );
+                }
                 let call_id = data
                     .pointer("/message/toolCallId")
                     .and_then(|v| v.as_str())
@@ -1913,34 +7455,36 @@ impl Root {
                     .unwrap_or(false)
                     || data.get("error").map(|v| !v.is_null()).unwrap_or(false);
                 if let Some(pos) = self.items.iter().rposition(
-                    |b| matches!(b, Block::Tool { call_id: c, .. } if c == call_id),
+                    |b| matches!(b, TranscriptBlock::Tool { call_id: c, .. } if c == call_id),
                 ) {
-                    if let Block::Tool {
+                    let elapsed = data.get("_omdElapsedMs").and_then(|v| v.as_u64());
+                    let exit_code = parse_exit_code(&output);
+                    if let TranscriptBlock::Tool {
                         output: out,
                         is_error: err,
                         running,
+                        duration_ms,
+                        exit_code: code,
                         ..
                     } = &mut self.items[pos]
                     {
                         *out = Some(output.trim().to_string());
                         *err = is_error;
                         *running = false;
+                        *duration_ms = elapsed.or(*duration_ms);
+                        *code = exit_code;
                     }
                 }
             }
-            "turn/start" => {
-                let turn = data.get("turn").and_then(|v| v.as_i64()).unwrap_or(0);
-                if turn > 1 {
-                    self.push_block(Block::TurnDivider { turn });
-                }
-            }
+            // dsh 的 turn/start 只用来切「第 N 轮」分隔线，聊天视图里没意义，忽略。
+            "turn/start" => {}
             "turn/end" => {
                 let reason = data
                     .pointer("/reason/kind")
                     .and_then(|v| v.as_str())
                     .unwrap_or("completed");
                 if reason != "completed" {
-                    self.push_block(Block::Notice(format!("本轮结束：{reason}")));
+                    self.push_block(TranscriptBlock::Notice(format!("turn ended: {reason}")));
                 }
             }
             "session/title" => {
@@ -1958,12 +7502,12 @@ impl Root {
     fn toggle_block(&mut self, uid: u64) {
         for block in self.items.iter_mut() {
             match block {
-                Block::Reasoning {
+                TranscriptBlock::Reasoning {
                     uid: u,
                     expanded,
                     ..
                 }
-                | Block::Tool {
+                | TranscriptBlock::Tool {
                     uid: u,
                     expanded,
                     ..
@@ -2033,17 +7577,135 @@ impl Root {
         self.send_text(text, cx);
     }
 
-    fn send_text(&mut self, text: String, cx: &mut Context<Self>) {
-        trace(format_args!("[ui] send_text {text:?}"));
-        self.push_block(Block::User {
-            uid: block_uid(),
-            text: text.clone(),
+    /// Chat panes on the tab in front of the user. Composer slots stay with
+    /// these. Saved sessions on other tabs must not take the last slot.
+    fn shown_chat_sessions(&self) -> Vec<String> {
+        let active_tab = self
+            .current_space
+            .as_ref()
+            .and_then(|id| self.spaces.iter().find(|space| &space.id == id))
+            .and_then(|space| space.active_panel.clone());
+        self.panes
+            .iter()
+            .filter(|pane| {
+                pane.editor_path.is_none()
+                    && pane.media_path.is_none()
+                    && pane.term_id.is_empty()
+                    && match (&pane.tab_id, &active_tab) {
+                        (Some(tab), Some(active)) => tab == active,
+                        _ => true,
+                    }
+            })
+            .filter_map(|pane| pane.session.clone())
+            .filter(|id| !is_file_panel(id))
+            .collect()
+    }
+
+    fn release_block_input(&mut self, session_id: &str) {
+        let still_shown = self.panes.iter().any(|pane| {
+            pane.session.as_deref() == Some(session_id)
+                && pane.term_id.is_empty()
+                && pane.editor_path.is_none()
+                && pane.media_path.is_none()
         });
-        self.scroll.scroll_to_bottom();
-        self.pending_clear = true;
+        if still_shown {
+            return;
+        }
+        if let Some(slot) = self
+            .block_input_sessions
+            .iter()
+            .position(|session| session.as_deref() == Some(session_id))
+        {
+            self.block_input_sessions[slot] = None;
+            self.block_clear_pending.push(slot);
+        }
+    }
+
+    fn assign_block_input(&mut self, session_id: &str) {
+        if self
+            .block_input_sessions
+            .iter()
+            .any(|session| session.as_deref() == Some(session_id))
+        {
+            return;
+        }
+        let keep = self.shown_chat_sessions();
+        let Some((slot, evicted)) =
+            claim_composer_slot(&mut self.block_input_sessions, session_id, &keep)
+        else {
+            eprintln!("[ui] block input slots exhausted for {session_id}");
+            return;
+        };
+        if evicted {
+            self.block_clear_pending.push(slot);
+        }
+        eprintln!("[ui] block input slot {slot} -> {session_id}");
+    }
+
+    fn send_text(&mut self, text: String, cx: &mut Context<Self>) {
+        let Some(session_id) = self.selected.clone() else { return };
+        self.send_text_for(session_id, text, true, cx);
+    }
+
+    /// Send from one dsh block's own composer. `clear_primary` is false for
+    /// split blocks: their input was already cleared by the composer handler.
+    fn send_text_for(
+        &mut self,
+        session_id: String,
+        text: String,
+        clear_primary: bool,
+        cx: &mut Context<Self>,
+    ) {
+        trace(format_args!("[ui] send_text_for {session_id} {text:?}"));
+        if self.selected.as_deref() == Some(session_id.as_str()) {
+            self.push_block(TranscriptBlock::User {
+                uid: block_uid(),
+                text: text.clone(),
+            });
+            self.scroll.scroll_to_bottom();
+            if clear_primary {
+                self.pending_clear = true;
+            }
+            self.awaiting_reply = true;
+            self.typing = None;
+        } else {
+            self.chat_snapshots
+                .entry(session_id.clone())
+                .or_insert((Vec::new(), usize::MAX))
+                .0
+                .push(TranscriptBlock::User {
+                    uid: block_uid(),
+                    text: text.clone(),
+                });
+        }
         let request_id = format!("omd-{}", uuid_like());
-        let _ = self.cmds.send_blocking(Cmd::Prompt { text, request_id });
+        let _ = self.cmds.send_blocking(Cmd::Prompt {
+            session_id,
+            text,
+            request_id,
+        });
         cx.notify();
+    }
+
+    fn send_block_prompt(
+        &mut self,
+        slot: usize,
+        input_entity: &Entity<InputState>,
+        cx: &mut Context<Self>,
+    ) {
+        let text = input_entity.read(cx).value().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let Some(session_id) = self
+            .block_input_sessions
+            .get(slot)
+            .and_then(|session| session.clone())
+        else {
+            return;
+        };
+        self.block_clear_pending.push(slot);
+        self.send_text_for(session_id, text, false, cx);
     }
 }
 
@@ -2132,20 +7794,2368 @@ fn truncate_line(s: &str, n: usize) -> String {
     out
 }
 
-fn render_block(block: Block, cx: &mut Context<Root>) -> AnyElement {
-    match block {
-        Block::User { text, .. } => div()
+
+/// 设置面板的分页。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SettingsTab {
+    General,
+    Plugins,
+    Account,
+}
+
+impl SettingsTab {
+    const ALL: [SettingsTab; 3] = [SettingsTab::General, SettingsTab::Plugins, SettingsTab::Account];
+    fn label(self) -> &'static str {
+        match self {
+            SettingsTab::General => "General",
+            SettingsTab::Plugins => "Plugins",
+            SettingsTab::Account => "Account",
+        }
+    }
+}
+
+/// tab id 用全局自增，避免用 panel 尾巴拼出来的怪名字
+fn next_tab_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    // 老状态文件里可能已经有 tab-001 这种 id，纯计数器会撞；
+    // 撞了就会出现"两个 tab 同时高亮 / 关错 tab"。掺时间戳打散。
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mixed = nanos
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(seq.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    format!("tab-{:08x}", (mixed >> 20) as u32)
+}
+
+/// 文件 panel 的 id 前缀（区别于 dsh session id）
+const FILE_PANEL_PREFIX: &str = "file:";
+
+fn file_panel_id(path: &str) -> String {
+    format!("{FILE_PANEL_PREFIX}{path}")
+}
+
+fn is_file_panel(id: &str) -> bool {
+    id.starts_with(FILE_PANEL_PREFIX)
+}
+
+/// 打开中的文件编辑器（gpui-base 的成熟 Editor，自带 rope/折叠/高亮）。
+struct FileEditor {
+    path: String,
+    language: String,
+    state: Entity<EditorState>,
+    dirty: bool,
+}
+
+/// 正在改名的目标。
+#[derive(Clone, Debug, PartialEq)]
+enum RenameTarget {
+    /// space（一个工作目录，装若干 tab）
+    Space(String),
+    /// tab（装若干 panel）
+    Panel(String),
+    /// panel 内的 block（一条 dsh 会话）
+    Block(String),
+    File(String),
+    NewFile(String),
+    NewDir(String),
+}
+
+
+/// lucide 风格的行内图标（默认资源包里没有这些文件类型图标）。
+const ICO_FILE_CODE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v5h5"/><path d="m10 13-2 2 2 2"/><path d="m14 17 2-2-2-2"/></svg>"##;
+const ICO_FILE_BRACES: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v5h5"/><path d="M9 13h1a1 1 0 0 1 1 1v1a1 1 0 0 0 1 1"/><path d="M15 13h-1a1 1 0 0 0-1 1v1a1 1 0 0 1-1 1"/></svg>"##;
+const ICO_FILE_IMAGE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v5h5"/><circle cx="10" cy="13" r="1.4"/><path d="m20 19-4.5-4.5L8 22"/></svg>"##;
+const ICO_FILE_COG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v5h5"/><circle cx="12" cy="15" r="2.2"/></svg>"##;
+
+/// 行内 svg 图标。
+fn svg_icon(data: &'static [u8], color: u32, size: f32) -> AnyElement {
+    Icon::default()
+        .data(data)
+        .with_size(px(size))
+        .text_color(rgb(color))
+        .into_any_element()
+}
+
+/// 文件类型 → 图标 + 颜色。
+fn file_icon(name: &str) -> (Option<&'static [u8]>, u32) {
+    use gpui_kit::assets::IconName;
+    let _ = IconName::File;
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "rs" => (Some(ICO_FILE_CODE), 0xd08770),
+        "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "c" | "cpp" | "h" | "lua" | "zig" => {
+            (Some(ICO_FILE_CODE), 0x00b4ff)
+        }
+        "json" | "jsonc" | "toml" | "yaml" | "yml" => (Some(ICO_FILE_BRACES), 0xc9a15a),
+        "ini" | "conf" | "env" => (Some(ICO_FILE_COG), 0x9ca3b0),
+        "md" | "markdown" | "txt" => (None, 0x00b4ff),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "svg" | "ico" => (Some(ICO_FILE_IMAGE), 0x00d98a),
+        "sh" | "bash" | "zsh" | "fish" => (None, 0x00d98a),
+        _ => (None, 0x707786),
+    }
+}
+
+/// Tern 风格的 session 图标：一条顶盖 + 一个圆角方块。
+fn session_icon(color: u32) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .w(px(13.))
+        .child(div().w(px(7.)).h(px(2.)).rounded(px(1.)).bg(rgb(color)))
+        .child(
+            div()
+                .mt(px(1.5))
+                .w(px(13.))
+                .h(px(9.))
+                .rounded(px(2.))
+                .border_1()
+                .border_color(rgb(color)),
+        )
+        .into_any_element()
+}
+
+/// 全局 pane id 分配（菜单闭包里也要用）。
+fn next_pane_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+
+/// 文件夹图标（顶上一小块 + 主体），用于顶栏开关和侧栏标题。
+fn folder_icon(color: u32) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .items_start()
+        .w(px(13.))
+        .child(div().w(px(5.)).h(px(2.)).rounded(px(1.)).bg(rgb(color)))
+        .child(
+            div()
+                .mt(px(1.))
+                .w(px(13.))
+                .h(px(8.))
+                .rounded(px(2.))
+                .border_1()
+                .border_color(rgb(color)),
+        )
+        .into_any_element()
+}
+
+fn change_is_staged(change: &GitChange) -> bool {
+    change.index != ' ' && change.index != '?'
+}
+
+fn change_is_unstaged(change: &GitChange) -> bool {
+    change.work != ' ' || change.index == '?'
+}
+
+/// 未暂存的未跟踪文件在列表里写成 A，和截图一致。
+fn git_row_letter(index: char, work: char, staged: bool) -> (char, u32) {
+    let raw = if staged {
+        index
+    } else if work == '?' {
+        'A'
+    } else {
+        work
+    };
+    let letter = match raw {
+        '?' | 'A' => 'A',
+        'D' => 'D',
+        'R' | 'C' => 'R',
+        ' ' => 'M',
+        other => other,
+    };
+    let color = match letter {
+        'A' => 0x3dcc8e,
+        'D' => 0xf07178,
+        'R' => 0x6cb6ff,
+        _ => 0xd4a054,
+    };
+    (letter, color)
+}
+
+/// 窄栏里保留文件名，前面用省略号截断。
+fn git_path_label(relative: &str, max_chars: usize) -> String {
+    let count = relative.chars().count();
+    if count <= max_chars || max_chars < 4 {
+        return relative.to_string();
+    }
+    let file = relative.rsplit('/').next().unwrap_or(relative);
+    let file_len = file.chars().count();
+    if file_len + 2 >= max_chars {
+        let keep = max_chars.saturating_sub(1);
+        let tail: String = file
+            .chars()
+            .rev()
+            .take(keep)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        return format!("…{tail}");
+    }
+    let prefix_len = max_chars - file_len - 1;
+    let mut prefix: String = relative.chars().take(prefix_len).collect();
+    if let Some(slash) = prefix.rfind('/') {
+        prefix.truncate(slash + 1);
+    }
+    format!("{prefix}…{file}")
+}
+
+fn git_delta(added: u32, deleted: u32) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.))
+        .flex_shrink_0()
+        .children(if added > 0 {
+            Some(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x3dcc8e))
+                    .child(SharedString::from(format!("+{added}"))),
+            )
+        } else {
+            None
+        })
+        .children(if deleted > 0 {
+            Some(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xf07178))
+                    .child(SharedString::from(format!("-{deleted}"))),
+            )
+        } else {
+            None
+        })
+        .into_any_element()
+}
+
+fn git_check(
+    id: SharedString,
+    on: bool,
+    cx: &mut Context<Root>,
+    on_click: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .w(px(14.))
+        .h(px(14.))
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .rounded(px(3.))
+        .border_1()
+        .border_color(rgb(if on { 0x3dcc8e } else { 0x5c6570 }))
+        .bg(rgb(0x15181f))
+        .cursor_pointer()
+        .child(
+            div()
+                .w(px(6.))
+                .h(px(6.))
+                .rounded(px(1.))
+                .bg(rgb(if on { 0x3dcc8e } else { 0x15181f })),
+        )
+        .on_click(cx.listener(move |this, _ev, win, cx| {
+            cx.stop_propagation();
+            on_click(this, win, cx);
+        }))
+        .into_any_element()
+}
+
+/// 文件栏里的改动列表：未暂存 / 已暂存、行尾增减、底部提交。
+fn git_panel_element(
+    branch: &str,
+    repo: bool,
+    changes: &[GitChange],
+    error: Option<&str>,
+    amend: bool,
+    commit_input: &Entity<InputState>,
+    cx: &mut Context<Root>,
+) -> AnyElement {
+    let branch_label = if branch.is_empty() {
+        "git".to_string()
+    } else {
+        branch.to_string()
+    };
+    let staged: Vec<&GitChange> = changes.iter().filter(|change| change_is_staged(change)).collect();
+    let unstaged: Vec<&GitChange> = changes
+        .iter()
+        .filter(|change| change_is_unstaged(change))
+        .collect();
+    let mut untracked = 0usize;
+    let mut modified = 0usize;
+    let mut added = 0u32;
+    let mut deleted = 0u32;
+    for change in &unstaged {
+        if change.index == '?' || change.work == '?' {
+            untracked += 1;
+        } else {
+            modified += 1;
+        }
+        added += change.added;
+        deleted += change.deleted;
+    }
+    let footer_untracked = changes
+        .iter()
+        .filter(|change| change.index == '?' || change.work == '?')
+        .count();
+    let footer_dirty = changes
+        .iter()
+        .any(|change| change.index != '?' && change.work != '?');
+
+    let mut list: Vec<AnyElement> = Vec::new();
+    if !repo {
+        list.push(git_hint("not a git repository"));
+    } else if changes.is_empty() {
+        list.push(git_hint("working tree clean"));
+    } else {
+        if !staged.is_empty() {
+            list.push(git_section_head(
+                "git-check-staged",
+                "Staged",
+                staged.len(),
+                "git-unstage-all",
+                "Unstage",
+                cx,
+                |this, _, cx| {
+                    this.run_git(&["reset"]);
+                    cx.notify();
+                },
+                |this, _, cx| {
+                    this.run_git(&["reset"]);
+                    cx.notify();
+                },
+            ));
+            for change in &staged {
+                list.push(git_change_row(change, true, cx));
+            }
+        }
+        if !unstaged.is_empty() {
+            list.push(git_section_head(
+                "git-check-unstaged",
+                "Unstaged",
+                unstaged.len(),
+                "git-stage-all",
+                "Stage all",
+                cx,
+                |this, _, cx| {
+                    this.run_git(&["add", "-A"]);
+                    cx.notify();
+                },
+                |this, _, cx| {
+                    this.run_git(&["add", "-A"]);
+                    cx.notify();
+                },
+            ));
+            list.push(git_mix_line(untracked, modified, added, deleted));
+            for change in &unstaged {
+                list.push(git_change_row(change, false, cx));
+            }
+        }
+    }
+
+    div()
+        .id("git-panel")
+        .flex()
+        .flex_col()
+        .flex_1()
+        .w_full()
+        .min_h(px(0.))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
+                .px(px(8.))
+                .h(px(28.))
+                .child(div().text_sm().text_color(rgb(0x8b93a7)).child("±"))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0xe8ecf4))
+                        .child("Working tree"),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id("git-refresh")
+                        .w(px(22.))
+                        .h(px(22.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(rgb(0x8b93a7))
+                        .hover(|style| style.bg(rgb(0x20232b)))
+                        .child("⟳")
+                        .on_click(cx.listener(|this, _ev, _win, cx| {
+                            this.git_status_root.clear();
+                            this.git_cache_cwd.clear();
+                            this.refresh_git_status();
+                            cx.notify();
+                        })),
+                ),
+        )
+        .child(
+            div()
+                .id("git-panel-list")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .py(px(2.))
+                .children(list),
+        )
+        .children(error.map(|text| {
+            div()
+                .px(px(8.))
+                .pb(px(4.))
+                .text_xs()
+                .text_color(rgb(0xf07178))
+                .child(SharedString::from(text.to_string()))
+        }))
+        .child(
+            div()
+                .px(px(8.))
+                .pt(px(6.))
+                .pb(px(8.))
+                .border_t_1()
+                .border_color(rgb(0x23272f))
+                .child(div().text_xs().text_color(rgb(0x8b93a7)).child("Summary"))
+                .child(
+                    div()
+                        .mt(px(4.))
+                        .px(px(8.))
+                        .py(px(2.))
+                        .rounded(px(8.))
+                        .bg(rgb(0x1b1e26))
+                        .child(
+                            Input::new(commit_input)
+                                .bordered(false)
+                                .appearance(false)
+                                .focus_bordered(false)
+                                .text_xs(),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(14.))
+                        .mt(px(6.))
+                        .child(
+                            div()
+                                .id("git-write-it")
+                                .text_xs()
+                                .text_color(rgb(0x8eb4ff))
+                                .cursor_pointer()
+                                .child("✦  Write it")
+                                .on_click(cx.listener(|this, _ev, win, cx| {
+                                    this.submit_git_commit(win, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("git-amend")
+                                .text_xs()
+                                .text_color(rgb(if amend { 0xd4a054 } else { 0x8b93a7 }))
+                                .cursor_pointer()
+                                .child("Amend")
+                                .on_click(cx.listener(|this, _ev, _win, cx| {
+                                    this.git_amend = !this.git_amend;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("git-generate")
+                        .mt(px(8.))
+                        .h(px(32.))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(8.))
+                        .bg(rgb(0x2a303c))
+                        .text_xs()
+                        .text_color(rgb(0xe8ecf4))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0x343b4a)))
+                        .child("Generate message")
+                        .on_click(cx.listener(|this, _ev, win, cx| {
+                            this.draft_git_message(win, cx);
+                        })),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
+                .px(px(8.))
+                .h(px(28.))
+                .border_t_1()
+                .border_color(rgb(0x23272f))
+                .child(div().text_xs().text_color(rgb(0x8b93a7)).child("⑂"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0xd7dbe3))
+                        .child(SharedString::from(branch_label)),
+                )
+                .children(if footer_dirty {
+                    Some(
+                        div()
+                            .w(px(6.))
+                            .h(px(6.))
+                            .rounded(px(3.))
+                            .bg(rgb(0xe39b2b)),
+                    )
+                } else {
+                    None
+                })
+                .children(if footer_untracked > 0 {
+                    Some(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x8b93a7))
+                            .child(SharedString::from(format!("? {footer_untracked}"))),
+                    )
+                } else {
+                    None
+                }),
+        )
+        .into_any_element()
+}
+
+fn git_hint(text: &'static str) -> AnyElement {
+    div()
+        .px(px(10.))
+        .py(px(8.))
+        .text_xs()
+        .text_color(rgb(0x5a6070))
+        .child(text)
+        .into_any_element()
+}
+
+fn git_section_head(
+    check_id: &'static str,
+    title: &'static str,
+    count: usize,
+    action_id: &'static str,
+    action: &'static str,
+    cx: &mut Context<Root>,
+    on_check: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
+    on_action: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.))
+        .px(px(8.))
+        .h(px(28.))
+        .child(git_check(SharedString::from(check_id), false, cx, on_check))
+        .child(div().text_xs().text_color(rgb(0xe8ecf4)).child(title))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x8b93a7))
+                .child(SharedString::from(count.to_string())),
+        )
+        .child(div().flex_1())
+        .child(
+            div()
+                .id(action_id)
+                .px(px(10.))
+                .h(px(22.))
+                .flex()
+                .items_center()
+                .rounded(px(11.))
+                .bg(rgb(0x2a303c))
+                .text_xs()
+                .text_color(rgb(0xe8ecf4))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(0x343b4a)))
+                .child(action)
+                .on_click(cx.listener(move |this, _ev, win, cx| {
+                    cx.stop_propagation();
+                    on_action(this, win, cx);
+                })),
+        )
+        .into_any_element()
+}
+
+fn git_mix_line(untracked: usize, modified: usize, added: u32, deleted: u32) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .px(px(8.))
+        .pb(px(4.))
+        .children(if untracked > 0 {
+            Some(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x3dcc8e))
+                    .child(SharedString::from(format!("{untracked} untracked"))),
+            )
+        } else {
+            None
+        })
+        .children(if untracked > 0 && modified > 0 {
+            Some(
+                div()
+                    .px(px(4.))
+                    .text_xs()
+                    .text_color(rgb(0x5a6070))
+                    .child("·"),
+            )
+        } else {
+            None
+        })
+        .children(if modified > 0 {
+            Some(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xd4a054))
+                    .child(SharedString::from(format!("{modified} modified"))),
+            )
+        } else {
+            None
+        })
+        .child(div().flex_1())
+        .children(if added + deleted > 0 {
+            Some(git_delta(added, deleted))
+        } else {
+            None
+        })
+        .into_any_element()
+}
+
+fn git_change_row(change: &GitChange, staged: bool, cx: &mut Context<Root>) -> AnyElement {
+    let (letter, color) = git_row_letter(change.index, change.work, staged);
+    let (added, deleted) = if staged {
+        (change.staged_added, change.staged_deleted)
+    } else {
+        (change.added, change.deleted)
+    };
+    let open_path = change.path.clone();
+    let action_path = change.path.clone();
+    let wide = added.max(deleted) >= 1000;
+    let label = git_path_label(
+        &change.relative,
+        if wide {
+            16
+        } else if added + deleted > 0 {
+            24
+        } else {
+            36
+        },
+    );
+    let prefix = if staged { "git-staged" } else { "git-file" };
+    div()
+        .id(SharedString::from(format!("{prefix}-{}", change.path)))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.))
+        .px(px(8.))
+        .h(px(24.))
+        .rounded_sm()
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(0x20232b)))
+        .child(git_check(
+            SharedString::from(format!("{prefix}-check-{}", change.path)),
+            staged,
+            cx,
+            move |this, _win, cx| {
+                if staged {
+                    this.git_unstage_path(&action_path);
+                } else {
+                    this.git_stage_path(&action_path);
+                }
+                cx.notify();
+            },
+        ))
+        .child(
+            div()
+                .w(px(12.))
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(rgb(color))
+                .child(SharedString::from(letter.to_string())),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_xs()
+                .text_color(rgb(0xd7dbe3))
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(SharedString::from(label)),
+        )
+        .children(if added + deleted > 0 {
+            Some(git_delta(added, deleted))
+        } else {
+            None
+        })
+        .on_click(cx.listener(move |this, _ev, win, cx| {
+            this.open_file_panel(open_path.clone(), win, cx);
+        }))
+        .into_any_element()
+}
+fn files_sidebar_element(
+    rows: Vec<(u32, String, String, bool, bool, u64)>,
+    root: &str,
+    width: f32,
+    selected: Option<String>,
+    git: &std::collections::HashMap<String, char>,
+    branch: &str,
+    dirty: &std::collections::HashSet<String>,
+    renaming: Option<RenameTarget>,
+    rename_input: &Entity<InputState>,
+    changes_view: bool,
+    menu_open: bool,
+    branch_line: bool,
+    repo: bool,
+    changes: &[GitChange],
+    error: Option<&str>,
+    amend: bool,
+    commit_input: &Entity<InputState>,
+    cx: &mut Context<Root>,
+) -> AnyElement {
+    let mut list: Vec<AnyElement> = Vec::new();
+    if rows.is_empty() {
+        list.push(
+            div()
+                .px(px(10.))
+                .py(px(8.))
+                .text_xs()
+                .text_color(rgb(0x5a6070))
+                .child("(empty)")
+                .into_any_element(),
+        );
+    }
+    if matches!(renaming, Some(RenameTarget::NewFile(_)) | Some(RenameTarget::NewDir(_))) {
+        list.push(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .px(px(8.))
+                .py(px(3.))
+                .child(
+                    div().w(px(16.)).text_xs().text_color(rgb(0x5a6070)).child("+"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .child(
+                            Input::new(rename_input)
+                                .bordered(false)
+                                .appearance(false)
+                                .focus_bordered(false)
+                                .text_xs(),
+                        ),
+                )
+                .into_any_element(),
+        );
+    }
+    for (depth, path, name, is_dir, expanded, _size) in rows {
+        let color = if is_dir { 0x00b4ff } else { file_icon(&name).1 };
+        let is_selected = selected.as_deref() == Some(path.as_str());
+        let mark = row_git_mark(&path, is_dir, git, dirty);
+        let name_color = if matches!(mark, Some('M' | 'A' | 'D' | 'R' | 'C' | '●')) {
+            0xd4a054
+        } else if is_selected {
+            0xe8ecf4
+        } else {
+            0xced3dd
+        };
+        let click_path = path.clone();
+        let toggle_path = path.clone();
+        list.push(
+            div()
+                .id(SharedString::from(format!("file-row-{path}")))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(5.))
+                .pl(px(6. + depth as f32 * 13.))
+                .pr(px(6.))
+                .h(px(22.))
+                .rounded_sm()
+                .cursor_pointer()
+                .bg(if is_selected {
+                    rgb(0x1e4a63)
+                } else {
+                    rgb(0x15181f)
+                })
+                .hover(|style| style.bg(rgb(0x20232b)))
+                .child(
+                    div()
+                        .w(px(12.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .children(if is_dir {
+                            Some(
+                                Icon::new(if expanded {
+                                    gpui_kit::assets::IconName::ChevronDown
+                                } else {
+                                    gpui_kit::assets::IconName::ChevronRight
+                                })
+                                .with_size(px(11.))
+                                .text_color(rgb(0x707786)),
+                            )
+                        } else {
+                            None
+                        }),
+                )
+                .child(if is_dir {
+                    Icon::new(if expanded {
+                        gpui_kit::assets::IconName::FolderOpen
+                    } else {
+                        gpui_kit::assets::IconName::FolderClosed
+                    })
+                    .with_size(px(13.))
+                    .text_color(rgb(color))
+                    .into_any_element()
+                } else if let Some(data) = file_icon(&name).0 {
+                    svg_icon(data, color, 13.)
+                } else {
+                    Icon::new(if name.ends_with(".md") || name.ends_with(".txt") {
+                        gpui_kit::assets::IconName::FileText
+                    } else if name.ends_with(".sh") {
+                        gpui_kit::assets::IconName::SquareTerminal
+                    } else {
+                        gpui_kit::assets::IconName::File
+                    })
+                    .with_size(px(13.))
+                    .text_color(rgb(color))
+                    .into_any_element()
+                })
+                .child({
+                    let editing = matches!(&renaming, Some(RenameTarget::File(p)) if p == &path);
+                    if editing {
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(
+                                Input::new(rename_input)
+                                    .bordered(false)
+                                    .appearance(false)
+                                    .focus_bordered(false)
+                                    .text_xs(),
+                            )
+                            .into_any_element()
+                    } else {
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_xs()
+                            .text_color(rgb(name_color))
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(SharedString::from(name))
+                            .into_any_element()
+                    }
+                })
+                .children(mark.and_then(git_dot_color).map(|dot| {
+                    div()
+                        .w(px(6.))
+                        .h(px(6.))
+                        .flex_shrink_0()
+                        .rounded(px(3.))
+                        .bg(rgb(dot))
+                }))
+                .on_click(cx.listener(move |this, _ev, win, cx| {
+                    if is_dir {
+                        this.files_toggle_dir(toggle_path.clone(), cx);
+                    } else {
+                        this.open_file_panel(click_path.clone(), win, cx);
+                    }
+                }))
+                .into_any_element(),
+        );
+    }
+    let root_label = PathBuf::from(root)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| root.to_string());
+    div()
+        .id("files-sidebar")
+        .relative()
+        .flex()
+        .flex_col()
+        .w(px(width))
+        .h_full()
+        .min_h(px(0.))
+        .bg(rgb(0x15181f))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
+                .px(px(8.))
+                .py(px(4.))
+                .child(
+                    Icon::new(gpui_kit::assets::IconName::FolderOpen)
+                        .with_size(px(13.))
+                        .text_color(rgb(0x00b4ff)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_sm()
+                        .text_color(rgb(0xe8ecf4))
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(SharedString::from(root_label)),
+                )
+                .child(
+                    div()
+                        .id("files-more")
+                        .w(px(18.))
+                        .h(px(18.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(rgb(if menu_open { 0xe8ecf4 } else { 0x8b93a7 }))
+                        .hover(|style| style.bg(rgb(0x20232b)))
+                        .child("…")
+                        .on_click(cx.listener(|this, _ev, _win, cx| {
+                            cx.stop_propagation();
+                            this.files_menu = !this.files_menu;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id("files-sidebar-close")
+                        .w(px(18.))
+                        .h(px(18.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0x20232b)))
+                        .child(
+                            Icon::new(gpui_kit::assets::IconName::PanelLeft)
+                                .with_size(px(14.))
+                                .text_color(rgb(0x8b93a7)),
+                        )
+                        .on_click(cx.listener(|this, _ev, _win, cx| {
+                            this.files_sidebar = false;
+                            this.files_menu = false;
+                            this.save_state();
+                            cx.notify();
+                        })),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(2.))
+                .px(px(6.))
+                .py(px(4.))
+                .child(sidebar_tool(
+                    "files-view-files",
+                    !changes_view,
+                    Icon::new(gpui_kit::assets::IconName::File)
+                        .with_size(px(14.))
+                        .text_color(rgb(if changes_view { 0x8b93a7 } else { 0xe8ecf4 }))
+                        .into_any_element(),
+                    cx,
+                    |this, _, cx| {
+                        this.git_panel = false;
+                        this.files_menu = false;
+                        cx.notify();
+                    },
+                ))
+                .child(sidebar_tool(
+                    "files-view-changes",
+                    changes_view,
+                    div()
+                        .text_sm()
+                        .child("±")
+                        .into_any_element(),
+                    cx,
+                    |this, _, cx| {
+                        if this.git_panel {
+                            this.git_panel = false;
+                            cx.notify();
+                        } else {
+                            this.open_git_changes(cx);
+                        }
+                    },
+                ))
+                .child(sidebar_tool(
+                    "files-view-branch",
+                    branch_line,
+                    div()
+                        .text_sm()
+                        .child("⑂")
+                        .into_any_element(),
+                    cx,
+                    |this, _, cx| {
+                        this.files_branch_line = !this.files_branch_line;
+                        this.files_menu = false;
+                        cx.notify();
+                    },
+                )),
+        )
+        .children(if branch_line {
+            Some(
+                div()
+                    .px(px(10.))
+                    .pb(px(4.))
+                    .text_xs()
+                    .text_color(rgb(0x8b93a7))
+                    .child(SharedString::from(if branch.is_empty() {
+                        "not a git repository".to_string()
+                    } else {
+                        branch.to_string()
+                    })),
+            )
+        } else {
+            None
+        })
+        .child(div().h(px(1.)).w_full().bg(rgb(0x23272f)))
+        .child(if changes_view {
+            git_panel_element(branch, repo, changes, error, amend, commit_input, cx)
+        } else {
+            div()
+                .id("files-sidebar-list")
+                .flex()
+                .flex_col()
+                .gap(px(0.))
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .py(px(4.))
+                .children(list)
+                .into_any_element()
+        })
+        .children(if menu_open {
+            Some(files_more_menu(cx))
+        } else {
+            None
+        })
+        .into_any_element()
+}
+
+fn sidebar_tool(
+    id: &'static str,
+    active: bool,
+    glyph: AnyElement,
+    cx: &mut Context<Root>,
+    action: impl Fn(&mut Root, &mut Window, &mut Context<Root>) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .w(px(26.))
+        .h(px(22.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.))
+        .cursor_pointer()
+        .text_xs()
+        .text_color(rgb(if active { 0xe8ecf4 } else { 0x8b93a7 }))
+        .bg(if active { rgb(0x2a3140) } else { rgb(0x15181f) })
+        .hover(|style| style.bg(rgb(0x20232b)))
+        .child(glyph)
+        .on_click(cx.listener(move |this, _ev, win, cx| action(this, win, cx)))
+        .into_any_element()
+}
+
+fn files_more_menu(cx: &mut Context<Root>) -> AnyElement {
+    let row = |id: &'static str, label: &'static str| {
+        div()
+            .id(id)
+            .px(px(8.))
+            .py(px(5.))
+            .rounded_sm()
+            .cursor_pointer()
+            .text_xs()
+            .text_color(rgb(0xe8ecf4))
+            .hover(|style| style.bg(rgb(0x20232b)))
+            .child(label)
+    };
+    div()
+        .id("files-more-menu")
+        .absolute()
+        .top(px(28.))
+        .right(px(28.))
+        .flex()
+        .flex_col()
+        .w(px(132.))
+        .p(px(4.))
+        .rounded(px(8.))
+        .bg(rgb(0x1b1e26))
+        .border_1()
+        .border_color(rgb(0x2c3340))
+        .shadow_lg()
+        .child(row("files-new-file", "New file").on_click(cx.listener(|this, _ev, win, cx| {
+            cx.stop_propagation();
+            this.files_menu = false;
+            let dir = this.file_op_dir();
+            this.begin_rename(RenameTarget::NewFile(dir), win, cx);
+        })))
+        .child(row("files-new-dir", "New folder").on_click(cx.listener(|this, _ev, win, cx| {
+            cx.stop_propagation();
+            this.files_menu = false;
+            let dir = this.file_op_dir();
+            this.begin_rename(RenameTarget::NewDir(dir), win, cx);
+        })))
+        .child(row("files-refresh", "Refresh").on_click(cx.listener(|this, _ev, _win, cx| {
+            cx.stop_propagation();
+            this.files_menu = false;
+            this.files_cache.clear();
+            this.git_status_root.clear();
+            this.files_load(&this.files_root.clone());
+            this.files_load_expanded();
+            this.refresh_git_status();
+            cx.notify();
+        })))
+        .into_any_element()
+}
+
+/// Media block body: inline image/GIF, or a reference to the system player.
+fn media_pane_body(
+    pane_id: u64,
+    path: String,
+    kind: MediaKind,
+    image: Option<Arc<RenderImage>>,
+) -> AnyElement {
+    if kind.inline() {
+        let body = if let Some(image) = image {
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size_full()
+                .overflow_hidden()
+                .child(
+                    gpui_kit::img(image)
+                        .max_w(px(1600.))
+                        .max_h(px(1200.)),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size_full()
+                .text_xs()
+                .text_color(rgb(0xff5663))
+                .child("Cannot decode image")
+                .into_any_element()
+        };
+        return div()
+            .id(SharedString::from(format!("media-body-{pane_id}")))
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h(px(0.))
+            .min_w(px(0.))
+            .bg(rgb(0x101319))
+            .child(body)
+            .into_any_element();
+    }
+
+    let open_path = path.clone();
+    div()
+        .id(SharedString::from(format!("media-body-{pane_id}")))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(8.))
+        .size_full()
+        .min_h(px(0.))
+        .bg(rgb(0x101319))
+        .child(
+            div()
+                .text_sm()
+                .text_color(rgb(0xe8ecf4))
+                .child(SharedString::from(
+                    std::path::Path::new(&path)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.clone()),
+                )),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x707786))
+                .child(SharedString::from(match kind {
+                    MediaKind::Video => "Video · system player",
+                    MediaKind::Audio => "Audio · system player",
+                    _ => "Media",
+                })),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!("media-open-{pane_id}")))
+                .px(px(12.))
+                .py(px(6.))
+                .rounded_sm()
+                .bg(rgb(0x1e4a63))
+                .text_sm()
+                .text_color(rgb(0xe8ecf4))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(0x28607d)))
+                .child("Open with system player")
+                .on_click(move |_ev, _win, _cx| {
+                    open_media_external(&open_path);
+                }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x5a6070))
+                .child(SharedString::from(path)),
+        )
+        .into_any_element()
+}
+
+/// 一个终端 pane：标题条 + 可滚动视口。
+fn pane_element(
+    pane_id: u64,
+    screen: Vec<Vec<Span>>,
+    editor: Option<Entity<EditorState>>,
+    focus: FocusHandle,
+    term_id: Option<String>,
+    title: String,
+    is_maximized: bool,
+    diag: Option<(usize, usize)>,
+    // 悬停中的分屏菜单方向（Some 时把菜单画在这个 pane 上）
+    split_menu: Option<SplitDir>,
+    media: Option<(String, MediaKind, Option<Arc<RenderImage>>)>,
+    images: Vec<PlacedImage>,
+    cx: &mut Context<Root>,
+) -> AnyElement {
+    let el = div()
+        .flex()
+        .flex_col()
+        .id(SharedString::from(format!("pane-{pane_id}")))
+        .min_h(px(0.))
+        .min_w(px(0.))
+        .size_full()
+        .bg(rgb(0x101319));
+    let focus_click = focus.clone();
+    el.child(
+        div()
+            .id(SharedString::from(format!("pane-head-{pane_id}")))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.))
+            .px(px(10.))
+            .h(px(24.))
+            .bg(rgb(0x15181f))
+            .border_b_1()
+            .border_color(rgb(0x23272f))
+            .child(if editor.is_some() {
+                Icon::new(gpui_kit::assets::IconName::FileText)
+                    .with_size(px(12.))
+                    .text_color(rgb(0x00b4ff))
+                    .into_any_element()
+            } else {
+                Icon::new(gpui_kit::assets::IconName::SquareTerminal)
+                    .with_size(px(12.))
+                    .text_color(rgb(0x00d98a))
+                    .into_any_element()
+            })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xced3dd))
+                    .child(SharedString::from(title)),
+            )
+            .children(diag.and_then(|(errors, warnings)| {
+                if errors == 0 && warnings == 0 {
+                    return None;
+                }
+                let mut row = div().flex().flex_row().items_center().gap(px(4.));
+                if errors > 0 {
+                    row = row.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xff5663))
+                            .child(SharedString::from(format!("✕{errors}"))),
+                    );
+                }
+                if warnings > 0 {
+                    row = row.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xc9a15a))
+                            .child(SharedString::from(format!("⚠{warnings}"))),
+                    );
+                }
+                Some(row)
+            }))
+            .child(div().flex_1())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
+                    this.drag_leaf = Some((
+                        pane_id,
+                        f32::from(ev.position.x),
+                        f32::from(ev.position.y),
+                    ));
+                    cx.notify();
+                }),
+            )
+            .child(panel_split_buttons(pane_id, cx))
+            .child(
+                div()
+                    .id(SharedString::from(format!("pane-max-{pane_id}")))
+                    .w(px(20.))
+                    .h(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x20232b)))
+                    .child(
+                        Icon::new(if is_maximized {
+                            gpui_kit::assets::IconName::Minimize
+                        } else {
+                            gpui_kit::assets::IconName::Maximize
+                        })
+                        .with_size(px(12.))
+                        .text_color(rgb(0x707786)),
+                    )
+                    .on_click(cx.listener(move |this, _ev, _win, cx| {
+                        this.toggle_maximize(pane_id, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("pane-close-{pane_id}")))
+                    .w(px(18.))
+                    .h(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(rgb(0x707786))
+                    .hover(|style| style.bg(rgb(0x23272f)))
+                    .child("×")
+                    .on_click(
+                        cx.listener(move |this, _ev, win, cx| this.close_pane(pane_id, win, cx)),
+                    ),
+            ),
+    )
+    .child(if let Some((path, kind, image)) = media {
+        media_pane_body(pane_id, path, kind, image)
+    } else if let Some(state) = editor {
+        // 编辑器：给它一个确定高度的容器，Editor 自己滚动（不用外层滚动，否则只按内容高度排）。
+        // 注意：这一层不能 track_focus / stop_propagation —— 否则点击被外层吃掉，
+        // Editor 拿不到 mousedown 就永远不聚焦，文件打不开成"不能编辑"。
+        div()
+            .id(SharedString::from(format!("pane-body-{pane_id}")))
+            .flex_1()
+            .min_h(px(0.))
+            .min_w(px(0.))
+            .size_full()
+            .child(
+                // 必须给确定高度：多行 Input 内部是 h_auto，auto 只会排出几行
+                Editor::new(&state)
+                    .text_sm()
+                    .h(gpui_kit::DefiniteLength::Fraction(1.)),
+            )
+            .into_any_element()
+    } else {
+        div()
+            .id(SharedString::from(format!("pane-body-{pane_id}")))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .p(px(8.))
+            .text_color(rgb(0xe8ecf4))
+            .relative()
+            .track_focus(&focus)
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _win, cx| {
+                if let Some(term_id) = term_id.as_deref() {
+                    let sent = this.send_terminal_key(term_id, &ev.keystroke, cx);
+                    eprintln!(
+                        "[term] key term={term_id} key={:?} shift={} ctrl={} sent={sent}",
+                        ev.keystroke.key,
+                        ev.keystroke.modifiers.shift,
+                        ev.keystroke.modifiers.control,
+                    );
+                    if sent {
+                        cx.stop_propagation();
+                    }
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _ev, win, cx| {
+                    this.focused_pane = Some(pane_id);
+                    focus_click.focus(win, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .children(term_rows(&screen))
+            .children(images.into_iter().map(|placed| {
+                let pad = 8.;
+                div()
+                    .absolute()
+                    .left(px(pad + placed.col as f32 * CELL_W as f32 + placed.ox as f32))
+                    .top(px(pad + placed.row as f32 * CELL_H as f32 + placed.oy as f32))
+                    .w(px(placed.w as f32))
+                    .h(px(placed.h as f32))
+                    .overflow_hidden()
+                    .child(
+                        gpui_kit::img(placed.image)
+                            .w(px(placed.w as f32))
+                            .h(px(placed.h as f32)),
+                    )
+            }))
+            .into_any_element()
+    })
+    .children(split_menu.map(|dir| split_hover_menu(pane_id, dir, cx)))
+    .into_any_element()
+}
+
+/// pane 之间的分隔条（拖拽改尺寸）。
+fn pane_divider(pane_id: u64, kind: BlockPlacement, dragging: bool, cx: &mut Context<Root>) -> AnyElement {
+    let vertical = kind == BlockPlacement::Right;
+    let color = if dragging { rgb(0x2d5a72) } else { rgb(0x171a22) };
+    let mut d = div()
+        .id(SharedString::from(format!("pane-div-{pane_id}")))
+        .flex_shrink_0()
+        .bg(color)
+        .hover(|style| style.bg(rgb(0x2c3340)));
+    d = if vertical {
+        d.w(px(4.)).h_full().cursor(CursorStyle::ResizeLeftRight)
+    } else {
+        d.h(px(4.)).w_full().cursor(CursorStyle::ResizeUpDown)
+    };
+    d.on_mouse_down(
+        MouseButton::Left,
+        cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
+            cx.stop_propagation();
+            let start = if vertical {
+                f32::from(ev.position.x)
+            } else {
+                f32::from(ev.position.y)
+            };
+            let size = this
+                .panes
+                .iter()
+                .find(|pane| pane.id == pane_id)
+                .map(|pane| pane.size)
+                .unwrap_or(220.);
+            this.drag_pane = Some((pane_id, start, size));
+            cx.notify();
+        }),
+    )
+    .into_any_element()
+}
+
+
+
+/// 递归渲染布局树。
+fn build_layout(
+    layout: &Layout,
+    leaf_elements: &mut std::collections::HashMap<u64, AnyElement>,
+    cx: &mut Context<Root>,
+) -> AnyElement {
+    match layout {
+        Layout::Leaf(id) => leaf_elements.remove(id).unwrap_or_else(|| {
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size_full()
+                .bg(rgb(0x101319))
+                .child(div().text_xs().text_color(rgb(0x5a6070)).child("starting…"))
+                .into_any_element()
+        }),
+        Layout::Split {
+            id,
+            dir,
+            sizes,
+            children,
+        } => {
+            let mut container = if *dir == SplitDir::Row {
+                div().flex().flex_row()
+            } else {
+                div().flex().flex_col()
+            }
+            .min_h(px(0.))
+            .min_w(px(0.))
+            .size_full();
+            for (index, child) in children.iter().enumerate() {
+                if index > 0 {
+                    container = container.child(split_divider(*id, index - 1, *dir, cx));
+                }
+                let weight = sizes.get(index).copied().unwrap_or(1.0).max(0.12);
+                container = container.child(
+                    div()
+                        .flex_grow(weight)
+                        .flex_basis(px(0.))
+                        .min_h(px(0.))
+                        .min_w(px(0.))
+                        .child(build_layout(child, leaf_elements, cx)),
+                );
+            }
+            container.into_any_element()
+        }
+    }
+}
+
+/// 布局树里两个兄弟之间的分隔条：拖动改权重。
+fn split_divider(split_id: u64, index: usize, dir: SplitDir, cx: &mut Context<Root>) -> AnyElement {
+    let vertical = dir == SplitDir::Row;
+    let mut d = div()
+        .id(SharedString::from(format!("split-{split_id}-{index}")))
+        .flex_shrink_0()
+        .bg(rgb(0x23272f))
+        .hover(|style| style.bg(rgb(0x444c5e)));
+    d = if vertical {
+        d.w(px(4.)).h_full().cursor(CursorStyle::ResizeLeftRight)
+    } else {
+        d.h(px(4.)).w_full().cursor(CursorStyle::ResizeUpDown)
+    };
+    d.on_mouse_down(
+        MouseButton::Left,
+        cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
+            cx.stop_propagation();
+            let start = if vertical {
+                f32::from(ev.position.x)
+            } else {
+                f32::from(ev.position.y)
+            };
+            let sizes = this
+                .current_space
+                .as_ref()
+                .and_then(|id| this.spaces.iter().find(|space| &space.id == id))
+                .and_then(|space| space.current_tab())
+                .and_then(|tab| tab.layout.sizes_of(split_id))
+                .unwrap_or_default();
+            this.drag_split = Some((split_id, index, start, sizes));
+            cx.notify();
+        }),
+    )
+    .into_any_element()
+}
+
+/// panel 头右上角的分屏按钮（Herdr 那种：▯ 右分屏 / ⊟ 下分屏）。
+fn panel_split_buttons(leaf: u64, cx: &mut Context<Root>) -> AnyElement {
+    // 只有 ▯ / ⊟ 两个按钮：
+    // - 直接点 = 该方向分屏，新面板是 dsh（见 split_with_dsh）
+    // - 悬停 = 下面弹小菜单（dsh / terminal），菜单是自己画的，
+    //   没有遮罩，所以按钮始终可点
+    let mut row = div().flex().flex_row().items_center().gap(px(2.)).flex_shrink_0();
+
+    for (vertical, dir, name) in [
+        (true, SplitDir::Row, gpui_kit::assets::IconName::PanelRight),
+        (false, SplitDir::Col, gpui_kit::assets::IconName::PanelBottom),
+    ] {
+        let weak = cx.entity().downgrade();
+        row = row.child(
+            div()
+                .id(SharedString::from(format!(
+                    "panel-split-{}-{leaf}",
+                    if vertical { "right" } else { "bottom" }
+                )))
+                .w(px(20.))
+                .h(px(18.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(0x20232b)))
+                .child(Icon::new(name).with_size(px(12.)).text_color(rgb(0x707786)))
+                .on_hover(cx.listener(move |this, hovered, _win, cx| {
+                    if *hovered {
+                        this.open_split_menu(leaf, dir, cx);
+                    } else {
+                        this.close_split_menu_soon(cx);
+                    }
+                }))
+                .on_click(move |_ev, _win, cx| {
+                    // 直接点 = dsh（按需求：split 出来的是 dsh 面板）
+                    let _ = weak.update(cx, |root, cx| {
+                        root.split_hover = None;
+                        root.split_with_dsh(leaf, dir, cx);
+                    });
+                }),
+        );
+    }
+
+    row.into_any_element()
+}
+
+/// Composer for a split dsh block. It owns its InputState, so two blocks
+/// can be edited independently at the same time.
+fn block_composer(
+    input: &Entity<InputState>,
+    session_id: String,
+    model_label: String,
+    path_label: String,
+    context_label: String,
+    window: &mut Window,
+    cx: &mut Context<Root>,
+) -> AnyElement {
+    let input_send = input.clone();
+    let focused = input.read(cx).focus_handle(cx).is_focused(window);
+    if !focused {
+        let hint = {
+            let value = input.read(cx).value().trim().to_string();
+            if value.is_empty() { "Ask dsh…".to_string() } else { value }
+        };
+        let focus_input = input.clone();
+        return div()
             .w_full()
-            .text_sm()
-            .text_color(rgb(0x8fb7ff))
-            .child(SharedString::from(format!("you: {text}")))
+            .px(px(12.))
+            .pt(px(2.))
+            .pb(px(10.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .w_full()
+                    .max_w(px(INPUT_MAX_W))
+                    .mx_auto()
+                    .h(px(34.))
+                    .px(px(12.))
+                    .rounded(px(10.))
+                    .bg(rgb(0x1b1e26))
+                    .border_1()
+                    .border_color(rgb(0x2c3340))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x20232b)))
+                    .child(
+                        Icon::new(gpui_kit::assets::IconName::Bot)
+                            .with_size(px(13.))
+                            .text_color(rgb(0x707786)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_xs()
+                            .text_color(rgb(0x707786))
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(SharedString::from(hint)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x5a6070))
+                            .child(SharedString::from(model_label)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x5a6070))
+                            .child(SharedString::from(context_label)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        move |_ev, win, cx| {
+                            focus_input.read(cx).focus_handle(cx).focus(win, cx);
+                        },
+                    ),
+            )
+            .into_any_element();
+    }
+    let input_send = input.clone();
+    let sid = session_id.clone();
+    let can_send = !input.read(cx).value().trim().is_empty();
+    div()
+        .w_full()
+        .px(px(16.))
+        .pt(px(2.))
+        .pb(px(14.))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .max_w(px(INPUT_MAX_W))
+                .mx_auto()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .px(px(6.))
+                        .child(div().text_xs().text_color(rgb(0x5a6070)).child("context"))
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x5a6070))
+                                .child(SharedString::from(context_label)),
+                        ),
+                )
+                .child(
+                    div()
+                        .rounded(px(16.))
+                        .bg(rgb(0x1b1e26))
+                        .border_1()
+                        .border_color(rgb(0x2c3340))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(10.))
+                                .px(px(20.))
+                                .pt(px(16.))
+                                .pb(px(6.))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .child(
+                                            Input::new(input)
+                                                .bordered(false)
+                                                .appearance(false)
+                                                .focus_bordered(false)
+                                                .text_lg(),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(10.))
+                                .px(px(12.))
+                                .pb(px(10.))
+                                .min_w(px(0.))
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(5.))
+                                        .px(px(9.))
+                                        .py(px(4.))
+                                        .rounded_full()
+                                        .bg(rgb(0x20232b))
+                                        .flex_shrink_0()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x00b4ff))
+                                                .child("◌"),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w(px(0.))
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .text_sm()
+                                                .child(SharedString::from(model_label)),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(4.))
+                                        .min_w(px(0.))
+                                        .overflow_hidden()
+                                        .text_xs()
+                                        .text_color(rgb(0x9ca3b0))
+                                        .child("▱")
+                                        .child(
+                                            div()
+                                                .min_w(px(0.))
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .child(SharedString::from(path_label)),
+                                        ),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("block-send-{session_id}")))
+                                        .w(px(34.))
+                                        .h(px(34.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_full()
+                                        .bg(if can_send {
+                                            rgb(0x1d4d66)
+                                        } else {
+                                            rgb(0x20232b)
+                                        })
+                                        .text_sm()
+                                        .text_color(if can_send {
+                                            rgb(0xe8ecf4)
+                                        } else {
+                                            rgb(0x9ca3b0)
+                                        })
+                                        .cursor_pointer()
+                                        .child(if can_send { "↑" } else { "＋" })
+                                        .on_click(cx.listener(move |this, _ev, win, cx| {
+                                            let text = input_send.read(cx).value().trim().to_string();
+                                            if text.is_empty() {
+                                                return;
+                                            }
+                                            input_send.update(cx, |state, cx| {
+                                                state.set_value("", win, cx)
+                                            });
+                                            this.send_text_for(sid.clone(), text, false, cx);
+                                        })),
+                                ),
+                        ),
+                ),
+        )
+        .into_any_element()
+}
+
+/// 分屏里的 dsh 聊天面板（简化版：只读展示该会话的快照，点一下就切成"活动聊天"）。
+fn chat_pane_element(
+    pane_id: u64,
+    session_id: String,
+    title: String,
+    live: bool,
+    is_active_panel: bool,
+    blocks: Vec<TranscriptBlock>,
+    scroll: ScrollHandle,
+    is_maximized: bool,
+    show_close: bool,
+    stream: Option<StreamState>,
+    composer: Option<AnyElement>,
+    split_menu: Option<SplitDir>,
+    cx: &mut Context<Root>,
+) -> AnyElement {
+    let weak_body = cx.entity().downgrade();
+    let weak_close = cx.entity().downgrade();
+    let switch_id = session_id.clone();
+    let close_id = session_id.clone();
+
+    let mut rows: Vec<AnyElement> = Vec::new();
+    for block in blocks.iter().rev().take(200).rev() {
+        let el = match block {
+            TranscriptBlock::User { text, .. } => div()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(div().text_xs().text_color(rgb(0x707786)).child("you"))
+                .child(div().text_sm().text_color(rgb(0xd0d4dc)).child(SharedString::from(text.clone()))),
+            TranscriptBlock::Assistant { text, .. } => div()
+                .text_sm()
+                .text_color(rgb(0xe8ecf4))
+                .child(SharedString::from(text.clone())),
+            TranscriptBlock::Reasoning { text, .. } => div()
+                .text_xs()
+                .text_color(rgb(0x707786))
+                .italic()
+                .child(SharedString::from(text.chars().take(400).collect::<String>())),
+            TranscriptBlock::Tool {
+                name, summary, output, ..
+            } => div()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_family("monospace")
+                        .text_color(rgb(0x00d98a))
+                        .child(SharedString::from(if summary.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{name} · {summary}")
+                        })),
+                )
+                .children(output.as_ref().map(|out| {
+                    div()
+                        .text_xs()
+                        .font_family("monospace")
+                        .text_color(rgb(0x9ca3b0))
+                        .child(SharedString::from(
+                            out.lines().take(6).collect::<Vec<_>>().join("\n"),
+                        ))
+                })),
+            TranscriptBlock::Notice(text) => div()
+                .text_xs()
+                .text_color(rgb(0x707786))
+                .child(SharedString::from(text.clone())),
+            TranscriptBlock::Image(_) => div().text_xs().text_color(rgb(0x707786)).child("[image]"),
+        };
+        rows.push(el.into_any_element());
+    }
+
+    div()
+        .relative()
+        .id(SharedString::from(format!("chat-pane-{pane_id}")))
+        .flex()
+        .flex_col()
+        .size_full()
+        .min_h(px(0.))
+        .min_w(px(0.))
+        .bg(rgb(0x101319))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
+                .px(px(10.))
+                .h(px(24.))
+                .flex_shrink_0()
+                .bg(rgb(0x15181f))
+                .border_b_1()
+                .border_color(rgb(0x23272f))
+                .child(
+                    Icon::new(gpui_kit::assets::IconName::Bot)
+                        .with_size(px(12.))
+                        .text_color(rgb(0x00b8ff)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_xs()
+                        .text_color(rgb(0xced3dd))
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(SharedString::from(title)),
+                )
+                .child(panel_split_buttons(pane_id, cx))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
+                        this.drag_leaf = Some((pane_id, f32::from(ev.position.x), f32::from(ev.position.y)));
+                        cx.notify();
+                    }),
+                )
+                .children(if show_close {
+                    Some(
+                        div()
+                            .id(SharedString::from(format!("chat-pane-close-{pane_id}")))
+                            .w(px(18.))
+                            .h(px(18.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(rgb(0x707786))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x3a1f24)).text_color(rgb(0xff5663)))
+                            .child("×")
+                            .on_click(move |_ev, _win, cx| {
+                                let _ = weak_close.update(cx, |root, cx| {
+                                    root.close_chat_pane(pane_id, &close_id, cx)
+                                });
+                            }),
+                    )
+                } else {
+                    None
+                }),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!("chat-pane-body-{pane_id}")))
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .track_scroll(&scroll)
+                .px(px(14.))
+                .py(px(10.))
+                .children(if rows.is_empty() && stream.is_none() {
+                    vec![div()
+                        .w_full()
+                        .py(px(90.))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .text_lg()
+                                .text_color(rgb(0x707786))
+                                .child("New session"),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0x5a6070))
+                                .child("Type a message below to get started"),
+                        )
+                        .into_any_element()]
+                } else {
+                    rows
+                })
+                .children(stream.filter(|state| !state.text.is_empty()).map(|state| {
+                    TextView::markdown("block-stream-md", SharedString::from(state.text))
+                        .w_full()
+                        .selectable(false)
+                }))
+                .on_mouse_down(MouseButton::Left, move |_ev, _win, cx| {
+                    let _ = weak_body.update(cx, |root, cx| {
+                        root.switch_to_chat(switch_id.clone(), cx);
+                    });
+                }),
+        )
+        .children(composer)
+        .children(split_menu.map(|dir| split_hover_menu(pane_id, dir, cx)))
+        .into_any_element()
+}
+
+/// 给 chat pane 用的分屏菜单（复用全局 split_hover 状态，这里是空实现）。
+fn split_menu_for(_pane_id: u64, _is_maximized: bool, _cx: &mut Context<Root>) -> Option<AnyElement> {
+    None
+}
+
+/// 分屏按钮的悬停菜单（dsh / terminal）。不用 popup 遮罩，所以按钮本身仍然可点。
+fn split_hover_menu(leaf: u64, dir: SplitDir, cx: &mut Context<Root>) -> AnyElement {
+    let weak_dsh = cx.entity().downgrade();
+    let weak_term = cx.entity().downgrade();
+    let weak_keep = cx.entity().downgrade();
+
+    let row = |id: String, glyph: &str, glyph_color: u32, label: &str, _hint: &str| {
+        div()
+            .id(SharedString::from(id))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.))
+            .px(px(8.))
+            .py(px(5.))
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(0x20232b)))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(glyph_color))
+                    .child(SharedString::from(glyph)),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xe8ecf4))
+                    .child(SharedString::from(label)),
+            )
+    };
+
+    div()
+        .id(SharedString::from(format!("split-hover-{leaf}")))
+        .absolute()
+        .top(px(26.))
+        .right(px(6.))
+        .flex()
+        .flex_col()
+        .gap(px(1.))
+        .w(px(148.))
+        .p(px(4.))
+        .rounded(px(8.))
+        .bg(rgb(0x1b1e26))
+        .border_1()
+        .border_color(rgb(0x2c3340))
+        .shadow_lg()
+        // 指针移进菜单时保持展开（不关）
+        .on_hover(cx.listener(move |this, hovered, _win, cx| {
+            if *hovered {
+                this.split_hover_gen = this.split_hover_gen.wrapping_add(1);
+            } else {
+                this.close_split_menu_soon(cx);
+            }
+            cx.notify();
+        }))
+        .child(
+            row(
+                format!("split-hover-dsh-{leaf}"),
+                "◆",
+                0x00b4ff,
+                "chat block",
+                if dir == SplitDir::Row { "split right" } else { "split down" },
+            )
+            .on_click(move |_ev, _win, cx| {
+                let _ = weak_dsh.update(cx, |root, cx| {
+                    root.split_hover = None;
+                    root.split_with_dsh(leaf, dir, cx);
+                });
+            }),
+        )
+        .child(
+            row(
+                format!("split-hover-term-{leaf}"),
+                ">",
+                0x00d98a,
+                "terminal block",
+                if dir == SplitDir::Row {
+                    "split right"
+                } else {
+                    "split down"
+                },
+            )
+            .on_click(move |_ev, _win, cx| {
+                let _ = weak_term.update(cx, |root, cx| {
+                    root.split_hover = None;
+                    root.split_pane(leaf, dir, cx);
+                });
+            }),
+        )
+        .on_mouse_down(MouseButton::Left, move |_ev, _win, _cx| {
+            // 菜单内部的点击不要冒泡到 pane 头（那里会启动拖拽）
+            let _ = &weak_keep;
+        })
+        .into_any_element()
+}
+
+/// 只用来给按钮 id 去重（不消耗真实 pane id）。
+fn next_pane_id_preview() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(1);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
+/// 分屏按钮：hover 出菜单（terminal），直接点是加一个该方向终端 pane。
+fn split_button(
+    vertical: bool,
+    kind: BlockPlacement,
+    active: bool,
+    cmds: async_channel::Sender<Cmd>,
+    cwd: String,
+    _cx: &mut Context<Root>,
+) -> AnyElement {
+    let trigger = {
+        let cmds = cmds.clone();
+        let cwd = cwd.clone();
+        div()
+            .id(if vertical { "split-left-right" } else { "split-top-bottom" })
+            .w(px(26.))
+            .h(px(22.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(0x20232b)))
+            .child(split_icon(vertical, active))
+            .on_click(move |_ev, _win, _cx| {
+                let _ = cmds.send_blocking(Cmd::NewTerminal {
+                    pane_id: next_pane_id(),
+                    kind,
+                    cwd: Some(cwd.clone()),
+                    run: None,
+                });
+            })
+    };
+    let menu_cmds = cmds.clone();
+    let menu_cwd = cwd.clone();
+    let tui_cmds = cmds.clone();
+    let tui_cwd = cwd.clone();
+    let label = if vertical { "right" } else { "bottom" };
+    gpui_kit::base::HoverCard::new(if vertical {
+        "split-card-left-right"
+    } else {
+        "split-card-top-bottom"
+    })
+    .anchor(gpui_kit::Anchor::TopLeft)
+    .open_delay(std::time::Duration::from_millis(120))
+    .close_delay(std::time::Duration::from_millis(160))
+    .trigger(trigger)
+    .content(move |_state, _window, _cx| {
+        div()
+            .id(SharedString::from(format!("split-menu-{label}")))
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .w(px(168.))
+            .p(px(4.))
+            .rounded(px(8.))
+            .bg(rgb(0x1b1e26))
+            .border_1()
+            .border_color(rgb(0x23272f))
+            .child(
+                div()
+                    .id(SharedString::from(format!("split-menu-tui-{label}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(8.))
+                    .py(px(5.))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x20232b)))
+                    .child(div().text_sm().text_color(rgb(0x00b4ff)).child("◆"))
+                    .child(div().text_sm().text_color(rgb(0xe8ecf4)).child("dsh"))
+                    .child(div().flex_1())
+                    .child(div().text_xs().text_color(rgb(0x707786)).child(label))
+                    .on_click({
+                        let cmds = tui_cmds.clone();
+                        let cwd = tui_cwd.clone();
+                        move |_ev, _win, _cx| {
+                            let _ = cmds.send_blocking(Cmd::NewTerminal {
+                                pane_id: next_pane_id(),
+                                kind,
+                                cwd: Some(cwd.clone()),
+                                run: Some(dsh_tui_command()),
+                            });
+                        }
+                    }),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("split-menu-term-{label}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(8.))
+                    .py(px(5.))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x20232b)))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_family("monospace")
+                            .text_color(rgb(0x00d98a))
+                            .child(">_"),
+                    )
+                    .child(div().text_sm().text_color(rgb(0xe8ecf4)).child("terminal"))
+                    .child(div().flex_1())
+                    .child(div().text_xs().text_color(rgb(0x707786)).child(label))
+                    .on_click({
+                        let cmds = menu_cmds.clone();
+                        let cwd = menu_cwd.clone();
+                        move |_ev, _win, _cx| {
+                            let _ = cmds.send_blocking(Cmd::NewTerminal {
+                                pane_id: next_pane_id(),
+                                kind,
+                                cwd: Some(cwd.clone()),
+                                run: None,
+                            });
+                        }
+                    }),
+            )
+    })
+    .into_any_element()
+}
+
+/// 终端 screen -> 元素行。pane 和「终端 tab」共用。
+fn term_rows(screen: &[Vec<Span>]) -> Vec<AnyElement> {
+    screen
+        .iter()
+        .map(|spans| {
+            div()
+                .flex()
+                .flex_row()
+                .children(spans.iter().map(|span| {
+                    let mut el = div()
+                        .text_size(px(13.))
+                        .font_family("monospace")
+                        .child(SharedString::from(span.text.clone()));
+                    if let Some(fg) = span.fg {
+                        el = el.text_color(rgb(fg));
+                    }
+                    if let Some(bg) = span.bg {
+                        el = el.bg(rgb(bg));
+                    }
+                    el
+                }))
+                .into_any_element()
+        })
+        .collect()
+}
+
+fn render_block(block: TranscriptBlock, reveal: Option<usize>, cx: &mut Context<Root>) -> AnyElement {
+    match block {
+        // 用户消息靠右，气泡样式，不加 "you:" 这类 label
+        TranscriptBlock::User { text, .. } => div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .justify_end()
+            .child(
+                div()
+                    .max_w(px(CONTENT_MAX_W * 0.72))
+                    .px(px(14.))
+                    .py(px(9.))
+                    .rounded(px(10.))
+                    .bg(rgb(0x1e2833))
+                    .border_1()
+                    .border_color(rgb(0x23272f))
+                    .text_size(px(15.))
+                    .text_color(rgb(0xe8ecf4))
+                    .child(SharedString::from(text)),
+            )
             .into_any_element(),
-        Block::Assistant { uid, text } => TextView::markdown(
+        TranscriptBlock::Assistant { uid, text } => TextView::markdown(
             SharedString::from(format!("md-{uid}")),
-            SharedString::from(text),
+            SharedString::from(match reveal {
+                Some(shown) => text.chars().take(shown).collect::<String>(),
+                None => text,
+            }),
         )
         .w_full()
-        .max_w(px(860.))
+        .text_size(px(15.))
+        .line_height(relative(1.55))
         .selectable(true)
         .code_block_actions(|block: &gpui_kit::base::text::CodeBlock, _window, cx| {
             let code = block.code().to_string();
@@ -2155,15 +10165,15 @@ fn render_block(block: Block, cx: &mut Context<Root>) -> AnyElement {
             let id = format!("copy-{:x}", hasher.finish());
             let code_for_click = code.clone();
             let label = match block.lang() {
-                Some(lang) => format!("{lang} · 复制"),
-                None => "复制".to_string(),
+                Some(lang) => format!("{lang} · copy"),
+                None => "copy".to_string(),
             };
             div()
                 .id(SharedString::from(id))
                 .px(px(6.))
                 .py(px(1.))
                 .rounded_sm()
-                .bg(rgb(0x2a2a33))
+                .bg(rgb(0x20232b))
                 .text_xs()
                 .cursor_pointer()
                 .child(SharedString::from(label))
@@ -2172,15 +10182,15 @@ fn render_block(block: Block, cx: &mut Context<Root>) -> AnyElement {
                 })
         })
         .into_any_element(),
-        Block::Reasoning {
+        TranscriptBlock::Reasoning {
             uid,
             text,
             expanded,
         } => {
             let label = format!(
-                "思考 · {} 字 {}",
+                "thinking · {} chars {}",
                 text.chars().count(),
-                if expanded { "▾" } else { "▸" }
+                if expanded { "⌄" } else { "›" }
             );
             div()
                 .flex()
@@ -2191,8 +10201,9 @@ fn render_block(block: Block, cx: &mut Context<Root>) -> AnyElement {
                 .on_click(cx.listener(move |this, _ev, _win, _cx| this.toggle_block(uid)))
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(rgb(0x8d8da6))
+                        .text_size(px(13.))
+                        .italic()
+                        .text_color(rgb(0x9ca3b0))
                         .child(SharedString::from(label)),
                 )
                 .children(if expanded {
@@ -2200,7 +10211,7 @@ fn render_block(block: Block, cx: &mut Context<Root>) -> AnyElement {
                         div()
                             .mt(px(4.))
                             .text_xs()
-                            .text_color(rgb(0x9a9ab0))
+                            .text_color(rgb(0x9ca3b0))
                             .child(SharedString::from(text)),
                     )
                 } else {
@@ -2208,7 +10219,7 @@ fn render_block(block: Block, cx: &mut Context<Root>) -> AnyElement {
                 })
                 .into_any_element()
         }
-        Block::Tool {
+        TranscriptBlock::Tool {
             uid,
             name,
             summary,
@@ -2217,79 +10228,166 @@ fn render_block(block: Block, cx: &mut Context<Root>) -> AnyElement {
             is_error,
             running,
             expanded,
+            duration_ms,
+            exit_code,
             ..
         } => {
+            // Tern 风格：一行「图标 + mono 工具名 + 灰描述」，展开后是带标题条的卡片
             let (icon, color) = if running {
-                ("●", 0xd8b45a)
+                ("●", 0xc9a15a)
             } else if is_error {
-                ("✗", 0xff7b72)
+                ("✕", 0xff5663)
             } else {
-                ("✓", 0x6fbf73)
+                ("✓", 0x00d98a)
             };
-            let header = format!(
-                "{icon} {name}  {summary}  {}",
-                if expanded { "▾" } else { "▸" }
-            );
             let output = output.unwrap_or_default();
+            let header_row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .py(px(3.))
+                .child(div().text_size(px(13.)).text_color(rgb(color)).child(icon))
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .font_family("monospace")
+                        .text_color(rgb(0xd0d4dc))
+                        .child(SharedString::from(name.clone())),
+                )
+                .child(
+                    div()
+                        .text_size(px(15.))
+                        .text_color(rgb(0x9ca3b0))
+                        .child(SharedString::from(summary)),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(rgb(0x707786))
+                        .child(if expanded { "⌄" } else { "›" }),
+                );
+            let card = if expanded {
+                let mut status_label = if running {
+                    "running".to_string()
+                } else if is_error {
+                    "error".to_string()
+                } else {
+                    "done".to_string()
+                };
+                if let Some(code) = exit_code {
+                    status_label.push_str(&format!(" · exit {code}"));
+                }
+                if let Some(ms) = duration_ms {
+                    let human = if ms >= 1000 {
+                        format!("{:.1}s", ms as f64 / 1000.0)
+                    } else {
+                        format!("{ms}ms")
+                    };
+                    status_label.push_str(&format!(" · {human}"));
+                }
+                let mut body = vec![div()
+                    .px(px(12.))
+                    .py(px(10.))
+                    .text_size(px(13.))
+                    .font_family("monospace")
+                    .text_color(rgb(0x9ca3b0))
+                    .child(SharedString::from(args))
+                    .into_any_element()];
+                if !output.is_empty() {
+                    // 语法高亮：交给 markdown 代码块（gpui-base 自带 highlighter）；
+                    // 输出可能很长，截断到 300 行 / 12k 字符。
+                    let lang = tool_lang(&name);
+                    let capped: String = output
+                        .lines()
+                        .take(300)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        .chars()
+                        .take(12_000)
+                        .collect();
+                    let fenced = format!("```{lang}\n{capped}\n```");
+                    body.push(
+                        div()
+                            .id(SharedString::from(format!("tool-out-{uid}")))
+                            .max_h(px(300.))
+                            .overflow_y_scroll()
+                            .px(px(10.))
+                            .pb(px(8.))
+                            .child(
+                                TextView::markdown(
+                                    SharedString::from(format!("tool-md-{uid}")),
+                                    SharedString::from(fenced),
+                                )
+                                .text_size(px(13.))
+                                .selectable(true),
+                            )
+                            .into_any_element(),
+                    );
+                }
+                if std::env::var("OMD_TRACE_TOOLS").is_ok() {
+                    eprintln!("[trace] tool card {name}: {status_label}");
+                }
+                Some(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .mt(px(4.))
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(rgb(0x23272f))
+                        .bg(rgb(0x1b1e26))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.))
+                                .px(px(12.))
+                                .py(px(5.))
+                                .bg(rgb(0x20232b))
+                                .child(div().text_size(px(13.)).text_color(rgb(color)).child(icon))
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .font_family("monospace")
+                                        .text_color(rgb(0x9ca3b0))
+                                        .child(SharedString::from(name.clone())),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(rgb(0x707786))
+                                        .child(status_label),
+                                ),
+                        )
+                        .children(body),
+                )
+            } else {
+                None
+            };
             div()
                 .flex()
                 .flex_col()
                 .w_full()
-                .p(px(8.))
-                .rounded_sm()
-                .bg(rgb(0x17171d))
                 .id(SharedString::from(format!("tool-{uid}")))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _ev, _win, _cx| this.toggle_block(uid)))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(color))
-                        .child(SharedString::from(header)),
-                )
-                .children(if expanded {
-                    let mut details = vec![div()
-                        .mt(px(6.))
-                        .text_xs()
-                        .font_family("monospace")
-                        .text_color(rgb(0x8a8aa0))
-                        .child(SharedString::from(args))
-                        .into_any_element()];
-                    if !output.is_empty() {
-                        details.push(
-                            div()
-                                .id(SharedString::from(format!("tool-out-{uid}")))
-                                .mt(px(6.))
-                                .max_h(px(240.))
-                                .overflow_y_scroll()
-                                .text_xs()
-                                .font_family("monospace")
-                                .text_color(rgb(0xbfc7d5))
-                                .child(SharedString::from(output))
-                                .into_any_element(),
-                        );
-                    }
-                    Some(div().flex().flex_col().children(details))
-                } else {
-                    None
-                })
+                .child(header_row)
+                .children(card)
                 .into_any_element()
         }
-        Block::TurnDivider { turn } => div()
-            .w_full()
-            .py(px(4.))
-            .text_xs()
-            .text_color(rgb(0x5f5f72))
-            .child(SharedString::from(format!("— 第 {turn} 轮 —")))
-            .into_any_element(),
-        Block::Image(source) => gpui_kit::img(source)
+        TranscriptBlock::Image(source) => gpui_kit::img(source)
             .w(px(240.))
             .rounded_sm()
             .into_any_element(),
-        Block::Notice(text) => div()
+        TranscriptBlock::Notice(text) => div()
             .w_full()
             .text_xs()
-            .text_color(rgb(0x8a8aa0))
+            .text_color(rgb(0x9ca3b0))
             .child(SharedString::from(text))
             .into_any_element(),
     }
@@ -2306,7 +10404,7 @@ fn render_question(
             body.push(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x7f9bc4))
+                    .text_color(rgb(0x9ca3b0))
                     .child(SharedString::from(header.clone()))
                     .into_any_element(),
             );
@@ -2321,7 +10419,7 @@ fn render_question(
             body.push(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x9a9ab0))
+                    .text_color(rgb(0x9ca3b0))
                     .child(SharedString::from(detail.clone()))
                     .into_any_element(),
             );
@@ -2330,8 +10428,8 @@ fn render_question(
             body.push(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x7f9bc4))
-                    .child("可多选")
+                    .text_color(rgb(0x9ca3b0))
+                    .child("multi-select")
                     .into_any_element(),
             );
         }
@@ -2352,9 +10450,9 @@ fn render_question(
                     .py(px(4.))
                     .rounded_sm()
                     .bg(if selected {
-                        rgb(0x2c4a6e)
+                        rgb(0x1e4a63)
                     } else {
-                        rgb(0x22242c)
+                        rgb(0x20232b)
                     })
                     .cursor_pointer()
                     .id(SharedString::from(format!("q-{qi}-{}", opt.label)))
@@ -2372,7 +10470,7 @@ fn render_question(
                     row = row.child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0x8a8aa0))
+                            .text_color(rgb(0x9ca3b0))
                             .child(SharedString::from(description.clone())),
                     );
                 }
@@ -2395,13 +10493,13 @@ fn render_question(
         .p(px(12.))
         .gap(px(6.))
         .rounded_sm()
-        .bg(rgb(0x1b2433))
+        .bg(rgb(0x1e2833))
         .id("question")
         .child(
             div()
                 .text_sm()
-                .text_color(rgb(0x9fc6ff))
-                .child("❓ agent 需要你的回答"),
+                .text_color(rgb(0x00b4ff))
+                .child("❓ Needs your input"),
         )
         .children(body)
         .child(Input::new(input))
@@ -2411,17 +10509,175 @@ fn render_question(
                 .px(px(12.))
                 .py(px(4.))
                 .rounded_sm()
-                .bg(rgb(0x2c4a6e))
+                .bg(rgb(0x1e4a63))
                 .text_sm()
                 .cursor_pointer()
-                .child("提交回答")
+                .child("Submit")
                 .on_click(cx.listener(|this, _ev, _win, cx| this.submit_question(cx))),
         )
         .into_any_element()
 }
 
+/// 浏览器块的临时展示层：把 CEF 的 GPU 帧画在固定区域上。
+fn browser_overlay() -> AnyElement {
+    if std::env::var("OMD_BROWSER").is_err() {
+        return div().into_any_element();
+    }
+    canvas(
+        |bounds, window, _| {
+            // 浏览器画面是外部驱动的：每次布局都预约下一帧，形成绘制循环。
+            if std::env::var("OMD_BROWSER").is_ok() {
+                window.request_animation_frame();
+            }
+            if std::env::var("OMD_BROWSER_DEBUG").is_ok() {
+                static P: AtomicU64 = AtomicU64::new(0);
+                let n = P.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 2 {
+                    eprintln!("[overlay] prepaint #{n} {bounds:?}");
+                }
+            }
+        },
+        |bounds, _, window, _cx| {
+            let frame = browser::latest_accel(0);
+            if std::env::var("OMD_BROWSER_DEBUG").is_ok() {
+                static N: AtomicU64 = AtomicU64::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 5 {
+                    eprintln!("[overlay] paint #{n} frame={:?}", frame.map(|f| (f.width, f.height, f.seq)));
+                }
+            }
+            if frame.is_some() {
+                // 浏览器帧是外部驱动的，GPUI 不会自己重绘：持续要下一帧。
+                window.request_animation_frame();
+            }
+            if let Some(frame) = frame {
+                window.paint_external_texture(
+                    bounds,
+                    0,
+                    size(
+                        DevicePixels(frame.width as i32),
+                        DevicePixels(frame.height as i32),
+                    ),
+                    Corners::default(),
+                );
+            }
+        },
+    )
+    .absolute()
+    .left(px(40.))
+    .top(px(120.))
+    .w(px(800.))
+    .h(px(520.))
+    .into_any_element()
+}
+
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(id) = self.focus_pending.take() {
+            if let Some(pane) = self.panes.iter().find(|pane| pane.id == id) {
+                pane.focus.focus(window, cx);
+            }
+        }
+        if self.files_sidebar {
+            self.ensure_git_root(cx);
+        }
+        for slot in std::mem::take(&mut self.block_clear_pending) {
+            if let Some(input) = self.block_inputs.get(slot).cloned() {
+                input.update(cx, |state, cx| state.set_value("", window, cx));
+            }
+        }
+        // 跨文件 WorkspaceEdit 里"文件已经开着"的那部分（这里才有 window）
+        if !self.pending_workspace_edits.is_empty() {
+            for (path, edits) in std::mem::take(&mut self.pending_workspace_edits) {
+                let Some(editor) = self.editors.get(&file_panel_id(&path)) else {
+                    continue;
+                };
+                let state = editor.state.clone();
+                let text = state.read(cx).value().to_string();
+                let mut sorted = edits;
+                sorted.sort_by_key(|edit| {
+                    std::cmp::Reverse(lsp::offset_for(
+                        &text,
+                        edit.range.start.line,
+                        edit.range.start.character,
+                    ))
+                });
+                let count = sorted.len();
+                state.update(cx, |state, cx| {
+                    state.apply_lsp_edits(&sorted, window, cx);
+                });
+                eprintln!("[lsp] open buffer 应用 {count} 处 workspace edit: {path}");
+            }
+        }
+        // 接受补全后要补的附加编辑（这里才有 window）
+        if !self.pending_extra_edits.is_empty() {
+            for (path, edits) in std::mem::take(&mut self.pending_extra_edits) {
+                let Some(editor) = self.editors.get(&file_panel_id(&path)) else {
+                    continue;
+                };
+                let state = editor.state.clone();
+                let text = state.read(cx).value().to_string();
+                let mut sorted = edits;
+                // 从后往前应用，避免前面的插入把后面的偏移顶歪
+                sorted.sort_by_key(|edit| {
+                    std::cmp::Reverse(lsp::offset_for(
+                        &text,
+                        edit.range.start.line,
+                        edit.range.start.character,
+                    ))
+                });
+                let count = sorted.len();
+                state.update(cx, |state, cx| {
+                    state.apply_lsp_edits(&sorted, window, cx);
+                });
+                eprintln!("[lsp] applied {count} additional edits for {path}");
+            }
+        }
+        if self.split_click_pending
+            && self
+                .current_space
+                .as_ref()
+                .is_some_and(|id| self.spaces.iter().any(|space| &space.id == id))
+        {
+            self.split_click_pending = false;
+            self.split_pane(0, SplitDir::Row, cx);
+            stamp("split_pane(0, Row) via OMD_SPLIT_CLICK");
+        }
+        // 窗口失去焦点时清掉所有拖拽态：mouse-up 可能在窗口外丢掉，
+        // 否则那个 tab/pane 会一直保持"正在拖"的高亮
+        if !window.is_window_active() {
+            self.tab_drag = None;
+            self.drag_leaf = None;
+            self.drag_split = None;
+            self.drag_pane = None;
+        }
+        // 上一帧记下的"滚到某个 tab"：现在量到宽度了就补上
+        if let Some((index, count)) = self.pending_tab_scroll {
+            if f32::from(self.tab_scroll.bounds().size.width) > 0. {
+                self.apply_tab_scroll(index, count);
+                self.pending_tab_scroll = None;
+            }
+        }
+        if self.typing.is_some() {
+            self.ensure_typing_ticker(cx);
+        }
+        let render_no = RENDER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        // 第一帧之后再要一次焦点（窗口映射前 activate 常常无效）
+        if render_no == 2 {
+            window.activate_window();
+        }
+        if self.scroll_tab_steps > 0 && render_no > 3 {
+            self.scroll_tab_steps -= 1;
+            self.scroll_tabs_by(0.8, cx);
+        }
+        let render_start = std::time::Instant::now();
+        let items_at_render = self.items.len();
+        if render_no <= 8 {
+            stamp(format!(
+                "render #{render_no} enter (items={items_at_render}, spaces={})",
+                self.spaces.len()
+            ));
+        }
         if self.pending_clear {
             self.pending_clear = false;
             self.input
@@ -2436,11 +10692,20 @@ impl Render for Root {
         let selected = self.selected.clone();
         let sessions = self.sessions.clone();
         let blocks = self.items.clone();
+        // 只渲染尾部窗口：首帧不等整段历史，剩下的靠 start_reveal() 按帧补。
+        let hidden_blocks = blocks
+            .len()
+            .saturating_sub(self.reveal_limit.min(blocks.len()));
         let error = self.error.clone();
         let connected = self.connected;
         let ever_connected = self.ever_connected;
         let agent_running = self.agent_running;
-        let show_terminal = self.show_terminal;
+        let has_bottom = self.panes.iter().any(|pane| pane.kind == BlockPlacement::Bottom);
+        let has_right = self.panes.iter().any(|pane| pane.kind == BlockPlacement::Right);
+        let selected_is_term = self
+            .selected
+            .as_ref()
+            .is_some_and(|id| self.term_tabs.contains(id));
         let cmds = self.cmds.clone();
         let space_count = self.spaces.len();
         let current_space = self
@@ -2457,76 +10722,80 @@ impl Render for Root {
             .map(|space| space.cwd.clone())
             .unwrap_or_else(|| "/".to_string());
         let space_id = current_space.as_ref().map(|space| space.id.clone());
-        let tabs: Vec<(String, String, bool)> = current_space
+        let renaming = self.renaming.clone();
+        let tab_drag = self.tab_drag.clone();
+        // 三层：space → tab → panel
+        let tab_chips: Vec<(String, String, bool)> = current_space
             .as_ref()
             .map(|space| {
+                let active_panel = space.active_panel.clone();
                 space
-                    .tabs
+                    .panels
                     .iter()
-                    .map(|id| {
+                    .enumerate()
+                    .map(|(index, tab)| {
                         (
-                            id.clone(),
-                            self.session_title(id),
-                            selected.as_deref() == Some(id.as_str()),
+                            tab.id.clone(),
+                            tab_display_name(tab, index),
+                            active_panel.as_deref() == Some(tab.id.as_str()),
                         )
                     })
                     .collect()
             })
             .unwrap_or_default();
-        let (status_dot, status_color) = match &error {
-            Some(_) => ("●", 0xff7b72),
-            None if connected => ("●", 0x6fbf73),
-            None if ever_connected => ("●", 0xd8b45a),
-            None => ("○", 0x8a8aa0),
-        };
-
-        let term_panel = if show_terminal {
-            let screen = self.term_screen.clone();
-            let term_focus = self.term_focus.clone();
-            Some(
-                div().flex().flex_col()
-                    .id("term")
-                    .w(px(560.))
-                    .min_h(px(0.))
-                    .bg(rgb(0x0a0a0c))
-                    .overflow_y_scroll()
-                    .p(px(8.))
-                    .track_focus(&term_focus)
-                    .on_mouse_down(MouseButton::Left, {
-                        let term_focus = term_focus.clone();
-                        move |_ev, win, _cx| {
-                            term_focus.focus(win, _cx);
-                        }
+        // 全部 tab 的下拉清单内容（点行切换、点 × 关整个 tab）
+        let tab_rows: Vec<(String, String, bool, usize)> = current_space
+            .as_ref()
+            .map(|space| {
+                let active_panel = space.active_panel.clone();
+                space
+                    .panels
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tab)| {
+                        (
+                            tab.id.clone(),
+                            tab_display_name(tab, index),
+                            active_panel.as_deref() == Some(tab.id.as_str()),
+                            tab.blocks.len(),
+                        )
                     })
-                    .children(screen.iter().map(|spans| {
-                        div().flex().flex_row().children(spans.iter().map(|span| {
-                            let mut el = div().text_sm().font_family("monospace").child(
-                                SharedString::from(span.text.clone()),
-                            );
-                            if let Some(fg) = span.fg {
-                                el = el.text_color(rgb(fg));
-                            }
-                            if let Some(bg) = span.bg {
-                                el = el.bg(rgb(bg));
-                            }
-                            el
-                        }))
-                    })),
-            )
-        } else {
-            None
+                    .collect()
+            })
+            .unwrap_or_default();
+        let tab_chip_count = tab_chips.len();
+        // tab 宽度：能放下就放到 220，放不下一起缩到 76，再放不下就横向滚动
+        // （Firefox 的行为：宽度不固定）
+        let tab_strip_viewport = f32::from(self.tab_scroll.bounds().size.width);
+        let tab_widths: Vec<f32> = tab_chips
+            .iter()
+            .map(|(_, title, _)| est_tab_width(title))
+            .collect();
+        self.tab_widths = tab_widths.clone();
+        let tab_content_w: f32 =
+            tab_widths.iter().sum::<f32>() + (tab_chip_count as f32 - 1.).max(0.) * 3.;
+        if std::env::var("OMD_TRACE_TABS").is_ok() {
+            stamp(format!(
+                "[tabs] viewport={tab_strip_viewport} content={tab_content_w} widths={tab_widths:?}"
+            ));
+        }
+        let (status_dot, status_color) = match &error {
+            Some(_) => ("●", 0xff5663),
+            None if connected => ("●", 0x00d98a),
+            None if ever_connected => ("●", 0xc9a15a),
+            None => ("○", 0x9ca3b0),
         };
 
         let streaming_markdown = self
             .streaming
             .as_ref()
             .filter(|state| !state.text.trim().is_empty())
-            .map(|state| state.text.clone());
+            .map(|state| format!("{}▍", state.revealed_text()));
         let streaming_reasoning = self
             .streaming
             .as_ref()
             .filter(|state| state.text.trim().is_empty() && !state.reasoning.trim().is_empty())
-            .map(|_| "思考中…".to_string());
+            .map(|_| "thinking…".to_string());
 
         let approval_card = self.approval.clone().map(|(event_id, label)| {
             let cmds_allow = cmds.clone();
@@ -2539,18 +10808,18 @@ impl Render for Root {
                 .p(px(10.))
                 .mb(px(8.))
                 .rounded_sm()
-                .bg(rgb(0x3a2f1f))
+                .bg(rgb(0x33281a))
                 .gap(px(6.))
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(0xffd479))
-                        .child("⚠ 需要授权"),
+                        .text_color(rgb(0xc9a15a))
+                        .child("⚠ Approval required"),
                 )
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0xd8c9a8))
+                        .text_color(rgb(0xc9a15a))
                         .child(SharedString::from(label)),
                 )
                 .child(
@@ -2560,10 +10829,10 @@ impl Render for Root {
                             .px(px(10.))
                             .py(px(4.))
                             .rounded_sm()
-                            .bg(rgb(0x2d5f36))
+                            .bg(rgb(0x14402c))
                             .text_sm()
                             .cursor_pointer()
-                            .child("允许")
+                            .child("Allow")
                             .on_click(move |_ev, _win, _cx| {
                                 let _ = cmds_allow.send_blocking(Cmd::Decide {
                                     event_id: id_allow.clone(),
@@ -2577,10 +10846,10 @@ impl Render for Root {
                             .px(px(10.))
                             .py(px(4.))
                             .rounded_sm()
-                            .bg(rgb(0x5f2d2d))
+                            .bg(rgb(0x3a1f24))
                             .text_sm()
                             .cursor_pointer()
-                            .child("拒绝")
+                            .child("Deny")
                             .on_click(move |_ev, _win, _cx| {
                                 let _ = cmds_reject.send_blocking(Cmd::Decide {
                                     event_id: id_reject.clone(),
@@ -2600,34 +10869,40 @@ impl Render for Root {
             && self.streaming.is_none()
             && self.question.is_none()
             && self.approval.is_none();
-        let transcript = div().flex().flex_col()
-            .id("transcript")
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
-            .gap(px(4.))
-            .p(px(12.))
-            .children(blocks.into_iter().map(|block| render_block(block, cx)))
+        let self_typing = self.typing.as_ref().map(|t| (t.uid, t.revealed));
+        // 正文列：限宽 + 居中；外层只负责滚动。
+        let transcript_body = div().flex().flex_col()
+            .w_full()
+            .max_w(px(CONTENT_MAX_W))
+            .mx_auto()
+            .gap(px(12.))
+            .children(
+                blocks
+                    .into_iter()
+                    .skip(hidden_blocks)
+                    .map(|block| {
+                        // 正在逐字显示的 block 只喂已打出来的前缀
+                        let reveal = match (&block, &self_typing) {
+                            (TranscriptBlock::Assistant { uid, .. }, Some((tu, shown)))
+                                if uid == tu =>
+                            {
+                                Some(*shown)
+                            }
+                            _ => None,
+                        };
+                        render_block(block, reveal, cx)
+                    }),
+            )
             .children(streaming_markdown.map(|text| {
-                div().flex().flex_col().gap(px(2.))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x9fd0a0))
-                            .child("agent"),
-                    )
-                    .child(
-                        TextView::markdown("stream-md", SharedString::from(text))
-                            .w_full()
-                            .max_w(px(860.))
-                            .selectable(false),
-                    )
+                // AI 输出靠左，和最终 block 用同样的 markdown，但没有 label
+                TextView::markdown("stream-md", SharedString::from(text))
+                    .w_full()
+                    .selectable(false)
             }))
             .children(streaming_reasoning.map(|line| {
                 div()
                     .text_sm()
-                    .text_color(rgb(0x9fd0a0))
+                    .text_color(rgb(0x00d98a))
                     .child(SharedString::from(line))
             }))
             .children(if empty {
@@ -2642,25 +10917,25 @@ impl Render for Root {
                         .child(
                             div()
                                 .text_lg()
-                                .text_color(rgb(0x777788))
+                                .text_color(rgb(0x707786))
                                 .child(if self.selected.is_some() {
-                                    "新会话"
+                                    "New session"
                                 } else if space_id.is_some() {
-                                    "此空间没有打开的会话"
+                                    "No panel open in this session"
                                 } else {
-                                    "没有工作区"
+                                    "No session"
                                 }),
                         )
                         .child(
                             div()
                                 .text_sm()
-                                .text_color(rgb(0x5f5f72))
+                                .text_color(rgb(0x5a6070))
                                 .child(if self.selected.is_some() {
-                                    "在下面输入消息开始"
+                                    "Type a message below to get started"
                                 } else if space_id.is_some() {
-                                    "点击 ▦ 选择会话，或点 + 新建"
+                                    "Ctrl+K to pick a panel, or ＋ to create one"
                                 } else {
-                                    "点击 + 新建会话"
+                                    "Click ＋ to create a panel"
                                 }),
                         ),
                 )
@@ -2670,13 +10945,17 @@ impl Render for Root {
             .children(question_card)
             .children(approval_card);
 
-        let transcript_area = div()
-            .relative()
-            .flex()
-            .flex_col()
+        let transcript = div().flex().flex_col()
+            .id("transcript")
             .flex_1()
             .min_h(px(0.))
-            .child(transcript);
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .px(px(16.))
+            .pt(px(18.))
+            .pb(px(28.))
+            .child(transcript_body);
+
 
         let can_send = !self.input.read(cx).value().trim().is_empty();
         if self.git_cache_cwd != space_cwd {
@@ -2692,6 +10971,8 @@ impl Render for Root {
             .map(format_tokens)
             .unwrap_or_else(|| "1M".to_string());
 
+        let model_label_done = model_label.clone();
+        let context_label_done = context_label.clone();
         let typing = div()
             .w_full()
             .px(px(16.))
@@ -2702,7 +10983,7 @@ impl Render for Root {
                     .flex()
                     .flex_col()
                     .w_full()
-                    .max_w(px(1200.))
+                    .max_w(px(INPUT_MAX_W))
                     .mx_auto()
                     .gap(px(6.))
                     .child(
@@ -2711,7 +10992,7 @@ impl Render for Root {
                             .flex_row()
                             .items_center()
                             .px(px(6.))
-                            .child(div().text_xs().text_color(rgb(0x5f5f72)).child("ctx"))
+                            .child(div().text_xs().text_color(rgb(0x5a6070)).child("context"))
                             .child(div().flex_1())
                             .children(if context_label.is_empty() {
                                 None
@@ -2719,7 +11000,7 @@ impl Render for Root {
                                 Some(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(0x5f5f72))
+                                        .text_color(rgb(0x5a6070))
                                         .child(SharedString::from(context_label)),
                                 )
                             }),
@@ -2727,9 +11008,9 @@ impl Render for Root {
                     .child(
                         div()
                             .rounded(px(16.))
-                            .bg(rgb(0x1e1e23))
+                            .bg(rgb(0x1b1e26))
                             .border_1()
-                            .border_color(rgb(0x3a3a40))
+                            .border_color(rgb(0x2c3340))
                             .child(
                                 div()
                                     .flex()
@@ -2760,6 +11041,8 @@ impl Render for Root {
                                     .gap(px(10.))
                                     .px(px(12.))
                                     .pb(px(10.))
+                                    .min_w(px(0.))
+                                    .overflow_hidden()
                                     .child(
                                         div()
                                             .id("model-pill")
@@ -2770,15 +11053,31 @@ impl Render for Root {
                                             .px(px(9.))
                                             .py(px(4.))
                                             .rounded_full()
-                                            .bg(rgb(0x2a2a33))
+                                            .bg(rgb(0x20232b))
                                             .cursor_pointer()
-                                            .hover(|style| style.bg(rgb(0x32323c)))
-                                            .child(div().text_xs().text_color(rgb(0x4f9cf0)).child("◌"))
-                                            .child(div().text_sm().child(SharedString::from(model_label)))
-                                            .child(div().text_xs().text_color(rgb(0x777788)).child("⌄"))
-                                            .on_click(cx.listener(|this, _ev, _win, cx| {
+                                            .hover(|style| style.bg(rgb(0x23272f)))
+                                            .child(div().text_xs().text_color(rgb(0x00b4ff)).child("◌"))
+                                            .child(
+                                                div()
+                                                    .min_w(px(0.))
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .text_sm()
+                                                    .child(SharedString::from(model_label)),
+                                            )
+                                            .child(div().text_xs().text_color(rgb(0x707786)).child("⌄"))
+                                            .on_click(cx.listener(|this, _ev, win, cx| {
                                                 this.show_models = !this.show_models;
                                                 if this.show_models {
+                                                    // 打开时清空并聚焦搜索框
+                                                    this.model_input.update(cx, |state, cx| {
+                                                        state.set_value("", win, cx)
+                                                    });
+                                                    this.model_input
+                                                        .read(cx)
+                                                        .focus_handle(cx)
+                                                        .focus(win, cx);
                                                     let empty = this
                                                         .model_catalog
                                                         .get("groups")
@@ -2798,10 +11097,19 @@ impl Render for Root {
                                             .flex_row()
                                             .items_center()
                                             .gap(px(4.))
+                                            .min_w(px(0.))
+                                            .overflow_hidden()
                                             .text_xs()
-                                            .text_color(rgb(0x8a8aa0))
+                                            .text_color(rgb(0x9ca3b0))
                                             .child("▱")
-                                            .child(SharedString::from(path_label)),
+                                            .child(
+                                                div()
+                                                    .min_w(px(0.))
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .child(SharedString::from(path_label)),
+                                            ),
                                     )
                                     .children(if git_text.is_empty() {
                                         None
@@ -2813,17 +11121,11 @@ impl Render for Root {
                                                 .items_center()
                                                 .gap(px(4.))
                                                 .text_xs()
-                                                .text_color(rgb(0xd6b45a))
+                                                .text_color(rgb(0xc9a15a))
                                                 .child("⑂")
                                                 .child(SharedString::from(git_text)),
                                         )
                                     })
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(0x5f5f72))
-                                            .child("scheduler: 0"),
-                                    )
                                     .child(div().flex_1())
                                     .child(
                                         div()
@@ -2835,15 +11137,15 @@ impl Render for Root {
                                             .justify_center()
                                             .rounded_full()
                                             .bg(if can_send {
-                                                rgb(0x2f5f8a)
+                                                rgb(0x1d4d66)
                                             } else {
-                                                rgb(0x2a2a33)
+                                                rgb(0x20232b)
                                             })
                                             .text_sm()
                                             .text_color(if can_send {
-                                                rgb(0xe8e8f0)
+                                                rgb(0xe8ecf4)
                                             } else {
-                                                rgb(0x8a8aa0)
+                                                rgb(0x9ca3b0)
                                             })
                                             .cursor_pointer()
                                             .child(if can_send { "↑" } else { "＋" })
@@ -2857,13 +11159,733 @@ impl Render for Root {
                     ),
             );
 
+        // 输入框是 chat panel 的一部分：聚焦时展开，否则收成一行（panel 矮也不挤）
+        let composer_focused = self.input.read(cx).focus_handle(cx).is_focused(window);
+        let composer: AnyElement = if composer_focused {
+            typing.into_any_element()
+        } else {
+            let hint = {
+                let value = self.input.read(cx).value().trim().to_string();
+                if value.is_empty() {
+                    "Ask dsh…".to_string()
+                } else {
+                    value
+                }
+            };
+            div()
+                .w_full()
+                .px(px(12.))
+                .pt(px(2.))
+                .pb(px(10.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        .w_full()
+                        .max_w(px(INPUT_MAX_W))
+                        .mx_auto()
+                        .h(px(34.))
+                        .px(px(12.))
+                        .rounded(px(10.))
+                        .bg(rgb(0x1b1e26))
+                        .border_1()
+                        .border_color(rgb(0x2c3340))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0x20232b)))
+                        .child(
+                            Icon::new(gpui_kit::assets::IconName::Bot)
+                                .with_size(px(13.))
+                                .text_color(rgb(0x707786)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .text_xs()
+                                .text_color(rgb(0x707786))
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(SharedString::from(hint)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x5a6070))
+                                .child(SharedString::from(model_label_done.clone())),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x5a6070))
+                                .child(SharedString::from(context_label_done.clone())),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, win, cx| {
+                                this.input.read(cx).focus_handle(cx).focus(win, cx);
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .into_any_element()
+        };
+
+        // The first dsh panel in this tab is the leaf-0 primary chat. Split
+        // dsh blocks may become active, but leaf 0 must keep showing primary
+        // instead of duplicating the selected split session.
+        let active_panel_primary = current_space
+            .as_ref()
+            .and_then(|space| space.current_tab())
+            .and_then(|tab| {
+                tab.blocks
+                    .iter()
+                    .find(|panel| !is_file_panel(panel))
+                    .cloned()
+            });
+        let leaf0_live = active_panel_primary
+            .as_deref()
+            .map_or(true, |primary| self.selected.as_deref() == Some(primary));
+        let mut composer = Some(composer);
+        let leaf0_composer = if leaf0_live { composer.take() } else { None };
+
+        // chat panel（头 + transcript + 输入框）
+
+        let primary_session = current_space
+            .as_ref()
+            .and_then(|space| space.current_tab())
+            .and_then(|panel| {
+                panel
+                    .blocks
+                    .iter()
+                    .find(|block| !is_file_panel(block))
+                    .cloned()
+            })
+            .or_else(|| selected.clone());
+        // 聊天 panel 自己的头（和 terminal / editor panel 一个样式）
+        let chat_panel_head = {
+            let title = selected
+                .as_deref()
+                .map(|id| self.session_title(id))
+                .unwrap_or_else(|| "new panel".to_string());
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
+                .px(px(10.))
+                .h(px(24.))
+                .flex_shrink_0()
+                .bg(rgb(0x15181f))
+                .border_b_1()
+                .border_color(rgb(0x23272f))
+                .child(
+                    Icon::new(gpui_kit::assets::IconName::Bot)
+                        .with_size(px(12.))
+                        .text_color(rgb(0x00b4ff)),
+                )
+                .child(
+                    div()
+                        .flex_shrink_1()
+                        .min_w(px(0.))
+                        .text_xs()
+                        .text_color(rgb(0xced3dd))
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(SharedString::from(title)),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .max_w(px(200.))
+                        .text_xs()
+                        .text_color(rgb(0x5a6070))
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(SharedString::from(short_path(&space_cwd))),
+                )
+                .child(panel_split_buttons(0, cx))
+                .children(primary_session.as_ref().map(|session| {
+                    let sid = session.clone();
+                    div()
+                        .id("primary-chat-close")
+                        .w(px(18.))
+                        .h(px(18.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .text_xs()
+                        .text_color(rgb(0x707786))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0x3a1f24)).text_color(rgb(0xff5663)))
+                        .child("×")
+                        .on_click(cx.listener(move |this, _ev, _win, cx| {
+                            this.close_chat_pane(0, &sid, cx);
+                        }))
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, ev: &MouseDownEvent, _win, cx| {
+                        this.drag_leaf = Some((
+                            0,
+                            f32::from(ev.position.x),
+                            f32::from(ev.position.y),
+                        ));
+                        cx.notify();
+                    }),
+                )
+        };
+
+        // size_full 而不是 flex_1：外层 split 的子容器不是 flex，
+        // flex_1 在里面不生效，高度会塌成内容高度（正文只画几行）。
+        let chat_panel = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h(px(0.))
+            .min_w(px(0.))
+            .bg(rgb(0x101319))
+            .child(chat_panel_head)
+            .child(transcript)
+            .children(leaf0_composer)
+            .children(
+                self.split_hover
+                    .filter(|(leaf, _)| *leaf == 0)
+                    .map(|(_, dir)| split_hover_menu(0, dir, cx)),
+            );
+
         let settings_modal = if self.show_settings {
-            let version = self
-                .dsh_version
-                .clone()
-                .unwrap_or_else(|| "dev".to_string());
-            let busy = self.dsh_busy;
-            let status = self.dsh_status.clone();
+            let editable = self
+                .settings_doc
+                .get("writable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let namespaces = self
+                .settings_doc
+                .get("namespaces")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut sections: Vec<AnyElement> = Vec::new();
+            if self.settings_loading {
+                sections.push(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x9ca3b0))
+                        .child("Loading settings…")
+                        .into_any_element(),
+                );
+            } else if let Some(err) = self.settings_error.clone() {
+                sections.push(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0xff5663))
+                        .child(SharedString::from(err))
+                        .into_any_element(),
+                );
+            }
+            for ns_view in &namespaces {
+                let ns = ns_view
+                    .get("ns")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let revision = ns_view.get("revision").and_then(|v| v.as_i64()).unwrap_or(0);
+                let value = ns_view.get("value").cloned().unwrap_or(Value::Null);
+                let user = ns_view.get("user").cloned().unwrap_or(Value::Null);
+                let secrets = ns_view
+                    .get("secrets")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut rows: Vec<AnyElement> = Vec::new();
+                let fields: Vec<(String, Value)> = value
+                    .as_object()
+                    .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    .unwrap_or_default();
+                {
+                    for (key, field) in &fields {
+                        let field = field;
+                        let mut path = vec![key.clone()];
+                        let overridden = user
+                            .get(key)
+                            .map(|v| !v.is_null())
+                            .unwrap_or(false);
+                        let editing_this = self
+                            .settings_edit
+                            .as_ref()
+                            .is_some_and(|(e_ns, e_path, _, _)| e_ns == &ns && e_path == &path);
+                        let control: AnyElement = if editing_this {
+                            div()
+                                .w(px(220.))
+                                .child(
+                                    Input::new(&self.settings_input)
+                                        .bordered(false)
+                                        .appearance(false)
+                                        .focus_bordered(false)
+                                        .text_xs(),
+                                )
+                                .into_any_element()
+                        } else {
+                            match field {
+                                Value::Bool(on) => {
+                                    let on = *on;
+                                    div()
+                                        .id(SharedString::from(format!("set-{ns}-{key}")))
+                                        .px(px(8.))
+                                        .py(px(2.))
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .bg(rgb(0x20232b))
+                                        .text_xs()
+                                        .text_color(if on { rgb(0x00d98a) } else { rgb(0x9ca3b0) })
+                                        .child(if on { "on" } else { "off" })
+                                        .on_click(cx.listener({
+                                            let ns = ns.clone();
+                                            let path = path.clone();
+                                            move |this, _ev, _win, cx| {
+                                                if !editable {
+                                                    return;
+                                                }
+                                                this.write_setting(
+                                                    &ns,
+                                                    path.clone(),
+                                                    Value::Bool(!on),
+                                                    Some(revision),
+                                                );
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .into_any_element()
+                                }
+                                Value::Number(n) => {
+                                    let text = n.to_string();
+                                    let is_number = true;
+                                    div()
+                                        .id(SharedString::from(format!("set-{ns}-{key}")))
+                                        .px(px(8.))
+                                        .py(px(2.))
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .bg(rgb(0x20232b))
+                                        .text_xs()
+                                        .text_color(rgb(0xe8ecf4))
+                                        .child(SharedString::from(text.clone()))
+                                        .on_click(cx.listener({
+                                            let ns = ns.clone();
+                                            let path = path.clone();
+                                            move |this, _ev, win, cx| {
+                                                this.begin_setting_edit(
+                                                    ns.clone(),
+                                                    path.clone(),
+                                                    revision,
+                                                    is_number,
+                                                    text.clone(),
+                                                    win,
+                                                    cx,
+                                                );
+                                            }
+                                        }))
+                                        .into_any_element()
+                                }
+                                Value::String(text) => {
+                                    let full = text.clone();
+                                    let shown: String = full.chars().take(60).collect();
+                                    let is_number = false;
+                                    div()
+                                        .id(SharedString::from(format!("set-{ns}-{key}")))
+                                        .px(px(8.))
+                                        .py(px(2.))
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .bg(rgb(0x20232b))
+                                        .text_xs()
+                                        .text_color(rgb(0xe8ecf4))
+                                        .child(SharedString::from(shown))
+                                        .on_click(cx.listener({
+                                            let ns = ns.clone();
+                                            let path = path.clone();
+                                            move |this, _ev, win, cx| {
+                                                this.begin_setting_edit(
+                                                    ns.clone(),
+                                                    path.clone(),
+                                                    revision,
+                                                    is_number,
+                                                    full.clone(),
+                                                    win,
+                                                    cx,
+                                                );
+                                            }
+                                        }))
+                                        .into_any_element()
+                                }
+                                other => {
+                                    let shown: String = other.to_string().chars().take(60).collect();
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x707786))
+                                        .child(SharedString::from(shown))
+                                        .into_any_element()
+                                }
+                            }
+                        };
+                        rows.push(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.))
+                                .py(px(3.))
+                                .child(
+                                    div()
+                                        .w(px(210.))
+                                        .text_xs()
+                                        .text_color(if overridden {
+                                            rgb(0x00b4ff)
+                                        } else {
+                                            rgb(0x9ca3b0)
+                                        })
+                                        .child(SharedString::from(key.clone())),
+                                )
+                                .child(control)
+                                .into_any_element(),
+                        );
+                    }
+                }
+                if !secrets.is_empty() {
+                    let names: Vec<String> = secrets
+                        .iter()
+                        .map(|secret| {
+                            let name = secret
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?")
+                                .to_string();
+                            let set = secret
+                                .get("configured")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            format!("{name} {}", if set { "✓" } else { "—" })
+                        })
+                        .collect();
+                    rows.push(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x5a6070))
+                            .child(SharedString::from(format!(
+                                "secrets: {}",
+                                names.join("  ")
+                            )))
+                            .into_any_element(),
+                    );
+                }
+                sections.push(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .py(px(8.))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_family("monospace")
+                                        .text_color(rgb(0xe8ecf4))
+                                        .child(SharedString::from(ns.clone())),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x5a6070))
+                                        .child(SharedString::from(format!("rev {revision}"))),
+                                ),
+                        )
+                        .children(rows)
+                        .into_any_element(),
+                );
+            }
+            // ---- Plugins 分页 ----
+            let mut plugins_rows: Vec<AnyElement> = Vec::new();
+            if self.settings_tab == SettingsTab::Plugins {
+                if let Some(err) = self.settings_tab_error.clone() {
+                    plugins_rows.push(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xff5663))
+                            .child(SharedString::from(err))
+                            .into_any_element(),
+                    );
+                }
+                // 过滤框
+                plugins_rows.push(
+                    div()
+                        .pb(px(6.))
+                        .child(
+                            div()
+                                .rounded(px(6.))
+                                .bg(rgb(0x14171d))
+                                .border_1()
+                                .border_color(rgb(0x23272f))
+                                .px(px(8.))
+                                .py(px(4.))
+                                .child(
+                                    Input::new(&self.plugins_input)
+                                        .bordered(false)
+                                        .appearance(false)
+                                        .focus_bordered(false)
+                                        .text_xs(),
+                                ),
+                        )
+                        .into_any_element(),
+                );
+                let filter = self.plugins_input.read(cx).value().trim().to_lowercase();
+                let items: Vec<Value> = self
+                    .plugins_doc
+                    .as_array()
+                    .cloned()
+                    .or_else(|| {
+                        self.plugins_doc
+                            .get("plugins")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                    })
+                    .unwrap_or_default();
+                if items.is_empty() {
+                    plugins_rows.push(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x707786))
+                            .child("No plugins reported")
+                            .into_any_element(),
+                    );
+                }
+                let total = items.len();
+                let mut shown_count = 0usize;
+                for item in &items {
+                    let id = item
+                        .get("id")
+                        .or_else(|| item.get("entryId"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = item
+                        .get("name")
+                        .or_else(|| item.get("moduleName"))
+                        .or_else(|| item.get("patchId"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&id)
+                        .to_string();
+                    let version = item
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let enabled = item.get("enabled").and_then(|v| v.as_bool());
+                    let read_only = item.get("readOnlyReason").is_some();
+                    if !filter.is_empty() {
+                        let hay = format!("{id} {name} {version}").to_lowercase();
+                        if !hay.contains(&filter) {
+                            continue;
+                        }
+                    }
+                    shown_count += 1;
+                    let toggle_id = id.clone();
+                    let toggle_to = !enabled.unwrap_or(true);
+                    plugins_rows.push(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .py(px(3.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .child(div().text_sm().child(SharedString::from(name)))
+                                    .children(if version.is_empty() {
+                                        None
+                                    } else {
+                                        Some(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x707786))
+                                                .child(SharedString::from(version)),
+                                        )
+                                    }),
+                            )
+                            .children(match enabled {
+                                Some(on) => {
+                                    let mut chip = div()
+                                        .id(SharedString::from(format!("plugin-toggle-{id}")))
+                                        .px(px(8.))
+                                        .py(px(2.))
+                                        .rounded_sm()
+                                        .bg(rgb(0x20232b))
+                                        .text_xs()
+                                        .text_color(if on { rgb(0x00d98a) } else { rgb(0x9ca3b0) })
+                                        .child(if on { "on" } else { "off" });
+                                    if !read_only {
+                                        chip = chip
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgb(0x23272f)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener({
+                                                    let toggle_id = toggle_id.clone();
+                                                    move |this, _ev, _win, cx| {
+                                                        let _ = this.cmds.send_blocking(Cmd::Call {
+                                                            tag: "plugins/toggle".to_string(),
+                                                            endpoint:
+                                                                "pluginManager/setPluginEnabled"
+                                                                    .to_string(),
+                                                            args: json!({
+                                                                "id": toggle_id.clone(),
+                                                                "enabled": toggle_to,
+                                                            }),
+                                                        });
+                                                        cx.notify();
+                                                    }
+                                                }),
+                                            );
+                                    }
+                                    Some(chip)
+                                }
+                                None => None,
+                            })
+                            .into_any_element(),
+                    );
+                }
+                if !filter.is_empty() {
+                    plugins_rows.push(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x5a6070))
+                            .child(SharedString::from(format!(
+                                "{shown_count} of {total} plugins"
+                            )))
+                            .into_any_element(),
+                    );
+                }
+            }
+
+            // ---- Account 分页 ----
+            let mut account_rows: Vec<AnyElement> = Vec::new();
+            if self.settings_tab == SettingsTab::Account {
+                if let Some(err) = self.settings_tab_error.clone() {
+                    account_rows.push(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xff5663))
+                            .child(SharedString::from(err))
+                            .into_any_element(),
+                    );
+                }
+                if let Some(map) = self.account_doc.as_object() {
+                    for (key, value) in map {
+                        let shown = match value {
+                            Value::String(text) => text.chars().take(80).collect::<String>(),
+                            other => other.to_string().chars().take(80).collect::<String>(),
+                        };
+                        account_rows.push(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.))
+                                .py(px(3.))
+                                .child(
+                                    div()
+                                        .w(px(150.))
+                                        .text_xs()
+                                        .text_color(rgb(0x9ca3b0))
+                                        .child(SharedString::from(key.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .text_xs()
+                                        .text_color(rgb(0xe8ecf4))
+                                        .child(SharedString::from(shown)),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                } else {
+                    account_rows.push(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x707786))
+                            .child("No account state")
+                            .into_any_element(),
+                    );
+                }
+                let cmds_in = self.cmds.clone();
+                let cmds_out = self.cmds.clone();
+                account_rows.push(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(8.))
+                        .pt(px(8.))
+                        .child(
+                            div()
+                                .id("account-signin")
+                                .px(px(10.))
+                                .py(px(3.))
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .bg(rgb(0x20232b))
+                                .text_xs()
+                                .text_color(rgb(0x00b4ff))
+                                .hover(|style| style.bg(rgb(0x23272f)))
+                                .child("sign in")
+                                .on_click(move |_ev, _win, _cx| {
+                                    let _ = cmds_in.send_blocking(Cmd::Call {
+                                        tag: "account/signin".to_string(),
+                                        endpoint: "account/startSignIn".to_string(),
+                                        args: json!({}),
+                                    });
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("account-signout")
+                                .px(px(10.))
+                                .py(px(3.))
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .bg(rgb(0x20232b))
+                                .text_xs()
+                                .text_color(rgb(0x9ca3b0))
+                                .hover(|style| style.bg(rgb(0x23272f)))
+                                .child("sign out")
+                                .on_click(move |_ev, _win, _cx| {
+                                    let _ = cmds_out.send_blocking(Cmd::Call {
+                                        tag: "account/signout".to_string(),
+                                        endpoint: "account/signOut".to_string(),
+                                        args: json!({}),
+                                    });
+                                }),
+                        )
+                        .into_any_element(),
+                );
+            }
+
+            let cmds_refresh = self.cmds.clone();
+            let cmds_open = self.cmds.clone();
             Some(
                 div()
                     .absolute()
@@ -2872,109 +11894,157 @@ impl Render for Root {
                     .items_center()
                     .justify_center()
                     .bg(rgba(0x000000cc))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, win, cx| {
+                            this.show_settings = false;
+                            this.input.read(cx).focus_handle(cx).focus(win, cx);
+                            cx.notify();
+                        }),
+                    )
                     .child(
                         div()
-                            .w(px(460.))
-                            .p(px(18.))
+                            .id("settings-card")
+                            .w(px(680.))
+                            .max_h(px(640.))
                             .flex()
                             .flex_col()
-                            .gap(px(10.))
                             .rounded_lg()
-                            .bg(rgb(0x1b1b20))
+                            .bg(rgb(0x1b1e26))
                             .border_1()
-                            .border_color(rgb(0x32323c))
-                            .child(div().text_lg().child("设置"))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x9a9ab0))
-                                    .child("dsh 引擎"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .child(SharedString::from(format!("当前版本：v{version}"))),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x8a8aa0))
-                                    .child(if self.dsh_bundled {
-                                        "内置运行时（应用数据目录）"
-                                    } else {
-                                        "外部 dsh（开发模式）"
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x8a8aa0))
-                                    .child(if busy {
-                                        "正在更新，请稍候…".to_string()
-                                    } else {
-                                        "更新会下载到应用数据目录，关闭并重新打开 App 后生效。"
-                                            .to_string()
-                                    }),
-                            )
-                            .children(status.map(|text| {
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0xd8b45a))
-                                    .child(SharedString::from(text))
-                            }))
+                            .border_color(rgb(0x23272f))
+                            .overflow_hidden()
+                            .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
+                                cx.stop_propagation();
+                            })
                             .child(
                                 div()
                                     .flex()
                                     .flex_row()
-                                    .gap(px(8.))
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .px(px(14.))
+                                    .py(px(10.))
+                                    .child(div().text_lg().child("Settings"))
                                     .child(
                                         div()
-                                            .id("update-dsh")
-                                            .px(px(12.))
-                                            .py(px(6.))
-                                            .rounded_sm()
-                                            .bg(if busy {
-                                                rgb(0x26262e)
+                                            .text_xs()
+                                            .text_color(if editable {
+                                                rgb(0x00d98a)
                                             } else {
-                                                rgb(0x2f5f8a)
+                                                rgb(0xc9a15a)
                                             })
-                                            .text_sm()
+                                            .child(if editable { "writable" } else { "read-only" }),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(
+                                        div()
+                                            .id("settings-refresh")
+                                            .px(px(8.))
+                                            .py(px(2.))
+                                            .rounded_sm()
                                             .cursor_pointer()
-                                            .child(if busy { "更新中…" } else { "更新到最新版" })
-                                            .on_click(cx.listener(|this, _ev, _win, cx| {
-                                                if this.dsh_busy {
-                                                    return;
-                                                }
-                                                this.dsh_busy = true;
-                                                this.dsh_status =
-                                                    Some("正在下载并安装 dsh…".into());
-                                                let _ = this
-                                                    .cmds
-                                                    .send_blocking(Cmd::UpdateDsh);
-                                                cx.notify();
-                                            })),
+                                            .text_xs()
+                                            .text_color(rgb(0x9ca3b0))
+                                            .hover(|style| style.bg(rgb(0x20232b)))
+                                            .child("reload")
+                                            .on_click(move |_ev, _win, _cx| {
+                                                let _ = cmds_refresh.send_blocking(Cmd::Call {
+                                                    tag: "settings/describe".to_string(),
+                                                    endpoint: "settings/describe".to_string(),
+                                                    args: json!({}),
+                                                });
+                                            }),
                                     )
                                     .child(
                                         div()
-                                            .id("close-settings")
-                                            .px(px(12.))
-                                            .py(px(6.))
+                                            .id("settings-open-file")
+                                            .px(px(8.))
+                                            .py(px(2.))
                                             .rounded_sm()
-                                            .bg(rgb(0x2a2a33))
-                                            .text_sm()
                                             .cursor_pointer()
-                                            .child("关闭")
-                                            .on_click(cx.listener(|this, _ev, _win, cx| {
+                                            .text_xs()
+                                            .text_color(rgb(0x9ca3b0))
+                                            .hover(|style| style.bg(rgb(0x20232b)))
+                                            .child("open file")
+                                            .on_click(move |_ev, _win, _cx| {
+                                                let _ = cmds_open.send_blocking(Cmd::Call {
+                                                    tag: "settings/open-document".to_string(),
+                                                    endpoint: "settings/openSettingsDocument"
+                                                        .to_string(),
+                                                    args: json!({}),
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("settings-close")
+                                            .px(px(8.))
+                                            .py(px(2.))
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .text_color(rgb(0xff5663))
+                                            .hover(|style| style.bg(rgb(0x3a1f24)))
+                                            .child("close")
+                                            .on_click(cx.listener(|this, _ev, win, cx| {
                                                 this.show_settings = false;
+                                                this.input.read(cx).focus_handle(cx).focus(win, cx);
                                                 cx.notify();
                                             })),
                                     ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(2.))
+                                    .px(px(10.))
+                                    .pb(px(6.))
+                                    .children(SettingsTab::ALL.iter().map(|tab| {
+                                        let active = self.settings_tab == *tab;
+                                        let tab = *tab;
+                                        div()
+                                            .id(SharedString::from(format!("settings-tab-{}", tab.label())))
+                                            .px(px(10.))
+                                            .py(px(3.))
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .bg(if active { rgb(0x20232b) } else { rgb(0x1b1e26) })
+                                            .text_color(if active { rgb(0xe8ecf4) } else { rgb(0x9ca3b0) })
+                                            .hover(|style| style.bg(rgb(0x20232b)))
+                                            .child(SharedString::from(tab.label()))
+                                            .on_click(cx.listener(move |this, _ev, win, cx| {
+                                                this.open_settings_tab(tab, win, cx);
+                                                cx.notify();
+                                            }))
+                                    })),
+                            )
+                            .child(div().h(px(1.)).w_full().bg(rgb(0x23272f)))
+                            .child(
+                                div()
+                                    .id("settings-body")
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_h(px(0.))
+                                    .overflow_y_scroll()
+                                    .px(px(14.))
+                                    .py(px(6.))
+                                    .children(match self.settings_tab {
+                                        SettingsTab::General => sections,
+                                        SettingsTab::Plugins => plugins_rows,
+                                        SettingsTab::Account => account_rows,
+                                    }),
                             ),
-                    ),
+                    )
             )
         } else {
             None
         };
+
         let model_groups: Vec<Value> = self
             .model_catalog
             .get("groups")
@@ -2982,415 +12052,1050 @@ impl Render for Root {
             .cloned()
             .unwrap_or_default();
         let model_picker = if self.show_models {
-            Some(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .bg(rgba(0x00000000))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _ev, _win, cx| {
-                                    this.show_models = false;
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("model-picker")
-                            .absolute()
-                            .bottom(px(132.))
-                            .left(px(16.))
-                            .w(px(390.))
-                            .max_h(px(420.))
-                            .overflow_y_scroll()
-                            .p(px(6.))
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .rounded_lg()
-                            .bg(rgb(0x1b1b20))
-                            .border_1()
-                            .border_color(rgb(0x32323c))
-                            .child(
-                                div()
-                                    .flex().flex_row().items_center()
-                                    .px(px(8.)).py(px(4.))
-                                    .child(div().text_sm().child("模型"))
-                                    .child(div().flex_1())
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(0x5f5f72))
-                                            .child(SharedString::from(catalog_model_name(&self.model_catalog, &self.current_model).unwrap_or_else(|| pretty_model(&self.current_model)))),
-                                    ),
+            let query = self.model_input.read(cx).value().trim().to_lowercase();
+            let mut rows: Vec<AnyElement> = Vec::new();
+            if !self.model_loading {
+                for group in &model_groups {
+                    let provider_name = group
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| group.get("id").and_then(|v| v.as_str()))
+                        .unwrap_or("")
+                        .to_string();
+                    let provider_id = group
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let Some(models) = group.get("models").and_then(|v| v.as_array()) else {
+                        continue;
+                    };
+                    let mut hits: Vec<&Value> = models
+                        .iter()
+                        .filter(|model| {
+                            if query.is_empty() {
+                                return true;
+                            }
+                            let hay = format!(
+                                "{} {} {} {}",
+                                model.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                                model.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                                model.get("description").and_then(|v| v.as_str()).unwrap_or(""),
+                                provider_name,
                             )
-                            .children(if self.model_loading {
-                                vec![div()
-                                    .px(px(8.)).py(px(10.))
-                                    .text_xs()
-                                    .text_color(rgb(0x777788))
-                                    .child("加载模型…")
-                                    .into_any_element()]
-                            } else if model_groups.is_empty() {
-                                vec![div()
-                                    .px(px(8.)).py(px(10.))
-                                    .text_xs()
-                                    .text_color(rgb(0x777788))
-                                    .child("没有可用模型")
-                                    .into_any_element()]
-                            } else {
-                                let mut rows = Vec::new();
-                                for group in model_groups {
-                                    let provider = group
-                                        .get("id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    let provider_name = group
-                                        .get("name")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or(&provider)
-                                        .to_string();
-                                    rows.push(
-                                        div()
-                                            .px(px(8.)).pt(px(8.)).pb(px(2.))
-                                            .text_xs()
-                                            .text_color(rgb(0x5f5f72))
-                                            .child(SharedString::from(provider_name))
-                                            .into_any_element(),
-                                    );
-                                    let Some(models) = group.get("models").and_then(|v| v.as_array()) else {
-                                        continue;
-                                    };
-                                    for model in models {
-                                        let id = model
-                                            .get("id")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let name = model
-                                            .get("name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or(&id)
-                                            .to_string();
-                                        let description = model
-                                            .get("description")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let active = self.current_model == id;
-                                        let provider = provider.clone();
-                                        let model_id = id.clone();
-                                        rows.push(
-                                            div()
-                                                .id(SharedString::from(format!("model-{provider}-{id}")))
-                                                .flex().flex_row().items_center().gap(px(6.))
-                                                .px(px(8.)).py(px(6.))
-                                                .rounded_sm()
-                                                .bg(if active { rgb(0x2a2a33) } else { rgb(0x1b1b20) })
-                                                .hover(|style| style.bg(rgb(0x24242c)))
-                                                .cursor_pointer()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |this, _ev, _win, cx| {
-                                                        this.show_models = false;
-                                                        let _ = this.cmds.send_blocking(Cmd::SelectModel {
-                                                            provider: provider.clone(),
-                                                            model: model_id.clone(),
-                                                        });
-                                                        cx.notify();
-                                                    }),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex().flex_col().flex_1()
-                                                        .child(div().text_sm().child(SharedString::from(name)))
-                                                        .children(if description.is_empty() {
-                                                            None
-                                                        } else {
-                                                            Some(
-                                                                div()
-                                                                    .text_xs()
-                                                                    .text_color(rgb(0x777788))
-                                                                    .child(SharedString::from(description)),
-                                                            )
-                                                        }),
-                                                )
-                                                .children(if active {
-                                                    Some(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(rgb(0x6fbf73))
-                                                            .child("✓"),
-                                                    )
-                                                } else {
-                                                    None
-                                                })
-                                                .into_any_element(),
-                                        );
-                                    }
-                                }
-                                rows
-                            }),
-                    ),
-            )
-        } else {
-            None
-        };
-
-        let switcher = if self.show_switcher {
-            Some(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .child(
+                            .to_lowercase();
+                            hay.contains(&query)
+                        })
+                        .collect();
+                    if hits.is_empty() {
+                        continue;
+                    }
+                    // 收藏优先（稳定排序）
+                    hits.sort_by_key(|model| {
+                        let key = format!(
+                            "{provider_id}/{}",
+                            model.get("id").and_then(|v| v.as_str()).unwrap_or("")
+                        );
+                        !self.model_favorites.contains(&key)
+                    });
+                    rows.push(
                         div()
-                            .absolute()
-                            .inset_0()
-                            .bg(rgba(0x00000000))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _ev, _win, cx| {
-                                    this.show_switcher = false;
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("space-switcher-panel")
-                            .absolute()
-                            .top(px(44.))
-                            .left(px(8.))
-                            .w(px(460.))
-                            .max_h(px(520.))
-                            .overflow_y_scroll()
-                            .p(px(6.))
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .rounded_lg()
-                            .bg(rgb(0x1b1b20))
-                            .border_1()
-                            .border_color(rgb(0x32323c))
-                            .child(
-                                div()
-                                    .flex().flex_row().items_center()
-                                    .px(px(8.)).py(px(4.))
-                                    .child(div().text_sm().text_color(rgb(0xe8e8f0)).child("切换空间"))
-                                    .child(div().flex_1())
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(0x777788))
-                                            .child(SharedString::from(format!("{space_count} 个"))),
-                                    ),
-                            )
-                            .children(self.spaces.iter().map(|space| {
-                                let id = space.id.clone();
-                                let active = self.current_space.as_deref() == Some(space.id.as_str());
-                                let running = self.space_running(space);
-                                let tabs = space.tabs.len();
-                                let sub = short_cwd(&space.cwd);
-                                div()
-                                    .id(SharedString::from(format!("space-{}", space.id)))
-                                    .flex().flex_row().items_center().gap(px(8.))
-                                    .px(px(8.)).py(px(6.))
-                                    .rounded_sm()
-                                    .bg(if active { rgb(0x2a2a33) } else { rgb(0x1b1b20) })
-                                    .hover(|style| style.bg(rgb(0x24242c)))
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(move |this, _ev, _win, cx| {
-                                        this.switch_space(id.clone(), cx);
-                                    }))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(if running { rgb(0x6fbf73) } else { rgb(0x6f6f88) })
-                                            .child(if running { "●" } else { "○" }),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex().flex_col().flex_1()
-                                            .child(
+                            .px(px(8.))
+                            .pt(px(8.))
+                            .pb(px(2.))
+                            .text_xs()
+                            .text_color(rgb(0x5a6070))
+                            .child(SharedString::from(provider_name))
+                            .into_any_element(),
+                    );
+                    for model in hits {
+                        let id = model
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = model
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&id)
+                            .to_string();
+                        let description = model
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let active = self.current_model == id;
+                        let key = format!("{provider_id}/{id}");
+                        let fav = self.model_favorites.contains(&key);
+                        let provider = provider_id.clone();
+                        let model_id = id.clone();
+                        let fav_key = key.clone();
+                        rows.push(
+                            div()
+                                .id(SharedString::from(format!("model-{provider_id}-{id}")))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.))
+                                .w_full()
+                                .px(px(8.))
+                                .py(px(6.))
+                                .rounded_sm()
+                                .bg(if active { rgb(0x20232b) } else { rgb(0x1b1e26) })
+                                .hover(|style| style.bg(rgb(0x171a22)))
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _ev, win, cx| {
+                                        this.show_models = false;
+                                        let _ = this.cmds.send_blocking(Cmd::SelectModel {
+                                            provider: provider.clone(),
+                                            model: model_id.clone(),
+                                        });
+                                        this.input.read(cx).focus_handle(cx).focus(win, cx);
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(
+                                    // min_w(0)：否则长描述把卡片顶宽，父级裁切（之前的错位）
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .child(div().text_sm().child(SharedString::from(name)))
+                                        .children(if description.is_empty() {
+                                            None
+                                        } else {
+                                            Some(
                                                 div()
-                                                    .flex().flex_row().items_center().gap(px(6.))
-                                                    .child(div().text_sm().child(SharedString::from(space.name.clone())))
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(rgb(0x777788))
-                                                            .child(SharedString::from(format!("{tabs} tabs"))),
-                                                    )
-                                                    .children(if active {
-                                                        Some(
-                                                            div()
-                                                                .text_xs()
-                                                                .text_color(rgb(0x6fbf73))
-                                                                .child("current"),
-                                                        )
-                                                    } else {
-                                                        None
-                                                    }),
+                                                    .text_xs()
+                                                    .text_color(rgb(0x707786))
+                                                    .child(SharedString::from(description)),
                                             )
+                                        }),
+                                )
+                                .children(if active {
+                                    Some(div().text_xs().text_color(rgb(0x00d98a)).child("✓"))
+                                } else {
+                                    None
+                                })
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "model-fav-{provider_id}-{id}"
+                                        )))
+                                        .w(px(20.))
+                                        .h(px(20.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .text_sm()
+                                        .text_color(if fav { rgb(0xc9a15a) } else { rgb(0x3a3f4a) })
+                                        .hover(|style| style.bg(rgb(0x23272f)))
+                                        .child(if fav { "★" } else { "☆" })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _ev, _win, cx| {
+                                                cx.stop_propagation();
+                                                if !this.model_favorites.remove(&fav_key) {
+                                                    this.model_favorites.insert(fav_key.clone());
+                                                }
+                                                this.save_state();
+                                                cx.notify();
+                                            }),
+                                        ),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                }
+            }
+            if rows.is_empty() {
+                rows.push(
+                    div()
+                        .px(px(8.))
+                        .py(px(12.))
+                        .text_xs()
+                        .text_color(rgb(0x707786))
+                        .child(if self.model_loading {
+                            "Loading models…"
+                        } else if query.is_empty() {
+                            "No models available"
+                        } else {
+                            "No matches"
+                        })
+                        .into_any_element(),
+                );
+            }
+            Some(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, win, cx| {
+                            this.show_models = false;
+                            this.input.read(cx).focus_handle(cx).focus(win, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        // 贴在输入框上方居中，宽度封顶（不再贴左、不再被裁）
+                        div()
+                            .id("model-picker-wrap")
+                            .absolute()
+                            .left(px(0.))
+                            .right(px(0.))
+                            .bottom(px(0.))
+                            .px(px(16.))
+                            .pb(px(112.))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                div()
+                                    .id("model-picker")
+                                    .w_full()
+                                    .max_w(px(520.))
+                                    .max_h(px(520.))
+                                    .flex()
+                                    .flex_col()
+                                    .overflow_hidden()
+                                    .rounded_lg()
+                                    .bg(rgb(0x1b1e26))
+                                    .border_1()
+                                    .border_color(rgb(0x23272f))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .px(px(12.))
+                                            .pt(px(10.))
+                                            .pb(px(4.))
+                                            .child(div().text_sm().child("Model"))
+                                            .child(div().flex_1())
                                             .child(
                                                 div()
                                                     .text_xs()
-                                                    .text_color(rgb(0x777788))
-                                                    .child(SharedString::from(sub)),
+                                                    .text_color(rgb(0x5a6070))
+                                                    .child(SharedString::from(
+                                                        catalog_model_name(
+                                                            &self.model_catalog,
+                                                            &self.current_model,
+                                                        )
+                                                        .unwrap_or_else(|| {
+                                                            pretty_model(&self.current_model)
+                                                        }),
+                                                    )),
                                             ),
                                     )
-                            })),
+                                    .child(
+                                        div()
+                                            .px(px(10.))
+                                            .pb(px(8.))
+                                            .child(
+                                                div()
+                                                    .rounded(px(6.))
+                                                    .bg(rgb(0x14171d))
+                                                    .border_1()
+                                                    .border_color(rgb(0x23272f))
+                                                    .px(px(8.))
+                                                    .py(px(4.))
+                                                    .child(
+                                                        Input::new(&self.model_input)
+                                                            .bordered(false)
+                                                            .appearance(false)
+                                                            .focus_bordered(false),
+                                                    ),
+                                            ),
+                                    )
+                                    .child(div().h(px(1.)).w_full().bg(rgb(0x23272f)))
+                                    .child(
+                                        div()
+                                            .id("model-list")
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(1.))
+                                            .flex_1()
+                                            .min_h(px(0.))
+                                            .overflow_y_scroll()
+                                            .p(px(6.))
+                                            .children(rows),
+                                    ),
+                            ),
                     ),
             )
         } else {
             None
         };
 
-        let session_picker = if self.show_sessions {
-            let rows: Vec<SessionRow> = self
-                .sessions
-                .iter()
-                .filter(|row| {
-                    space_id
-                        .as_deref()
-                        .is_some_and(|space| space_id_for(&row.cwd) == space)
+        // ---- 左侧文件栏 ----
+        let files_side = if self.files_sidebar {
+            Some(files_sidebar_element(
+                self.files_rows(),
+                &self.files_root.clone(),
+                self.files_width,
+                self.files_selected.clone(),
+                &self.git_status,
+                &self.git_branch,
+                &self
+                    .editors
+                    .values()
+                    .filter(|editor| editor.dirty)
+                    .map(|editor| editor.path.clone())
+                    .collect(),
+                self.renaming.clone(),
+                &self.rename_input,
+                self.git_panel,
+                self.files_menu,
+                self.files_branch_line,
+                self.git_repo,
+                &self.git_changes,
+                self.git_error.as_deref(),
+                self.git_amend,
+                &self.commit_input,
+                cx,
+            ))
+        } else {
+            None
+        };
+        let files_divider = if self.files_sidebar {
+            Some(
+                div()
+                    .id("files-divider")
+                    .flex_shrink_0()
+                    .w(px(4.))
+                    .h_full()
+                    .bg(rgb(0x171a22))
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .hover(|style| style.bg(rgb(0x2c3340)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, ev: &MouseDownEvent, _win, cx| {
+                            cx.stop_propagation();
+                            this.drag_pane = Some((
+                                0,
+                                f32::from(ev.position.x),
+                                this.files_width,
+                            ));
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+
+        // ---- panel 布局树（Leaf(0) = chat，其余是 terminal / editor panel）----
+        let active_panel_obj = current_space.as_ref().and_then(|space| space.current_tab());
+        let layout = active_panel_obj
+            .map(|tab| tab.layout.clone())
+            .unwrap_or(Layout::Leaf(0));
+        let maximized = active_panel_obj
+            .and_then(|tab| tab.maximized)
+            .filter(|id| *id == 0 || self.panes.iter().any(|pane| pane.id == *id));
+        let mut leaf_elements: std::collections::HashMap<u64, AnyElement> =
+            std::collections::HashMap::new();
+        if !leaf0_live {
+            if let Some(primary) = active_panel_primary.clone() {
+                let snapshot = self
+                    .chat_snapshots
+                    .get(&primary)
+                    .map(|(items, _)| items.clone())
+                    .unwrap_or_default();
+                leaf_elements.insert(
+                    0,
+                    chat_pane_element(
+                        0,
+                        primary.clone(),
+                        self.session_title(&primary),
+                        false,
+                        true,
+                        snapshot,
+                        ScrollHandle::new(),
+                        false,
+                        false,
+                        self.chat_streams.get(&primary).cloned(),
+                        composer.take().map(|el| {
+                            let weak = cx.entity().downgrade();
+                            let target = primary.clone();
+                            div()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    move |_ev, _win, cx| {
+                                        let _ = weak.update(cx, |root, cx| {
+                                            root.switch_to_chat(target.clone(), cx);
+                                        });
+                                    },
+                                )
+                                .child(el)
+                                .into_any_element()
+                        }),
+                        self.split_hover.filter(|(leaf, _)| *leaf == 0).map(|(_, dir)| dir),
+                        cx,
+                    ),
+                );
+            } else {
+                leaf_elements.insert(0, chat_panel.into_any_element());
+            }
+        } else {
+            leaf_elements.insert(0, chat_panel.into_any_element());
+        }
+        let pane_snapshot: Vec<(
+            u64,
+            Vec<Vec<Span>>,
+            Option<Entity<EditorState>>,
+            Option<String>,
+            FocusHandle,
+            Option<String>,
+            Option<String>,
+            Option<(String, MediaKind, Option<Arc<RenderImage>>)>,
+            Vec<PlacedImage>,
+        )> = self
+            .panes
+            .iter()
+            .map(|pane| {
+                let editor = pane
+                    .editor_path
+                    .as_deref()
+                    .and_then(|path| self.editors.get(&file_panel_id(path)))
+                    .map(|editor| editor.state.clone());
+                (
+                    pane.id,
+                    pane.screen.clone(),
+                    editor,
+                    pane.editor_path.clone(),
+                    pane.focus.clone(),
+                    pane.session.clone(),
+                    if pane.term_id.is_empty() {
+                        None
+                    } else {
+                        Some(pane.term_id.clone())
+                    },
+                    pane.media_path.clone().map(|path| {
+                        (
+                            path,
+                            pane.media_kind.unwrap_or(MediaKind::Image),
+                            pane.media_image.clone(),
+                        )
+                    }),
+                    pane.images.clone(),
+                )
+            })
+            .collect();
+        let split_menu_map = self.split_hover;
+        for (pane_id, screen, editor, editor_path, focus, session, term_id, media, images) in
+            pane_snapshot
+        {
+            let split_menu = split_menu_map
+                .filter(|(leaf, _)| *leaf == pane_id)
+                .map(|(_, dir)| dir);
+            let diag = editor_path
+                .as_deref()
+                .and_then(|path| self.diag_counts.get(&file_panel_id(path)).copied());
+            // chat pane：有 session 但没有终端/编辑器 → 渲染成 dsh 聊天视图
+            let chat_pane = session
+                .clone()
+                .filter(|_| editor_path.is_none() && !self.panes.iter().any(|pane| {
+                    pane.id == pane_id && !pane.term_id.is_empty()
+                }));
+            if let Some(session_id) = chat_pane {
+                let live = self.selected.as_deref() == Some(session_id.as_str());
+                let is_active_panel = self
+                    .current_space
+                    .as_ref()
+                    .and_then(|id| self.spaces.iter().find(|space| &space.id == id))
+                    .and_then(|space| space.active_panel.clone())
+                    == self
+                        .current_space
+                        .as_ref()
+                        .and_then(|id| self.spaces.iter().find(|space| &space.id == id))
+                        .and_then(|space| space.panels.iter().find(|tab| tab.blocks.contains(&session_id)).map(|tab| tab.id.clone()));
+                let snapshot = if live {
+                    self.items.clone()
+                } else {
+                    self.chat_snapshots
+                        .get(&session_id)
+                        .map(|(items, _)| items.clone())
+                        .unwrap_or_default()
+                };
+                let title = self.session_title(&session_id);
+                let scroll = self
+                    .chat_scrolls
+                    .entry(pane_id)
+                    .or_insert_with(ScrollHandle::new)
+                    .clone();
+                self.assign_block_input(&session_id);
+                let pane_composer = self
+                    .block_input_sessions
+                    .iter()
+                    .position(|slot| slot.as_deref() == Some(session_id.as_str()))
+                    .map(|slot| {
+                        block_composer(
+                            &self.block_inputs[slot],
+                            session_id.clone(),
+                            catalog_model_name(&self.model_catalog, &self.current_model)
+                                .unwrap_or_else(|| pretty_model(&self.current_model)),
+                            short_path(&space_cwd),
+                            self.context_window
+                                .map(format_tokens)
+                                .unwrap_or_else(|| "1M".to_string()),
+                            window,
+                            cx,
+                        )
+                    });
+                let block_stream = if live {
+                    self.streaming.clone()
+                } else {
+                    self.chat_streams.get(&session_id).cloned()
+                };
+                leaf_elements.insert(
+                    pane_id,
+                    chat_pane_element(
+                        pane_id,
+                        session_id,
+                        title,
+                        live,
+                        is_active_panel,
+                        snapshot,
+                        scroll,
+                        maximized == Some(pane_id),
+                        true,
+                        block_stream,
+                        pane_composer,
+                        self.split_hover.filter(|(leaf, _)| *leaf == pane_id).map(|(_, dir)| dir),
+                        cx,
+                    ),
+                );
+                continue;
+            }
+            let title = media
+                .as_ref()
+                .map(|(path, _, _)| path.clone())
+                .or(editor_path.clone())
+                .as_deref()
+                .and_then(|path| {
+                    PathBuf::from(path)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
                 })
-                .cloned()
+                .unwrap_or_else(|| "terminal".to_string());
+            leaf_elements.insert(
+                pane_id,
+                pane_element(
+                    pane_id,
+                    screen,
+                    editor,
+                    focus,
+                    term_id,
+                    title,
+                    maximized == Some(pane_id),
+                    diag,
+                    split_menu,
+                    media,
+                    images,
+                    cx,
+                ),
+            );
+        }
+        let layout_element = if let Some(pane_id) = maximized {
+            leaf_elements
+                .remove(&pane_id)
+                .unwrap_or_else(|| div().flex_1().into_any_element())
+        } else {
+            build_layout(&layout, &mut leaf_elements, cx)
+        };
+
+        let palette = if self.show_palette {
+            let query = self.palette_query(cx);
+            let entries = self.palette_entries(&query);
+            let selected = self.palette_index.min(entries.len().saturating_sub(1));
+            let mut rows: Vec<AnyElement> = Vec::new();
+            let mut last_section = "";
+            for (index, entry) in entries.iter().enumerate() {
+                if entry.section != last_section {
+                    last_section = entry.section;
+                    rows.push(
+                        div()
+                            .px(px(12.))
+                            .pt(px(8.))
+                            .pb(px(2.))
+                            .text_xs()
+                            .text_color(rgb(0x707786))
+                            .child(SharedString::from(entry.section))
+                            .into_any_element(),
+                    );
+                }
+                let active = index == selected;
+                let action = entry.action.clone();
+                let mut badges: Vec<AnyElement> = Vec::new();
+                if let Some(badge) = &entry.badge {
+                    for part in badge.split(' ') {
+                        badges.push(key_chip(part));
+                    }
+                }
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("pal-{index}")))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.))
+                        .w_full()
+                        .px(px(12.))
+                        .py(px(8.))
+                        .rounded_md()
+                        .bg(if active { rgb(0x20232b) } else { rgb(0x1b1e26) })
+                        .hover(|style| style.bg(rgb(0x171a22)))
+                        .cursor_pointer()
+                        .on_mouse_move(cx.listener(move |this, _ev, _win, cx| {
+                            if this.palette_index != index {
+                                this.palette_index = index;
+                                cx.notify();
+                            }
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, win, cx| {
+                                this.palette_index = index;
+                                let _ = &action;
+                                this.palette_activate(win, cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .w(px(6.))
+                                .h(px(6.))
+                                .rounded_full()
+                                .bg(rgb(entry.dot.unwrap_or(0x2c3340))),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(if active {
+                                                    rgb(0xf0f2f8)
+                                                } else {
+                                                    rgb(0xd0d4dc)
+                                                })
+                                                .child(SharedString::from(entry.label.clone())),
+                                        )
+                                        .children(if entry.tag.is_empty() {
+                                            None
+                                        } else {
+                                            Some(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(0x707786))
+                                                    .child(SharedString::from(entry.tag.clone())),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x707786))
+                                        .child(SharedString::from(entry.sub.clone())),
+                                ),
+                        )
+                        .children(badges)
+                        .into_any_element(),
+                );
+            }
+            if rows.is_empty() {
+                rows.push(
+                    div()
+                        .px(px(12.))
+                        .py(px(16.))
+                        .text_xs()
+                        .text_color(rgb(0x707786))
+                        .child("No matches")
+                        .into_any_element(),
+                );
+            }
+            let tabs: Vec<AnyElement> = PaletteTab::ALL
+                .iter()
+                .map(|tab| {
+                    let active = self.palette_tab == *tab;
+                    let tab = *tab;
+                    div()
+                        .id(SharedString::from(format!("pal-tab-{}", tab.label())))
+                        .px(px(12.))
+                        .py(px(4.))
+                        .rounded_full()
+                        .bg(if active { rgb(0x00b4ff) } else { rgb(0x20232b) })
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0x20232b)))
+                        .text_xs()
+                        .text_color(if active { rgb(0xffffff) } else { rgb(0x9ca3b0) })
+                        .child(SharedString::from(tab.label()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _win, cx| {
+                                this.palette_tab = tab;
+                                this.palette_index = 0;
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element()
+                })
                 .collect();
             Some(
                 div()
                     .absolute()
                     .inset_0()
-                    .child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .bg(rgba(0x00000000))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _ev, _win, cx| {
-                                    this.show_sessions = false;
-                                    cx.notify();
-                                }),
-                            ),
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .bg(rgba(0x0b0e13cc))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, win, cx| this.close_palette(win, cx)),
                     )
                     .child(
                         div()
-                            .id("session-picker-panel")
-                            .absolute()
-                            .top(px(44.))
-                            .left(px(8.))
-                            .w(px(460.))
-                            .max_h(px(520.))
-                            .overflow_y_scroll()
-                            .p(px(6.))
+                            .id("palette")
+                            .mt(px(64.))
+                            .w(px(760.))
+                            .max_h(px(560.))
                             .flex()
                             .flex_col()
-                            .gap(px(2.))
+                            .overflow_hidden()
                             .rounded_lg()
-                            .bg(rgb(0x1b1b20))
                             .border_1()
-                            .border_color(rgb(0x32323c))
+                            .border_color(rgb(0x23272f))
+                            .bg(rgb(0x1b1e26))
+                            .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
+                                cx.stop_propagation();
+                            })
                             .child(
                                 div()
-                                    .flex().flex_row().items_center()
-                                    .px(px(8.)).py(px(4.))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .px(px(16.))
+                                    .py(px(12.))
+                                    .child(div().text_sm().text_color(rgb(0x00b4ff)).child("⌘"))
                                     .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(rgb(0xe8e8f0))
-                                            .child(SharedString::from(format!("会话 · {space_label}"))),
+                                        div().flex_1().min_w(px(0.)).child(
+                                            Input::new(&self.palette_input)
+                                                .bordered(false)
+                                                .appearance(false)
+                                                .focus_bordered(false)
+                                                .text_lg(),
+                                        ),
                                     )
-                                    .child(div().flex_1())
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(0x777788))
-                                            .child(SharedString::from(format!("{} 个", rows.len()))),
-                                    ),
+                                    .child(key_chip("esc")),
                             )
-                            .children(if rows.is_empty() {
-                                vec![div()
-                                    .px(px(8.)).py(px(12.))
-                                    .text_xs()
-                                    .text_color(rgb(0x777788))
-                                    .child("此空间还没有会话")
-                                    .into_any_element()]
-                            } else {
-                                rows.into_iter()
-                                    .map(|row| {
-                                        let id = row.id.clone();
-                                        let active = self.selected.as_deref() == Some(row.id.as_str());
-                                        let title = if row.title.trim().is_empty() {
-                                            short_cwd(&row.cwd)
-                                        } else {
-                                            row.title.chars().take(40).collect::<String>()
-                                        };
-                                        let sub = short_cwd(&row.cwd);
-                                        div()
-                                            .id(SharedString::from(format!("session-{}", row.id)))
-                                            .flex().flex_row().items_center().gap(px(8.))
-                                            .px(px(8.)).py(px(5.))
-                                            .rounded_sm()
-                                            .bg(if active { rgb(0x2a2a33) } else { rgb(0x1b1b20) })
-                                            .hover(|style| style.bg(rgb(0x24242c)))
-                                            .cursor_pointer()
-                                            .on_click(cx.listener(move |this, _ev, _win, cx| {
-                                                this.open_tab(id.clone(), cx);
-                                            }))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(if row.running { rgb(0x6fbf73) } else { rgb(0x6f6f88) })
-                                                    .child(if row.running { "●" } else { "○" }),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex().flex_col().flex_1()
-                                                    .child(div().text_sm().child(SharedString::from(title)))
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(rgb(0x777788))
-                                                            .child(SharedString::from(sub)),
-                                                    ),
-                                            )
-                                            .into_any_element()
-                                    })
-                                    .collect()
-                            }),
+                            .child(div().h(px(1.)).w_full().bg(rgb(0x23272f)))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .px(px(12.))
+                                    .py(px(8.))
+                                    .children(tabs),
+                            )
+                            .child(
+                                div()
+                                    .id("palette-list")
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(1.))
+                                    .flex_1()
+                                    .min_h(px(0.))
+                                    .overflow_y_scroll()
+                                    .px(px(6.))
+                                    .pb(px(6.))
+                                    .children(rows),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .px(px(14.))
+                                    .py(px(8.))
+                                    .border_t_1()
+                                    .border_color(rgb(0x23272f))
+                                    .child(key_chip("↑ ↓"))
+                                    .child(div().text_xs().text_color(rgb(0x707786)).child("select"))
+                                    .child(key_chip("↵"))
+                                    .child(div().text_xs().text_color(rgb(0x707786)).child("run"))
+                                    .child(key_chip("⇥"))
+                                    .child(div().text_xs().text_color(rgb(0x707786)).child("next tab"))
+                                    .child(div().flex_1())
+                                    .child(div().text_xs().text_color(rgb(0x707786)).child("Ctrl K toggle"))
+                                    .child(div().text_xs().text_color(rgb(0x5a6070)).child("·"))
+                                    .child(div().text_xs().text_color(rgb(0x707786)).child("esc close")),
+                            ),
                     ),
             )
         } else {
             None
         };
 
+        // ---- 后台任务面板 ----
+        let jobs_modal = if self.show_jobs {
+            let session_id = self.selected.clone().unwrap_or_default();
+            let mut rows: Vec<AnyElement> = Vec::new();
+            if self.jobs.is_empty() {
+                rows.push(
+                    div()
+                        .px(px(4.))
+                        .py(px(10.))
+                        .text_xs()
+                        .text_color(rgb(0x707786))
+                        .child("No background jobs")
+                        .into_any_element(),
+                );
+            }
+            for job in &self.jobs {
+                let id = job.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let kind = job
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("job")
+                    .to_string();
+                let label = job
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let status = job
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let progress = job
+                    .get("progress")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let detail = job
+                    .get("detail")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let color = match status.as_str() {
+                    "running" => 0xc9a15a,
+                    "stopping" => 0xc9a15a,
+                    "completed" => 0x00d98a,
+                    "killed" => 0xff5663,
+                    "failed" => 0xff5663,
+                    _ => 0x9ca3b0,
+                };
+                let killable = matches!(status.as_str(), "running" | "stopping");
+                let kill_id = id.clone();
+                let kill_session = session_id.clone();
+                let meta = if !detail.is_empty() {
+                    detail
+                } else if !progress.is_empty() {
+                    progress
+                } else {
+                    String::new()
+                };
+                rows.push(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        .px(px(4.))
+                        .py(px(6.))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family("monospace")
+                                .text_color(rgb(0x5a6070))
+                                .w(px(74.))
+                                .child(SharedString::from(kind)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(div().text_sm().child(SharedString::from(label)))
+                                .children(if meta.is_empty() {
+                                    None
+                                } else {
+                                    Some(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x707786))
+                                            .child(SharedString::from(meta)),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(color))
+                                .child(SharedString::from(status)),
+                        )
+                        .children(if killable {
+                            Some(
+                                div()
+                                    .id(SharedString::from(format!("job-kill-{kill_id}")))
+                                    .px(px(6.))
+                                    .py(px(2.))
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(rgb(0xff5663))
+                                    .hover(|style| style.bg(rgb(0x3a1f24)))
+                                    .child("kill")
+                                    .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                        let _ = this.cmds.send_blocking(Cmd::JobKill {
+                                            session_id: kill_session.clone(),
+                                            job_id: kill_id.clone(),
+                                        });
+                                        cx.notify();
+                                    })),
+                            )
+                        } else {
+                            None
+                        })
+                        .into_any_element(),
+                );
+            }
+            Some(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgba(0x000000cc))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, _win, cx| {
+                            this.show_jobs = false;
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id("jobs-card")
+                            .w(px(560.))
+                            .max_h(px(420.))
+                            .flex()
+                            .flex_col()
+                            .rounded_lg()
+                            .bg(rgb(0x1b1e26))
+                            .border_1()
+                            .border_color(rgb(0x23272f))
+                            .overflow_hidden()
+                            .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .px(px(14.))
+                                    .py(px(10.))
+                                    .child(div().text_sm().child("Background jobs"))
+                                    .child(div().flex_1())
+                                    .child(
+                                        div()
+                                            .id("jobs-close")
+                                            .px(px(8.))
+                                            .py(px(2.))
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .text_color(rgb(0x9ca3b0))
+                                            .hover(|style| style.bg(rgb(0x20232b)))
+                                            .child("close")
+                                            .on_click(cx.listener(|this, _ev, _win, cx| {
+                                                this.show_jobs = false;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(div().h(px(1.)).w_full().bg(rgb(0x23272f)))
+                            .child(
+                                div()
+                                    .id("jobs-body")
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_h(px(0.))
+                                    .overflow_y_scroll()
+                                    .px(px(10.))
+                                    .py(px(4.))
+                                    .children(rows),
+                            ),
+                    ),
+            )
+        } else {
+            None
+        };
+
+        // tab 条溢出状态：决定左右箭头是否显示 / 是否还能滚
+        let tab_overflow = tab_strip_viewport > 0. && tab_content_w > tab_strip_viewport + 4.;
+        let tab_offset_x = -f32::from(self.tab_scroll.offset().x);
+        let tab_max_x = f32::from(self.tab_scroll.max_offset().x);
+        let tab_at_start = tab_offset_x <= 0.5;
+        let tab_at_end = tab_offset_x >= tab_max_x - 0.5;
+
         let root = div().flex().flex_col()
             .id("root")
             .relative()
             .size_full()
-            .bg(rgb(0x111114))
-            .text_color(rgb(0xd8d8e0));
-        // 键盘路由只在终端面板打开时挂（避免任何情况下干扰输入框）
-        let root = if show_terminal {
-            root.on_key_down(cx.listener(|this, ev: &KeyDownEvent, _win, cx| {
-                if this.show_terminal && this.term_focus.contains_focused(_win, cx) {
-                    if let Some(data) = key_to_bytes(&ev.keystroke) {
-                        let _ = this.cmds.send_blocking(Cmd::TerminalInput(data));
-                        cx.stop_propagation();
-                    }
+            .bg(rgb(0x15181f))
+            .text_color(rgb(0xe8ecf4));
+        // 键盘路由：焦点在某个终端 pane 上时，按键直接喂给那个终端
+        let root = root.on_key_down(cx.listener(|this, ev: &KeyDownEvent, win, cx| {
+            if let Some(term_id) = this.focused_term(win, cx) {
+                if this.send_terminal_key(&term_id, &ev.keystroke, cx) {
+                    cx.stop_propagation();
                 }
+            }
+        }));
+        let root = root
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, win, cx| {
+                this.drag_pane_move(ev, win, cx);
+                this.drag_tab(ev, cx);
             }))
-        } else {
-            root
-        };
-        root
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _win, cx| {
+                    this.end_pane_drag(cx);
+                    if this.tab_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            );
+        let element = root
             .child(
                 div().flex().flex_col().w_full()
                     .child(
@@ -3400,7 +13105,9 @@ impl Render for Root {
                             .h(px(38.))
                             .px(px(8.))
                             .gap(px(6.))
-                            .bg(rgb(0x1b1b20))
+                            .bg(rgb(0x1b1e26))
+                            .border_b_1()
+                            .border_color(rgb(0x23272f))
                             .child(
                                 div()
                                     .id("session-switcher")
@@ -3408,92 +13115,499 @@ impl Render for Root {
                                     .px(px(6.)).py(px(3.))
                                     .rounded_sm()
                                     .cursor_pointer()
-                                    .hover(|style| style.bg(rgb(0x2a2a33)))
-                                    .on_click(cx.listener(|this, _ev, _win, cx| {
-                                        this.show_switcher = !this.show_switcher;
-                                        this.show_settings = false;
-                                        cx.notify();
+                                    .hover(|style| style.bg(rgb(0x20232b)))
+                                    .on_click(cx.listener(|this, ev: &ClickEvent, win, cx| {
+                                        if ev.click_count() == 2 {
+                                            if let Some(space_id) = this.current_space.clone() {
+                                                this.begin_rename(
+                                                    RenameTarget::Space(space_id),
+                                                    win,
+                                                    cx,
+                                                );
+                                            }
+                                        } else {
+                                            this.open_palette_on(PaletteTab::Spaces, win, cx);
+                                        }
                                     }))
-                                    .child(
+                                    .child(session_icon(0x9ca3b0))
+                                    .child(if renaming == Some(RenameTarget::Space(space_id.clone().unwrap_or_default())) {
+                                        div().w(px(160.)).child(
+                                            Input::new(&self.rename_input)
+                                                .bordered(false)
+                                                .appearance(false)
+                                                .focus_bordered(false)
+                                                .text_sm(),
+                                        )
+                                    } else {
                                         div()
                                             .text_sm()
-                                            .text_color(rgb(0xe8e8f0))
-                                            .child(SharedString::from(space_label)),
-                                    )
-                                    .child(div().text_xs().text_color(rgb(0x8a8aa0)).child("⌄")),
+                                            .text_color(rgb(0xe8ecf4))
+                                            .child(SharedString::from(space_label))
+                                    }),
                             )
                             .child(
-                                div().w(px(1.)).h(px(16.)).bg(rgb(0x32323c)),
+                                div().w(px(1.)).h(px(16.)).bg(rgb(0x23272f)),
                             )
+                            .children(if tab_overflow {
+                                Some(
+                                    div()
+                                        .id("tab-scroll-left")
+                                        .w(px(20.)).h(px(HEAD_BTN))
+                                        .flex().items_center().justify_center()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .text_size(px(HEAD_GLYPH))
+                                        .text_color(rgb(if tab_at_start {
+                                            0x3a4150
+                                        } else {
+                                            0x9ca3b0
+                                        }))
+                                        .hover(|style| style.bg(rgb(0x20232b)))
+                                        .child("‹")
+                                        .on_click(cx.listener(|this, _ev, _win, cx| {
+                                            this.scroll_tabs_by(-0.8, cx);
+                                        })),
+                                )
+                            } else {
+                                None
+                            })
                             .child(
-                                div().flex().flex_row().items_center().gap(px(3.))
-                                    .max_w(px(720.))
-                                    .overflow_hidden()
-                                    .children(tabs.into_iter().map(|(id, title, active)| {
+                                // tab 条：横向滚动（Firefox 那种，滚轮/拖拽都能推）
+                                div().id("tab-strip")
+                                    .flex().flex_row().items_center().gap(px(3.))
+                                    .flex_1().min_w(px(0.))
+                                    .overflow_x_scroll()
+                                    .track_scroll(&self.tab_scroll)
+                                    .children(tab_chips.into_iter().enumerate().map(|(tab_index, (id, title, active))| {
+                                        let width = tab_widths.get(tab_index).copied().unwrap_or(168.);
                                         let open_id = id.clone();
                                         let close_id = id.clone();
+                                        let rename_id = id.clone();
+                                        let drag_id = id.clone();
+                                        let dragging_this =
+                                            tab_drag.as_ref().map(|(pid, _)| pid) == Some(&id);
+                                        let renaming_this =
+                                            renaming.as_ref() == Some(&RenameTarget::Panel(id.clone()));
                                         div()
                                             .id(SharedString::from(format!("tab-{id}")))
                                             .flex().flex_row().items_center().gap(px(4.))
-                                            .px(px(8.)).py(px(3.))
+                                            .w(px(if renaming_this { 150. } else { width }))
+                                            .min_w(px(56.))
+                                            .max_w(px(240.))
+                                            .flex_shrink_0()
+                                            .px(px(8.))
+                                            .py(if renaming_this { px(0.) } else { px(3.) })
                                             .rounded_md()
-                                            .bg(if active { rgb(0x2a2a33) } else { rgb(0x1b1b20) })
+                                            // 简洁版：只有 active 才"抬起来"（有边框 + 浅底），
+                                            // 其余平铺；hover 只轻微提亮，绝不和 active 同亮度
+                                            .bg(if dragging_this {
+                                                rgb(0x2a3140)
+                                            } else if active {
+                                                rgb(0x20232b)
+                                            } else {
+                                                rgb(0x1b1e26)
+                                            })
+                                            .border_1()
+                                            .border_color(if dragging_this {
+                                                rgb(0x00b4ff)
+                                            } else if active {
+                                                rgb(0x3b4557)
+                                            } else {
+                                                rgb(0x1b1e26)
+                                            })
                                             .cursor_pointer()
-                                            .hover(|style| style.bg(rgb(0x24242c)))
-                                            .on_click(cx.listener(move |this, _ev, _win, cx| {
-                                                this.open_tab(open_id.clone(), cx);
+                                            .hover(|style| style.bg(rgb(0x1f232c)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
+                                                    if this.renaming.is_none() {
+                                                        this.tab_drag = Some((
+                                                            drag_id.clone(),
+                                                            f32::from(ev.position.x),
+                                                        ));
+                                                        cx.notify();
+                                                    }
+                                                }),
+                                            )
+                                            .on_click(cx.listener(move |this, ev: &ClickEvent, win, cx| {
+                                                if ev.click_count() == 2 {
+                                                    // 双击改名（tab 名）
+                                                    this.begin_rename(
+                                                        RenameTarget::Panel(rename_id.clone()),
+                                                        win,
+                                                        cx,
+                                                    );
+                                                } else {
+                                                    this.activate_tab(open_id.clone(), cx);
+                                                }
                                             }))
-                                            .child(
+                                            .child(if renaming_this {
+                                                // 改名框必须收在 tab 里面（之前固定 140px 会撑出边框，
+                                                // 溢出到邻居 tab 上，点 × 就点错了）
+                                                div().flex_1().min_w(px(0.)).child(
+                                                    // 不裁高度（裁了文字就贴底/被切），
+                                                    // 内边距清零让文字垂直居中
+                                                    // 不压高度：Input 内部 line-height 是
+                                                    // 1.25rem(20px)+单行布局，压到 20/24 就会
+                                                    // 把文字顶到底部裁掉。让它在 38px 的
+                                                    // 标题栏里自然撑开最稳。
+                                                    // 字号和 tab 标签一致（text_xs），
+                                                    // 不改高度、清零内边距 → 文字不会被裁
+                                                    Input::new(&self.rename_input)
+                                                        .bordered(false)
+                                                        .appearance(false)
+                                                        .focus_bordered(false)
+                                                        .text_xs()
+                                                        .py(px(0.))
+                                                        .px(px(4.))
+                                                        .w_full(),
+                                                )
+                                            } else {
                                                 div()
                                                     .text_xs()
                                                     .text_color(if active {
-                                                        rgb(0xe8e8f0)
+                                                        rgb(0xe8ecf4)
                                                     } else {
-                                                        rgb(0x9a9ab0)
+                                                        rgb(0x8d94a3)
                                                     })
-                                                    .max_w(px(160.))
+                                                    .flex_1()
+                                                    .min_w(px(0.))
                                                     .overflow_hidden()
-                                                    .child(SharedString::from(title)),
-                                            )
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .child(SharedString::from(title))
+                                            })
                                             .child(
                                                 div()
                                                     .id(SharedString::from(format!("tab-close-{close_id}")))
+                                                    .flex_shrink_0()
                                                     .px(px(2.))
                                                     .text_xs()
-                                                    .text_color(rgb(0x777788))
+                                                    .text_color(rgb(0x707786))
                                                     .cursor_pointer()
                                                     .child("×")
+                                                    .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
+                                                        // 点 × 不要开始拖 tab
+                                                        cx.stop_propagation();
+                                                    })
                                                     .on_click(cx.listener(move |this, _ev, _win, cx| {
                                                         cx.stop_propagation();
-                                                        this.close_tab(&close_id, cx);
+                                                        this.close_whole_tab(&close_id, cx);
                                                     })),
                                             )
                                     })),
                             )
-                            .child(
-                                div()
+                            .children(if tab_overflow {
+                                Some(
+                                    div()
+                                        .id("tab-scroll-right")
+                                        .w(px(20.)).h(px(HEAD_BTN))
+                                        .flex().items_center().justify_center()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .text_size(px(HEAD_GLYPH))
+                                        .text_color(rgb(if tab_at_end {
+                                            0x3a4150
+                                        } else {
+                                            0x9ca3b0
+                                        }))
+                                        .hover(|style| style.bg(rgb(0x20232b)))
+                                        .child("›")
+                                        .on_click(cx.listener(|this, _ev, _win, cx| {
+                                            this.scroll_tabs_by(0.8, cx);
+                                        })),
+                                )
+                            } else {
+                                None
+                            })
+                            .child({
+                                // 「+」：hover 出菜单（dsh / terminal），直接点仍是新建 dsh 会话
+                                let dsh_cmds = cmds.clone();
+                                let dsh_cwd = space_cwd.clone();
+                                let term_cmds = cmds.clone();
+                                let term_cwd = space_cwd.clone();
+                                let menu_cmds = cmds.clone();
+                                let trigger = div()
                                     .id("new-tab")
-                                    .w(px(22.)).h(px(22.))
+                                    .w(px(HEAD_BTN)).h(px(HEAD_BTN))
                                     .flex().items_center().justify_center()
                                     .rounded_sm()
                                     .cursor_pointer()
-                                    .text_sm()
-                                    .text_color(rgb(0x9a9ab0))
-                                    .hover(|style| style.bg(rgb(0x2a2a33)))
+                                    .text_size(px(HEAD_GLYPH + 1.))
+                                    .text_color(rgb(0x9ca3b0))
+                                    .hover(|style| style.bg(rgb(0x20232b)))
                                     .child("+")
-                                    .on_click({
-                                        let cmds = cmds.clone();
-                                        let cwd = space_cwd.clone();
-                                        move |_ev, _win, _cx| {
-                                            let _ = cmds.send_blocking(Cmd::NewSession {
-                                                cwd: Some(cwd.clone()),
-                                            });
+                                    .on_click(move |_ev, _win, _cx| {
+                                        let _ = dsh_cmds
+                                            .send_blocking(Cmd::NewSession { cwd: Some(dsh_cwd.clone()) });
+                                    });
+                                gpui_kit::base::HoverCard::new("new-tab-card")
+                                    .anchor(gpui_kit::Anchor::TopLeft)
+                                    .open_delay(std::time::Duration::from_millis(120))
+                                    .close_delay(std::time::Duration::from_millis(160))
+                                    .trigger(trigger)
+                                    .content({
+                                        let cmds = menu_cmds.clone();
+                                        let space_cwd = space_cwd.clone();
+                                        move |_state, _window, _cx| {
+                                        div()
+                                            .id("new-tab-menu")
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(1.))
+                                            .w(px(168.))
+                                            .p(px(4.))
+                                            .rounded(px(8.))
+                                            .bg(rgb(0x1b1e26))
+                                            .border_1()
+                                            .border_color(rgb(0x23272f))
+                                            .child(
+                                                div()
+                                                    .id("new-tab-dsh")
+                                                    .flex().flex_row().items_center().gap(px(8.))
+                                                    .px(px(8.)).py(px(5.))
+                                                    .rounded_sm()
+                                                    .cursor_pointer()
+                                                    .hover(|style| style.bg(rgb(0x20232b)))
+                                                    .child(div().text_sm().text_color(rgb(0x00b4ff)).child("◆"))
+                                                    .child(div().text_sm().text_color(rgb(0xe8ecf4)).child("dsh"))
+                                                    .child(div().flex_1())
+                                                    .child(div().text_xs().text_color(rgb(0x707786)).child("chat"))
+                                                    .on_click({
+                                                        let cmds = cmds.clone();
+                                                        let cwd = space_cwd.clone();
+                                                        move |_ev, _win, _cx| {
+                                                            let _ = cmds.send_blocking(Cmd::NewSession {
+                                                                cwd: Some(cwd.clone()),
+                                                            });
+                                                        }
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("new-tab-terminal")
+                                                    .flex().flex_row().items_center().gap(px(8.))
+                                                    .px(px(8.)).py(px(5.))
+                                                    .rounded_sm()
+                                                    .cursor_pointer()
+                                                    .hover(|style| style.bg(rgb(0x20232b)))
+                                                    .child(
+                                                        div().text_sm().font_family("monospace")
+                                                            .text_color(rgb(0x00d98a)).child(">_"),
+                                                    )
+                                                    .child(div().text_sm().text_color(rgb(0xe8ecf4)).child("terminal"))
+                                                    .child(div().flex_1())
+                                                    .child(div().text_xs().text_color(rgb(0x707786)).child("tab"))
+                                                    .on_click({
+                                                        let cmds = cmds.clone();
+                                                        let cwd = space_cwd.clone();
+                                                        let pane_id = next_pane_id();
+                                                        move |_ev, _win, _cx| {
+                                                            let _ = cmds.send_blocking(Cmd::NewTerminal {
+                                                                pane_id,
+                                                                kind: BlockPlacement::Panel,
+                                                                cwd: Some(cwd.clone()),
+                                                                run: None,
+                                                            });
+                                                        }
+                                                    }),
+                                            )
                                         }
-                                    }),
-                            )
+                                    })
+                            })
+                            .child({
+                                // 全部 tab 的下拉清单：Popover 挂在按钮上，点了才开
+                                let weak = cx.entity().downgrade();
+                                let weak_open = weak.clone();
+                                let rows = tab_rows.clone();
+                                gpui_kit::base::Popover::new("tab-list-popover")
+                                    .anchor(gpui_kit::Anchor::TopRight)
+                                    .offset(px(6.))
+                                    .open(self.show_tab_list)
+                                    .on_open_change(move |open, _win, cx| {
+                                        let open = *open;
+                                        let _ = weak_open.update(cx, |root, cx| {
+                                            root.show_tab_list = open;
+                                            cx.notify();
+                                        });
+                                    })
+                                    .trigger_with(move |is_open, _win, _cx| {
+                                        div()
+                                            .id("tab-list-toggle")
+                                            .w(px(HEAD_BTN)).h(px(HEAD_BTN))
+                                            .flex().items_center().justify_center()
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .text_size(px(HEAD_GLYPH))
+                                            .text_color(rgb(if is_open {
+                                                0x00b4ff
+                                            } else {
+                                                0x9ca3b0
+                                            }))
+                                            .hover(|style| style.bg(rgb(0x20232b)))
+                                            .child("⌄")
+                                            .into_any_element()
+                                    })
+                                    .content({
+                                        let weak_row = weak.clone();
+                                        move |_state, _window, _cx| {
+                                            let rows: Vec<AnyElement> = rows
+                                                .iter()
+                                                .enumerate()
+                                                .map(|(index, (id, label, active, count))| {
+                                                    let open_id = id.clone();
+                                                    let close_id = id.clone();
+                                                    let weak_open_row = weak_row.clone();
+                                                    let weak_close = weak_row.clone();
+                                                    div()
+                                                        .id(SharedString::from(format!(
+                                                            "tab-row-{id}"
+                                                        )))
+                                                        .flex()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .gap(px(6.))
+                                                        .px(px(8.))
+                                                        .py(px(4.))
+                                                        .rounded_sm()
+                                                        .cursor_pointer()
+                                                        .bg(if *active {
+                                                            rgb(0x20232b)
+                                                        } else {
+                                                            rgb(0x15181f)
+                                                        })
+                                                        .hover(|style| style.bg(rgb(0x20232b)))
+                                                        .child(
+                                                            div()
+                                                                .w(px(16.))
+                                                                .text_xs()
+                                                                .text_color(rgb(0x5a6070))
+                                                                .child(SharedString::from(
+                                                                    if index < 9 {
+                                                                        format!("{}", index + 1)
+                                                                    } else {
+                                                                        String::new()
+                                                                    },
+                                                                )),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .flex_1()
+                                                                .min_w(px(0.))
+                                                                .text_sm()
+                                                                .overflow_hidden()
+                                                                .whitespace_nowrap()
+                                                                .text_ellipsis()
+                                                                .text_color(if *active {
+                                                                    rgb(0xe8ecf4)
+                                                                } else {
+                                                                    rgb(0xd0d4dc)
+                                                                })
+                                                                .child(SharedString::from(
+                                                                    label.clone(),
+                                                                )),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(rgb(0x707786))
+                                                                .child(SharedString::from(format!(
+                                                                    "{count}p"
+                                                                ))),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .id(SharedString::from(format!(
+                                                                    "tab-row-close-{id}"
+                                                                )))
+                                                                .px(px(3.))
+                                                                .text_xs()
+                                                                .text_color(rgb(0x707786))
+                                                                .cursor_pointer()
+                                                                .hover(|style| {
+                                                                    style.text_color(rgb(0xff5663))
+                                                                })
+                                                                .child("×")
+                                                                .on_click(move |_ev, _win, cx| {
+                                                                    cx.stop_propagation();
+                                                                    let _ = weak_close.update(
+                                                                        cx,
+                                                                        |root, cx| {
+                                                                            root.close_whole_tab(
+                                                                                &close_id, cx,
+                                                                            );
+                                                                        },
+                                                                    );
+                                                                }),
+                                                        )
+                                                        .on_click(move |_ev, _win, cx| {
+                                                            let _ = weak_open_row.update(
+                                                                cx,
+                                                                |root, cx| {
+                                                                    root.show_tab_list = false;
+                                                                    root.activate_tab(
+                                                                        open_id.clone(),
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            );
+                                                        })
+                                                        .into_any_element()
+                                                })
+                                                .collect();
+                                            div()
+                                                .w(px(300.))
+                                                .p(px(6.))
+                                                .flex()
+                                                .flex_col()
+                                                .gap(px(1.))
+                                                .rounded(px(10.))
+                                                .bg(rgb(0x1b1e26))
+                                                .border_1()
+                                                .border_color(rgb(0x23272f))
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .gap(px(6.))
+                                                        .px(px(8.))
+                                                        .py(px(4.))
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(rgb(0x707786))
+                                                                .child(SharedString::from("Tabs")),
+                                                        )
+                                                        .child(div().flex_1())
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(rgb(0x5a6070))
+                                                                .child(SharedString::from(format!(
+                                                                    "{}",
+                                                                    rows.len()
+                                                                ))),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("tab-list-rows")
+                                                        .flex()
+                                                        .flex_col()
+                                                        .gap(px(1.))
+                                                        .max_h(px(380.))
+                                                        .overflow_y_scroll()
+                                                        .children(rows),
+                                                )
+                                        }
+                                    })
+                            })
                             .child(
+                                // 窗口拖拽区（让 tab 条尽量宽，这里只留一小段）
                                 div()
-                                    .flex_1()
+                                    .w(px(24.))
+                                    .flex_shrink_0()
                                     .h_full()
                                     .min_h(px(24.))
                                     .on_mouse_down(MouseButton::Left, |_ev, win, _cx| {
@@ -3505,11 +13619,11 @@ impl Render for Root {
                                 Some(
                                     div()
                                         .id("cancel")
-                                        .w(px(24.)).h(px(22.))
+                                        .w(px(HEAD_BTN)).h(px(HEAD_BTN))
                                         .flex().items_center().justify_center()
                                         .rounded_sm()
-                                        .bg(rgb(0x5f2d2d))
-                                        .text_xs()
+                                        .bg(rgb(0x3a1f24))
+                                        .text_size(px(11.))
                                         .cursor_pointer()
                                         .child("■")
                                         .on_click(move |_ev, _win, _cx| {
@@ -3521,48 +13635,86 @@ impl Render for Root {
                             })
                             .child(
                                 div()
-                                    .id("toggle-terminal")
-                                    .w(px(26.)).h(px(22.))
-                                    .flex().items_center().justify_center()
+                                    .id("files-toggle")
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(HEAD_BTN))
+                                    .h(px(HEAD_BTN))
                                     .rounded_sm()
                                     .cursor_pointer()
-                                    .text_xs()
-                                    .text_color(if show_terminal { rgb(0x9fc6ff) } else { rgb(0x9a9ab0) })
-                                    .hover(|style| style.bg(rgb(0x2a2a33)))
-                                    .child(">_")
-                                    .on_click(cx.listener(|this, _ev, win, cx| {
-                                        this.show_terminal = !this.show_terminal;
-                                        if this.show_terminal && this.term.is_none() {
-                                            this.term = Term::new(100, 30);
-                                        }
-                                        if this.show_terminal {
-                                            let _ = this.cmds.send_blocking(Cmd::NewTerminal);
+                                    .hover(|style| style.bg(rgb(0x20232b)))
+                                    .child(
+                                        Icon::new(if self.files_sidebar {
+                                            gpui_kit::assets::IconName::PanelLeftOpen
                                         } else {
-                                            this.input.read(cx).focus_handle(cx).focus(win, cx);
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("toggle-sidebar")
-                                    .w(px(26.)).h(px(22.))
-                                    .flex().items_center().justify_center()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .text_xs()
-                                    .text_color(if self.show_sessions { rgb(0x9fc6ff) } else { rgb(0x9a9ab0) })
-                                    .hover(|style| style.bg(rgb(0x2a2a33)))
-                                    .child("▦")
+                                            gpui_kit::assets::IconName::PanelLeft
+                                        })
+                                        .with_size(px(15.))
+                                        .text_color(rgb(if self.files_sidebar {
+                                            0x00b4ff
+                                        } else {
+                                            0x9ca3b0
+                                        })),
+                                    )
                                     .on_click(cx.listener(|this, _ev, _win, cx| {
-                                        this.show_sessions = !this.show_sessions;
-                                        this.show_settings = false;
-                                        cx.notify();
+                                        this.files_toggle_sidebar(cx);
                                     })),
                             )
+                            .children(if !self.jobs.is_empty() {
+                                let running = self
+                                    .jobs
+                                    .iter()
+                                    .filter(|job| {
+                                        matches!(
+                                            job.get("status").and_then(|v| v.as_str()),
+                                            Some("running") | Some("stopping")
+                                        )
+                                    })
+                                    .count();
+                                let total = self.jobs.len();
+                                let color = if running > 0 { 0xc9a15a } else { 0x9ca3b0 };
+                                let text = if running > 0 {
+                                    format!("{running}/{total}")
+                                } else {
+                                    total.to_string()
+                                };
+                                Some(
+                                    div()
+                                        .id("jobs-chip")
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(4.))
+                                        .px(px(6.))
+                                        .h(px(HEAD_BTN))
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(rgb(0x20232b)))
+                                        .child(div().text_xs().text_color(rgb(color)).child("◎"))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(color))
+                                                .child(SharedString::from(text)),
+                                        )
+                                        .on_click(cx.listener(|this, _ev, _win, cx| {
+                                            this.show_jobs = true;
+                                            cx.notify();
+                                        })),
+                                )
+                            } else {
+                                None
+                            })
                             .children(if !connected {
                                 Some(
                                     div()
+                                        .w(px(HEAD_BTN))
+                                        .h(px(HEAD_BTN))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
                                         .text_xs()
                                         .text_color(rgb(status_color))
                                         .child(status_dot),
@@ -3573,45 +13725,98 @@ impl Render for Root {
                             .child(
                                 div()
                                     .id("settings")
-                                    .w(px(30.)).h(px(22.))
+                                    .w(px(HEAD_BTN)).h(px(HEAD_BTN))
                                     .flex().items_center().justify_center()
                                     .rounded_sm()
                                     .cursor_pointer()
-                                    .text_sm()
-                                    .text_color(rgb(0xc8c8d4))
-                                    .hover(|style| style.bg(rgb(0x32323c)))
+                                    .text_size(px(HEAD_GLYPH))
+                                    .text_color(rgb(0xd0d4dc))
+                                    .hover(|style| style.bg(rgb(0x23272f)))
                                     .child("⚙")
                                     .on_click(cx.listener(|this, _ev, _win, cx| {
                                         this.show_settings = true;
-                                        this.show_switcher = false;
+                                        this.reload_settings();
                                         cx.notify();
                                     })),
                             )
-                            .child(window_button("win-min", "—", 0x32323c, |win, _cx| {
+                            .child(window_button("win-min", "—", 0x23272f, |win, _cx| {
                                 win.minimize_window();
                             }))
-                            .child(window_button("win-max", "□", 0x32323c, |win, _cx| {
+                            .child(window_button("win-max", "□", 0x23272f, |win, _cx| {
                                 win.zoom_window();
                             }))
-                            .child(window_button("win-close", "×", 0x7a3030, |win, _cx| {
+                            .child(window_button("win-close", "×", 0x3a1f24, |win, _cx| {
                                 win.remove_window();
                             })),
                     )
             )
             .child(
-                div().flex().flex_row()
+                div()
+                    .flex()
+                    .flex_row()
                     .flex_1()
                     .min_h(px(0.))
                     .w_full()
-                    .children(term_panel)
-                    .child(transcript_area),
+                    .children(files_side)
+                    .children(files_divider)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .min_w(px(0.))
+                            .child(layout_element),
+                    ),
             )
-            .child(typing)
-            .children(switcher)
-            .children(session_picker)
             .children(model_picker)
             .children(settings_modal)
+            .children(jobs_modal)
+            .children(palette)
+            .child(browser_overlay());
+        let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
+        if render_no <= 8 || render_ms >= 8.0 {
+            stamp(format!(
+                "render #{render_no} done in {render_ms:.2}ms (items={items_at_render})"
+            ));
+        }
+        element
     }
+}
+/// 分屏图标：圆角矩形 + 中缝（参考 tern/herdr 的 panel split 图标）。
+/// `vertical = true` → side by side（竖中缝）；否则stacked（横中缝）。
+fn split_icon(vertical: bool, active: bool) -> AnyElement {
+    let color = if active { rgb(0x00b4ff) } else { rgb(0x9ca3b0) };
+    let mut icon = div()
+        .w(px(15.))
+        .h(px(13.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(color);
+    icon = if vertical {
+        icon.child(div().w(px(1.)).h_full().bg(color))
+    } else {
+        icon.child(div().h(px(1.)).w_full().bg(color))
+    };
+    icon.into_any_element()
+}
+
+/// 快捷键小胶囊（面板里用）。
+fn key_chip(text: &str) -> AnyElement {
+    div()
+        .px(px(6.))
+        .py(px(2.))
+        .rounded(px(4.))
+        .bg(rgb(0x20232b))
+        .border_1()
+        .border_color(rgb(0x2c3340))
+        .text_xs()
+        .text_color(rgb(0x9ca3b0))
+        .child(SharedString::from(text.to_string()))
+        .into_any_element()
 }
 
 fn window_button(
@@ -3622,18 +13827,44 @@ fn window_button(
 ) -> impl IntoElement {
     div()
         .id(id)
-        .w(px(30.))
-        .h(px(22.))
+        .w(px(HEAD_BTN + 4.))
+        .h(px(HEAD_BTN))
         .flex()
         .items_center()
         .justify_center()
         .rounded_sm()
         .cursor_pointer()
-        .text_sm()
-        .text_color(rgb(0xc8c8d4))
+        .text_size(px(HEAD_GLYPH))
+        .text_color(rgb(0xd0d4dc))
         .hover(move |style| style.bg(rgb(hover_bg)))
         .child(label)
         .on_click(move |_ev, win, cx| action(win, cx))
+}
+
+// 注：gpui-base 的 LanguageConfig 是 pub(crate)，应用侧拿不到，
+// 所以括号自动闭合/回车缩进只能用它的默认实现（默认已含 ()[]{}、引号自动闭合）。
+// 能调的只有 tab 宽度（InputBaseState::tab_size，见 tab_size_for）。
+
+/// tab 显示名：用户改过就用改的，否则就是 "tab 1"、"tab 2"（按位置）。
+fn tab_display_name(tab: &Panel, index: usize) -> String {
+    if !tab.name.trim().is_empty() {
+        return tab.name.clone();
+    }
+    let number = if tab.number > 0 {
+        tab.number as usize
+    } else {
+        index + 1
+    };
+    format!("tab {number}")
+}
+
+/// 各语言的缩进宽度（编辑器 tab 宽度）。
+fn tab_size_for(language: &str) -> usize {
+    match language {
+        "rs" | "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "go" | "java" | "kotlin" | "swift"
+        | "zig" | "py" | "pyi" => 4,
+        _ => 2,
+    }
 }
 
 fn normalize_cwd(cwd: &str) -> String {
@@ -3775,12 +14006,52 @@ fn ui_state_path() -> PathBuf {
     data_dir().join("ui-state.json")
 }
 
-fn load_ui_state() -> (Vec<Space>, Option<String>, Option<String>, String, String) {
+struct UiState {
+    spaces: Vec<Space>,
+    current_space: Option<String>,
+    selected: Option<String>,
+    model: String,
+    provider: String,
+    term_tabs: Vec<String>,
+    files_sidebar: bool,
+    files_root: String,
+    files_width: f32,
+    files_expanded: Vec<String>,
+    model_favorites: Vec<String>,
+    panel_names: Vec<(String, String)>,
+}
+
+fn layout_json_has_content(value: &Value) -> bool {
+    if let Some(leaf) = value.get("leaf").and_then(|v| v.as_str()) {
+        return matches!(leaf, "media" | "editor" | "terminal");
+    }
+    value
+        .get("children")
+        .and_then(|v| v.as_array())
+        .map(|children| children.iter().any(layout_json_has_content))
+        .unwrap_or(false)
+}
+
+fn load_ui_state() -> UiState {
+    let empty = || UiState {
+        spaces: Vec::new(),
+        current_space: None,
+        selected: None,
+        model: String::new(),
+        provider: String::new(),
+        term_tabs: Vec::new(),
+        files_sidebar: false,
+        files_root: String::new(),
+        files_width: 244.,
+        files_expanded: Vec::new(),
+        model_favorites: Vec::new(),
+        panel_names: Vec::new(),
+    };
     let Ok(text) = std::fs::read_to_string(ui_state_path()) else {
-        return (Vec::new(), None, None, String::new(), String::new());
+        return empty();
     };
     let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return (Vec::new(), None, None, String::new(), String::new());
+        return empty();
     };
     let spaces: Vec<Space> = value
         .get("spaces")
@@ -3800,31 +14071,106 @@ fn load_ui_state() -> (Vec<Space>, Option<String>, Option<String>, String, Strin
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| space_name(cwd));
-                    let tabs: Vec<String> = item
+                    let tabs_value: Vec<Value> = item
                         .get("tabs")
                         .and_then(|v| v.as_array())
-                        .map(|tabs| {
-                            tabs.iter()
-                                .filter_map(|tab| tab.as_str().map(|s| s.to_string()))
-                                .collect()
-                        })
+                        .cloned()
                         .unwrap_or_default();
-                    let active = item
-                        .get("active")
+                    let tabs = tabs_value
+                        .iter()
+                        .filter_map(|tab_value| {
+                            if let Some(panel) = tab_value.as_str() {
+                                // 旧格式：一个 tab 就是一个 panel
+                                let mut tab = Panel::new(
+                                    format!(
+                                        "tab-{}",
+                                        panel.chars().rev().take(6).collect::<String>()
+                                    ),
+                                    0,
+                                );
+                                tab.blocks.push(panel.to_string());
+                                tab.active = Some(panel.to_string());
+                                return Some(tab);
+                            }
+                            let id = tab_value.get("id").and_then(|v| v.as_str())?.to_string();
+                            let number = tab_value
+                                .get("number")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as u32;
+                            let mut tab = Panel::new(id, number);
+                            tab.name = tab_value
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            tab.blocks = tab_value
+                                .get("panels")
+                                .and_then(|v| v.as_array())
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter_map(|p| p.as_str().map(|s| s.to_string()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            tab.active =
+                                tab_value.get("active").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            tab.pending_layout = tab_value.get("layout").cloned();
+                            tab.blocks.retain(|panel| !is_file_panel(panel));
+                            let has_layout_content = tab
+                                .pending_layout
+                                .as_ref()
+                                .map(layout_json_has_content)
+                                .unwrap_or(false);
+                            if tab.blocks.is_empty() && !has_layout_content {
+                                return None;
+                            }
+                            Some(tab)
+                        })
+                        .collect::<Vec<Panel>>();
+                    let active_panel = item
+                        .get("active_panel")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
-                        .filter(|id| tabs.contains(id));
+                        .filter(|id| tabs.iter().any(|tab| &tab.id == id))
+                        .or_else(|| tabs.first().map(|tab| tab.id.clone()));
                     Some(Space {
                         id,
                         name,
                         cwd: normalize_cwd(cwd),
-                        tabs,
-                        active,
+                        panels: tabs,
+                        active_panel,
                     })
                 })
                 .collect()
         })
         .unwrap_or_default();
+    // 去重：重复的 tab id 会让两个 tab 同时显示"激活"，关闭也会关错
+    let mut spaces = spaces;
+    let mut seen_tabs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for space in &mut spaces {
+        for tab in &mut space.panels {
+            if seen_tabs.insert(tab.id.clone()) {
+                continue;
+            }
+            let fresh = next_tab_id();
+            eprintln!("[ui] duplicate tab id {} -> {fresh}", tab.id);
+            if space.active_panel.as_deref() == Some(tab.id.as_str()) {
+                space.active_panel = Some(fresh.clone());
+            }
+            tab.id = fresh;
+        }
+    }
+    // 老状态没有 number：按顺序补上，保证 "tab N" 稳定
+    for space in &mut spaces {
+        let mut next = space.panels.iter().map(|tab| tab.number).max().unwrap_or(0) + 1;
+        for tab in &mut space.panels {
+            if tab.number == 0 {
+                tab.number = next;
+                next += 1;
+            }
+        }
+    }
     let current_space = value
         .get("current_space")
         .and_then(|v| v.as_str())
@@ -3844,7 +14190,75 @@ fn load_ui_state() -> (Vec<Space>, Option<String>, Option<String>, String, Strin
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    (spaces, current_space, selected, model, provider)
+    let term_tabs: Vec<String> = value
+        .get("term_tabs")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let panel_names: Vec<(String, String)> = value
+        .get("panel_names")
+        .and_then(|v| v.as_object())
+        .map(|map| {
+            map.iter()
+                .filter_map(|(k, v)| v.as_str().map(|name| (k.clone(), name.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let files_sidebar = value
+        .get("files_sidebar")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let files_root = value
+        .get("files_root")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let files_width = value
+        .get("files_width")
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+        .unwrap_or(244.)
+        .clamp(180., 480.);
+    let files_expanded: Vec<String> = value
+        .get("files_expanded")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let model_favorites: Vec<String> = value
+        .get("model_favorites")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    UiState {
+        spaces,
+        current_space,
+        selected,
+        model,
+        provider,
+        term_tabs,
+        files_sidebar,
+        files_root,
+        files_width,
+        files_expanded,
+        model_favorites,
+        panel_names,
+    }
 }
 
 fn catalog_model_name(catalog: &Value, id: &str) -> Option<String> {
@@ -3900,6 +14314,408 @@ fn pretty_cwd(cwd: &str) -> String {
     path
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GitChange {
+    path: String,
+    relative: String,
+    /// `git status` 的第一列：暂存区。空格表示这列没变化。
+    index: char,
+    /// 第二列：工作区。
+    work: char,
+    /// 工作区相对 HEAD 的增删行。未跟踪文件是 0。
+    added: u32,
+    deleted: u32,
+    staged_added: u32,
+    staged_deleted: u32,
+}
+
+/// 文件树上只放一个字母。工作区的改动优先，否则看暂存区。
+fn git_tree_letter(index: char, work: char) -> char {
+    let pick = if work != ' ' { work } else { index };
+    if pick == '?' { 'U' } else { pick }
+}
+
+/// 文件或目录在树上该画哪种点。目录把子路径折上来：改动优先于未跟踪。
+fn row_git_mark(
+    path: &str,
+    is_dir: bool,
+    git: &std::collections::HashMap<String, char>,
+    dirty: &std::collections::HashSet<String>,
+) -> Option<char> {
+    let modified = |letter: char| matches!(letter, 'M' | 'A' | 'D' | 'R' | 'C' | '●');
+    if !is_dir {
+        if dirty.contains(path) {
+            return Some('M');
+        }
+        return git.get(path).copied();
+    }
+    let prefix = format!("{path}/");
+    if dirty.iter().any(|item| item.starts_with(&prefix)) {
+        return Some('M');
+    }
+    let mut untracked = false;
+    for (item, letter) in git {
+        if item.starts_with(&prefix) {
+            if modified(*letter) {
+                return Some(*letter);
+            }
+            if *letter == 'U' {
+                untracked = true;
+            }
+        }
+    }
+    if untracked { Some('U') } else { None }
+}
+
+/// 改动是橙色点，未跟踪是灰色点。干净的行不画点。
+fn git_dot_color(letter: char) -> Option<u32> {
+    match letter {
+        'U' => Some(0x6b7280),
+        'M' | 'A' | 'D' | 'R' | 'C' | '●' => Some(0xe39b2b),
+        _ => None,
+    }
+}
+
+fn git_summary_text(branch: &str, changes: &[GitChange]) -> String {
+    if branch.is_empty() {
+        return String::new();
+    }
+    let mut modified = 0usize;
+    let mut untracked = 0usize;
+    for change in changes {
+        if change.index == '?' || change.work == '?' {
+            untracked += 1;
+        } else {
+            modified += 1;
+        }
+    }
+    let mut summary = branch.to_string();
+    if modified > 0 {
+        summary.push_str(&format!(" *{modified}"));
+    }
+    if untracked > 0 {
+        summary.push_str(&format!(" ?{untracked}"));
+    }
+    summary
+}
+
+/// `git status --porcelain=v1 -z`。重命名是 `XY 新路径\0旧路径\0`。
+fn parse_porcelain_z(
+    root: &str,
+    bytes: &[u8],
+) -> (std::collections::HashMap<String, char>, Vec<GitChange>) {
+    let mut map = std::collections::HashMap::new();
+    let mut changes = Vec::new();
+    let mut parts = bytes.split(|byte| *byte == 0);
+    while let Some(entry) = parts.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let index = entry[0] as char;
+        let work = entry[1] as char;
+        let relative = String::from_utf8_lossy(&entry[3..]).to_string();
+        if relative.is_empty() {
+            continue;
+        }
+        if matches!(index, 'R' | 'C') || matches!(work, 'R' | 'C') {
+            let _ = parts.next();
+        }
+        let path = if PathBuf::from(&relative).is_absolute() {
+            relative.clone()
+        } else {
+            PathBuf::from(root).join(&relative).display().to_string()
+        };
+        map.insert(path.clone(), git_tree_letter(index, work));
+        changes.push(GitChange {
+            path,
+            relative,
+            index,
+            work,
+            added: 0,
+            deleted: 0,
+            staged_added: 0,
+            staged_deleted: 0,
+        });
+    }
+    changes.sort_by(|a, b| a.relative.to_lowercase().cmp(&b.relative.to_lowercase()));
+    (map, changes)
+}
+
+fn git_status_map(
+    cwd: &str,
+) -> Option<(String, std::collections::HashMap<String, char>, Vec<GitChange>)> {
+    let root_out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !root_out.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&root_out.stdout).trim().to_string();
+    if root.is_empty() {
+        return None;
+    }
+    let branch_out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    let branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+    let status_out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["status", "--porcelain=v1", "-z"])
+        .output()
+        .ok()?;
+    if !status_out.status.success() {
+        return None;
+    }
+    let (map, mut changes) = parse_porcelain_z(&root, &status_out.stdout);
+    if !changes.is_empty() {
+        attach_numstat(
+            &mut changes,
+            &git_numstat(&root, false),
+            &git_numstat(&root, true),
+        );
+    }
+    Some((branch, map, changes))
+}
+
+fn git_numstat(root: &str, cached: bool) -> std::collections::HashMap<String, (u32, u32)> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(root).arg("diff").arg("--numstat");
+    if cached {
+        cmd.arg("--cached");
+    }
+    match cmd.output() {
+        Ok(output) if output.status.success() => parse_numstat(&output.stdout),
+        _ => std::collections::HashMap::new(),
+    }
+}
+
+fn attach_numstat(
+    changes: &mut [GitChange],
+    work: &std::collections::HashMap<String, (u32, u32)>,
+    staged: &std::collections::HashMap<String, (u32, u32)>,
+) {
+    for change in changes {
+        if let Some((added, deleted)) = work.get(&change.relative) {
+            change.added = *added;
+            change.deleted = *deleted;
+        }
+        if let Some((added, deleted)) = staged.get(&change.relative) {
+            change.staged_added = *added;
+            change.staged_deleted = *deleted;
+        }
+    }
+}
+
+/// `git diff --numstat`。重命名可能是 `old => new` 或 `dir/{old => new}/file`。
+fn numstat_path(path: &str) -> String {
+    let path = path.trim().trim_matches('"');
+    if let Some((head, rest)) = path.split_once('{') {
+        if let Some((inside, tail)) = rest.split_once('}') {
+            if let Some((_, new_name)) = inside.split_once("=>") {
+                return format!("{head}{}{tail}", new_name.trim());
+            }
+        }
+    }
+    path.rsplit_once(" => ")
+        .map(|(_, new_name)| new_name.trim().to_string())
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn parse_numstat(bytes: &[u8]) -> std::collections::HashMap<String, (u32, u32)> {
+    let mut map = std::collections::HashMap::new();
+    let text = String::from_utf8_lossy(bytes);
+    for line in text.split(|ch| ch == '\n' || ch == '\0') {
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let (Some(added), Some(deleted), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let Ok(added) = added.parse::<u32>() else {
+            continue;
+        };
+        let Ok(deleted) = deleted.parse::<u32>() else {
+            continue;
+        };
+        map.insert(numstat_path(path), (added, deleted));
+    }
+    map
+}
+
+fn draft_commit_message(changes: &[GitChange]) -> String {
+    let staged: Vec<&GitChange> = changes.iter().filter(|change| change_is_staged(change)).collect();
+    let picked: Vec<&GitChange> = if staged.is_empty() {
+        changes.iter().collect()
+    } else {
+        staged
+    };
+    if picked.is_empty() {
+        return String::new();
+    }
+    if picked.len() == 1 {
+        let change = picked[0];
+        let verb = if change.index == '?' || change.work == '?' || change.index == 'A' || change.work == 'A'
+        {
+            "add"
+        } else if change.index == 'D' || change.work == 'D' {
+            "remove"
+        } else {
+            "update"
+        };
+        return format!("{verb} {}", change.relative);
+    }
+    format!("update {} files", picked.len())
+}
+
+#[cfg(test)]
+mod git_status_tests {
+    use super::{git_summary_text, git_tree_letter, parse_porcelain_z, GitChange};
+
+    #[test]
+    fn unstaged_modification_is_visible() {
+        let (map, changes) = parse_porcelain_z("/repo", b" M src/main.rs\0");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].index, ' ');
+        assert_eq!(changes[0].work, 'M');
+        assert_eq!(changes[0].relative, "src/main.rs");
+        assert_eq!(changes[0].path, "/repo/src/main.rs");
+        assert_eq!(map.get("/repo/src/main.rs").copied(), Some('M'));
+        assert_eq!(git_tree_letter(' ', 'M'), 'M');
+    }
+
+    #[test]
+    fn staged_untracked_and_rename() {
+        let raw = b"M  staged.rs\0?? new.txt\0RM renamed.rs\0old.rs\0";
+        let (map, changes) = parse_porcelain_z("/repo", raw);
+        assert_eq!(changes.len(), 3);
+        assert_eq!(map.get("/repo/staged.rs").copied(), Some('M'));
+        assert_eq!(map.get("/repo/new.txt").copied(), Some('U'));
+        assert_eq!(map.get("/repo/renamed.rs").copied(), Some('M'));
+        assert!(map.get("/repo/old.rs").is_none());
+        let renamed = changes.iter().find(|c| c.relative == "renamed.rs").unwrap();
+        assert_eq!(renamed.index, 'R');
+        assert_eq!(renamed.work, 'M');
+    }
+
+    #[test]
+    fn summary_counts_untracked_separately() {
+        let changes = vec![
+            GitChange {
+                path: "a".into(),
+                relative: "a".into(),
+                index: ' ',
+                work: 'M',
+                added: 0,
+                deleted: 0,
+                staged_added: 0,
+                staged_deleted: 0,
+            },
+            GitChange {
+                path: "b".into(),
+                relative: "b".into(),
+                index: '?',
+                work: '?',
+                added: 0,
+                deleted: 0,
+                staged_added: 0,
+                staged_deleted: 0,
+            },
+        ];
+        assert_eq!(git_summary_text("main", &changes), "main *1 ?1");
+        assert_eq!(git_summary_text("main", &[]), "main");
+    }
+
+    #[test]
+    fn folder_dot_prefers_modification_over_untracked() {
+        use std::collections::{HashMap, HashSet};
+        let mut git = HashMap::new();
+        git.insert("/repo/docs/a.md".to_string(), 'U');
+        git.insert("/repo/crates/app/src/main.rs".to_string(), 'M');
+        git.insert("/repo/vendor/x".to_string(), 'U');
+        let dirty = HashSet::new();
+        assert_eq!(
+            super::row_git_mark("/repo/docs", true, &git, &dirty),
+            Some('U')
+        );
+        assert_eq!(
+            super::row_git_mark("/repo/crates", true, &git, &dirty),
+            Some('M')
+        );
+        assert_eq!(
+            super::row_git_mark("/repo/contracts", true, &git, &dirty),
+            None
+        );
+        let mut dirty = HashSet::new();
+        dirty.insert("/repo/README.md".to_string());
+        assert_eq!(
+            super::row_git_mark("/repo/README.md", false, &git, &dirty),
+            Some('M')
+        );
+        assert_eq!(super::git_dot_color('U'), Some(0x6b7280));
+        assert_eq!(super::git_dot_color('M'), Some(0xe39b2b));
+    }
+
+    #[test]
+    fn numstat_keeps_the_new_path_and_skips_binary() {
+        let map = super::parse_numstat(
+            b"75\t11\tCargo.lock\n-\t-\tbin.dat\n3\t1\tsrc/{old => new}/lib.rs\n",
+        );
+        assert_eq!(map.get("Cargo.lock").copied(), Some((75, 11)));
+        assert!(map.get("bin.dat").is_none());
+        assert_eq!(map.get("src/new/lib.rs").copied(), Some((3, 1)));
+        assert_eq!(super::numstat_path("old.rs => new.rs"), "new.rs");
+    }
+
+    #[test]
+    fn path_label_keeps_the_file_name() {
+        assert_eq!(super::git_path_label("Cargo.toml", 28), "Cargo.toml");
+        assert_eq!(
+            super::git_path_label("crates/app/src/ghostty_vt.rs", 26),
+            "crates/app/…ghostty_vt.rs"
+        );
+    }
+
+    #[test]
+    fn draft_uses_staged_files_when_present() {
+        let changes = vec![
+            GitChange {
+                path: "a".into(),
+                relative: "src/main.rs".into(),
+                index: 'M',
+                work: ' ',
+                added: 1,
+                deleted: 0,
+                staged_added: 4,
+                staged_deleted: 1,
+            },
+            GitChange {
+                path: "b".into(),
+                relative: "notes.txt".into(),
+                index: '?',
+                work: '?',
+                added: 0,
+                deleted: 0,
+                staged_added: 0,
+                staged_deleted: 0,
+            },
+        ];
+        assert_eq!(super::draft_commit_message(&changes), "update src/main.rs");
+        assert_eq!(
+            super::draft_commit_message(&changes[1..]),
+            "add notes.txt"
+        );
+    }
+}
+
 fn git_summary(cwd: &str) -> Option<String> {
     let branch = std::process::Command::new("git")
         .arg("-C")
@@ -3939,6 +14755,128 @@ fn git_summary(cwd: &str) -> Option<String> {
     Some(summary)
 }
 
+/// "just now / N 分钟前 / N 小时前 / N 天前"。列表里比 cwd 有信息量。
+fn relative_time(updated_at: i64) -> String {
+    let delta = (now_millis() - updated_at).max(0) / 1000;
+    match delta {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{} min ago", delta / 60),
+        3600..=86399 => format!("{} h ago", delta / 3600),
+        _ => format!("{} d ago", delta / 86400),
+    }
+}
+
+/// 从工具输出里 best-effort 找退出码：`exit code 1` / `Exit code: 1` / `status=1`。
+
+/// 工具耗时打点：worker 里在事件流上记 start / 算 elapsed，写回 `event.data._omdElapsedMs`。
+/// UI 侧事件是批量应用的，量不出真实耗时，所以只能在 worker 这一层做。
+fn stamp_tool_elapsed(
+    value: &mut Value,
+    started: &mut std::collections::HashMap<String, std::time::Instant>,
+) {
+    let Some(event_type) = value.pointer("/event/type").and_then(|v| v.as_str()) else {
+        return;
+    };
+    match event_type {
+        "tool/call" => {
+            if let Some(id) = value.pointer("/event/data/callId").and_then(|v| v.as_str()) {
+                started.insert(id.to_string(), std::time::Instant::now());
+            }
+        }
+        "tool/result" => {
+            if let Some(id) = value
+                .pointer("/event/data/toolCallId")
+                .and_then(|v| v.as_str())
+            {
+                if let Some(start) = started.remove(id) {
+                    let ms = start.elapsed().as_millis() as u64;
+                    if let Some(data) = value.pointer_mut("/event/data") {
+                        data["_omdElapsedMs"] = json!(ms);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+
+/// `OMD_SELFCHECK=1` 时跑一遍纯逻辑自检（这个 bin 里 #[test] 展开会压爆 rustc，
+/// 所以用运行时断言代替）。
+fn selfcheck() {
+    let mut started = std::collections::HashMap::new();
+    let mut call = json!({
+        "type": "event",
+        "event": { "type": "tool/call", "data": { "callId": "c1" } }
+    });
+    stamp_tool_elapsed(&mut call, &mut started);
+    assert!(started.contains_key("c1"), "tool/call should record start");
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    let mut result = json!({
+        "type": "event",
+        "event": { "type": "tool/result", "data": { "toolCallId": "c1", "isError": false } }
+    });
+    stamp_tool_elapsed(&mut result, &mut started);
+    let ms = result
+        .pointer("/event/data/_omdElapsedMs")
+        .and_then(|v| v.as_u64())
+        .expect("elapsed should be stamped");
+    assert!(ms >= 10, "elapsed too small: {ms}");
+    assert!(started.is_empty(), "entry should be consumed");
+    assert_eq!(parse_exit_code("boom\nexit code 1\n"), Some(1));
+    assert_eq!(parse_exit_code("Exit code: 127"), Some(127));
+    assert_eq!(parse_exit_code("hi\n"), None);
+    assert_eq!(tool_lang("bash"), "bash");
+    assert_eq!(tool_lang("read_file"), "text");
+    stamp(format!("selfcheck ok (tool elapsed {ms}ms)"));
+}
+
+fn parse_exit_code(output: &str) -> Option<i32> {
+    const PATTERNS: [&str; 4] = ["exit code:", "exit code", "exit status:", "exit_status="];
+    for line in output.lines().rev().take(8) {
+        let lower = line.to_lowercase();
+        if let Some(at) = PATTERNS.iter().filter_map(|p| lower.find(p)).next() {
+            let rest = &lower[at..];
+            if let Some(num) = rest
+                .split(|c: char| !c.is_ascii_digit() && c != '-')
+                .find(|part| !part.is_empty() && *part != "-")
+            {
+                if let Ok(code) = num.parse::<i32>() {
+                    return Some(code);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 工具输出用什么语言高亮（只做粗分类，认不出就纯文本）。
+fn tool_lang(name: &str) -> &'static str {
+    let name = name.to_lowercase();
+    if name.contains("bash") || name.contains("shell") || name.contains("exec") || name.contains("command") {
+        "bash"
+    } else if name.contains("python") {
+        "python"
+    } else if name.contains("js") || name.contains("node") {
+        "javascript"
+    } else if name.contains("json") || name.contains("read") || name.contains("grep") {
+        "text"
+    } else {
+        "text"
+    }
+}
+
+/// 路径太长时中间省略，只留头尾。
+fn short_path(path: &str) -> String {
+    let chars: Vec<char> = path.chars().collect();
+    if chars.len() <= 52 {
+        return path.to_string();
+    }
+    let head: String = chars.iter().take(20).collect();
+    let tail: String = chars.iter().skip(chars.len() - 28).collect();
+    format!("{head}…{tail}")
+}
+
 fn short_cwd(cwd: &str) -> String {
     if cwd.is_empty() {
         return "(no cwd)".into();
@@ -3947,11 +14885,188 @@ fn short_cwd(cwd: &str) -> String {
     parts.into_iter().rev().collect::<Vec<_>>().join("/")
 }
 
+fn block_socket_path() -> PathBuf {
+    data_dir().join("control.sock")
+}
+
+fn run_block_cli() -> i32 {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let Some(command) = args.first().map(|s| s.as_str()) else {
+        eprintln!("usage: omd block <list|create|write|read> ...");
+        return 2;
+    };
+    let request = match command {
+        "list" => serde_json::json!({ "method": "block.list", "params": {} }),
+        "create" => {
+            let mut cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "/".to_string());
+            let mut cmd: Option<String> = None;
+            let mut i = 1;
+            if args.get(1).map(|v| v.as_str()) == Some("terminal") {
+                i = 2;
+            }
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--cwd" if i + 1 < args.len() => {
+                        cwd = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--command" if i + 1 < args.len() => {
+                        cmd = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    other => {
+                        eprintln!("unknown create argument: {other}");
+                        return 2;
+                    }
+                }
+            }
+            serde_json::json!({
+                "method": "block.createTerminal",
+                "params": { "cwd": cwd, "command": cmd }
+            })
+        }
+        "write" => {
+            let Some(id) = args.get(1).cloned() else {
+                eprintln!("usage: omd block write <id> <text|->");
+                return 2;
+            };
+            let mut data = args.get(2).cloned().unwrap_or_default();
+            if data == "-" {
+                let mut buf = String::new();
+                let _ = std::io::stdin().read_to_string(&mut buf);
+                data = buf;
+            }
+            serde_json::json!({ "method": "block.write", "params": { "id": id, "data": data } })
+        }
+        "read" => {
+            let Some(id) = args.get(1).cloned() else {
+                eprintln!("usage: omd block read <id> [cursor]");
+                return 2;
+            };
+            let cursor = args.get(2).and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+            serde_json::json!({ "method": "block.read", "params": { "id": id, "cursor": cursor } })
+        }
+        other => {
+            eprintln!("unknown block command: {other}");
+            return 2;
+        }
+    };
+
+    let path = block_socket_path();
+    let mut stream = match UnixStream::connect(&path) {
+        Ok(stream) => stream,
+        Err(err) => {
+            eprintln!("cannot connect {}: {err}", path.display());
+            return 1;
+        }
+    };
+    let line = serde_json::to_string(&request).unwrap_or_default();
+    if stream.write_all(line.as_bytes()).is_err() || stream.write_all(b"\n").is_err() {
+        return 1;
+    }
+    let _ = stream.flush();
+    let mut response = String::new();
+    let _ = BufReader::new(stream).read_line(&mut response);
+    if response.trim().is_empty() {
+        eprintln!("no response from OMD");
+        return 1;
+    }
+    match serde_json::from_str::<Value>(&response) {
+        Ok(value) => {
+            if value.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                println!("{}", serde_json::to_string_pretty(value.get("result").unwrap_or(&Value::Null)).unwrap_or_default());
+                0
+            } else {
+                eprintln!("{}", value.get("error").and_then(|v| v.as_str()).unwrap_or("block command failed"));
+                1
+            }
+        }
+        Err(_) => {
+            print!("{response}");
+            0
+        }
+    }
+}
+
 fn main() {
+    // CEF 的 renderer/gpu 子进程会带着 --type= 重新执行本程序，必须最先接管。
+    if let Some(code) = browser::run_subprocess_if_requested() {
+        std::process::exit(code);
+    }
+    if std::env::args().nth(1).as_deref() == Some("block") {
+        std::process::exit(run_block_cli());
+    }
+    stamp("main enter");
+    setup_fontconfig();
+    setup_gpu_preference();
+    if std::env::var("OMD_SELFCHECK").is_ok() {
+        selfcheck();
+    }
     // Ctrl-C 也走 Drop（杀整个 host 进程组）
     ctrlc_proxy();
-    gpui_kit::application().run(|cx| {
+    if std::env::var("OMD_BROWSER").is_ok() {
+        let cache = dsh_host::runtime_root().join("cef-cache");
+        let _ = std::fs::create_dir_all(&cache);
+        let port = std::env::var("OMD_CDP_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(9222);
+        let ok = browser::init(port, &cache);
+        // 防止 dsh 的 node 子进程继承 devtools 监听 socket。
+        #[cfg(target_os = "linux")]
+        browser::close_on_exec_cdp_port(port as u16);
+        stamp(format!("cef init ok={ok} port={port}"));
+    }
+    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    // 原生子窗口（零拷贝）需要 X11 父窗口：Wayland 没有子 surface 协议。
+    // 默认（OMD_BROWSER=1）仍走 Wayland + OSR，只有显式要求子窗口时才切 X11。
+    #[cfg(target_os = "linux")]
+    let app = if std::env::var("OMD_BROWSER_CHILD").is_ok() {
+        let mut environment = gpui_kit::GraphicalEnvironment::detect();
+        environment.wayland_display = None;
+        app.with_windowing(gpui_kit::WindowingRequest::Windowed(environment))
+    } else {
+        app
+    };
+    stamp("platform + App::new done (fonts/text system loaded)");
+    app.run(|cx| {
+        stamp("app.run closure (platform run loop up)");
         gpui_kit::init(cx);
+        // 编辑器的 LSP 动作（gpui-base 只给 action，不给默认键位）
+        cx.bind_keys([
+            gpui_kit::KeyBinding::new(
+                "ctrl-space",
+                gpui_kit::component::input::ShowCompletions,
+                Some("Input"),
+            ),
+            gpui_kit::KeyBinding::new(
+                "f12",
+                gpui_kit::component::input::GoToDefinition,
+                Some("Input"),
+            ),
+            gpui_kit::KeyBinding::new(
+                "ctrl-.",
+                gpui_kit::component::input::ToggleCodeActions,
+                Some("Input"),
+            ),
+            // 文本编辑基本功（gpui-base 只给 action，不给默认键位）
+            gpui_kit::KeyBinding::new("ctrl-z", gpui_kit::component::input::Undo, Some("Input")),
+            gpui_kit::KeyBinding::new("ctrl-shift-z", gpui_kit::component::input::Redo, Some("Input")),
+            gpui_kit::KeyBinding::new("ctrl-y", gpui_kit::component::input::Redo, Some("Input")),
+            gpui_kit::KeyBinding::new("ctrl-a", gpui_kit::component::input::SelectAll, Some("Input")),
+            gpui_kit::KeyBinding::new("ctrl-c", gpui_kit::component::input::Copy, Some("Input")),
+            gpui_kit::KeyBinding::new("ctrl-x", gpui_kit::component::input::Cut, Some("Input")),
+            gpui_kit::KeyBinding::new("ctrl-v", gpui_kit::component::input::Paste, Some("Input")),
+            gpui_kit::KeyBinding::new("ctrl-f", gpui_kit::component::input::Search, Some("Input")),
+            gpui_kit::KeyBinding::new("tab", gpui_kit::component::input::Indent, Some("Input")),
+            gpui_kit::KeyBinding::new("shift-tab", gpui_kit::component::input::Outdent, Some("Input")),
+        ]);
+        stamp("gpui_kit::init done");
         // gpui-component defaults to the system/light palette; the app shell is
         // dark, so force the component theme (Input, TextView, menus) to match.
         gpui_kit::component::theme::Theme::change(
@@ -3959,6 +15074,7 @@ fn main() {
             None,
             cx,
         );
+        stamp("theme dark done");
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                 point(px(40.), px(40.)),
@@ -3969,11 +15085,15 @@ fn main() {
             app_id: Some("omd".to_string()),
             ..Default::default()
         };
-        gpui_kit::open_window(options, cx, |_window, cx| {
-            cx.new(|cx| Root::new(_window, cx))
+        let handle = gpui_kit::open_window(options, cx, |window, cx| {
+            // 启动时主动要焦点：否则从终端/别的窗口拉起时，窗口会开在别人后面。
+            window.activate_window();
+            cx.new(|cx| Root::new(window, cx))
         })
         .expect("failed to open window");
+        stamp(format!("window opened (handle {handle:?})"));
     });
+    stamp("app.run returned");
 }
 
 /// 直接写文件，绕过 stdout 缓冲（worker 线程的 eprintln 不可靠）
@@ -4013,6 +15133,93 @@ fn ctrlc_proxy() {
 #[cfg(not(unix))]
 fn ctrlc_proxy() {}
 
+fn shifted_char(c: char) -> char {
+    match c {
+        '1' => '!', '2' => '@', '3' => '#', '4' => '$', '5' => '%',
+        '6' => '^', '7' => '&', '8' => '*', '9' => '(', '0' => ')',
+        '`' => '~', '-' => '_', '=' => '+', '[' => '{', ']' => '}',
+        '\\' => '|', ';' => ':', '\'' => '"', ',' => '<', '.' => '>',
+        '/' => '?',
+        c if c.is_ascii_lowercase() => c.to_ascii_uppercase(),
+        c => c,
+    }
+}
+
+/// GPUI key + modifiers -> ghostty key code / mods / text / unshifted codepoint.
+fn ghostty_key(keystroke: &Keystroke) -> Option<(i32, u16, String, u32)> {
+    let key = keystroke.key.as_str();
+    let lower = key.to_ascii_lowercase();
+    let mut mods = 0u16;
+    if keystroke.modifiers.shift { mods |= GHOSTTY_MODS_SHIFT; }
+    if keystroke.modifiers.control { mods |= GHOSTTY_MODS_CTRL; }
+    if keystroke.modifiers.alt { mods |= GHOSTTY_MODS_ALT; }
+    if keystroke.modifiers.platform { mods |= GHOSTTY_MODS_SUPER; }
+
+    let named = match lower.as_str() {
+        "backspace" => Some(53),
+        "enter" | "return" => Some(58),
+        "space" => Some(63),
+        "tab" => Some(64),
+        "delete" | "del" => Some(68),
+        "end" => Some(69),
+        "home" => Some(71),
+        "insert" => Some(72),
+        "pagedown" | "pgdn" => Some(73),
+        "pageup" | "pgup" => Some(74),
+        "down" => Some(75),
+        "left" => Some(76),
+        "right" => Some(77),
+        "up" => Some(78),
+        "esc" | "escape" => Some(120),
+        _ => None,
+    };
+    if let Some(code) = named {
+        return Some((code, mods, String::new(), 0));
+    }
+    if let Some(rest) = lower.strip_prefix('f') {
+        if let Ok(n) = rest.parse::<i32>() {
+            if (1..=12).contains(&n) {
+                return Some((120 + n, mods, String::new(), 0));
+            }
+        }
+    }
+    let mut chars = key.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    let code = match c.to_ascii_lowercase() {
+        c @ 'a'..='z' => 20 + (c as i32 - 'a' as i32),
+        c @ '0'..='9' => 6 + (c as i32 - '0' as i32),
+        '`' => 1, '\\' => 2, '[' => 3, ']' => 4, ',' => 5,
+        '=' => 16, '-' => 46, '.' => 47, '\'' => 48, ';' => 49, '/' => 50,
+        _ => return None,
+    };
+    // GPUI 的 key 是键名，而且字母一律小写。Caps Lock、Compose、非 US 布局
+    // 真正打出来的字符在 key_char。只发 key 会把大写密码变成小写，sudo 会拒绝。
+    let text = if mods & (GHOSTTY_MODS_CTRL | GHOSTTY_MODS_ALT | GHOSTTY_MODS_SUPER) != 0 {
+        String::new()
+    } else if let Some(ch) = typed_glyph(keystroke) {
+        ch.to_string()
+    } else if mods & GHOSTTY_MODS_SHIFT != 0 {
+        shifted_char(c).to_string()
+    } else {
+        c.to_string()
+    };
+    Some((code, mods, text, c.to_ascii_lowercase() as u32))
+}
+
+/// 键盘布局实际产生的那个字符。控制字符不算（Ctrl 交给编码器）。
+fn typed_glyph(keystroke: &Keystroke) -> Option<char> {
+    let raw = keystroke.key_char.as_deref()?;
+    let mut chars = raw.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() || ch.is_control() {
+        return None;
+    }
+    Some(ch)
+}
+
 /// 按键 → PTY 字节。覆盖 v1 需要的键；未映射返回 None（冒泡）。
 fn key_to_bytes(keystroke: &Keystroke) -> Option<String> {
     let key = keystroke.key.as_str();
@@ -4042,9 +15249,23 @@ fn key_to_bytes(keystroke: &Keystroke) -> Option<String> {
         "pagedown" => "\x1b[6~".into(),
         "space" => " ".into(),
         c if c.chars().count() == 1 => {
+            if !ctrl {
+                if let Some(ch) = typed_glyph(keystroke) {
+                    return Some(ch.to_string());
+                }
+            }
             let ch = c.chars().next().unwrap();
-            if shift && ch.is_ascii_lowercase() {
-                ch.to_ascii_uppercase().to_string()
+            if shift {
+                let shifted = match ch {
+                    '1' => '!', '2' => '@', '3' => '#', '4' => '$', '5' => '%',
+                    '6' => '^', '7' => '&', '8' => '*', '9' => '(', '0' => ')',
+                    '`' => '~', '-' => '_', '=' => '+', '[' => '{', ']' => '}',
+                    '\\' => '|', ';' => ':', '\'' => '"', ',' => '<', '.' => '>',
+                    '/' => '?',
+                    c if c.is_ascii_lowercase() => c.to_ascii_uppercase(),
+                    c => c,
+                };
+                shifted.to_string()
             } else {
                 c.to_string()
             }
@@ -4058,7 +15279,11 @@ fn key_to_bytes(keystroke: &Keystroke) -> Option<String> {
 fn decode_image(b64: &str) -> Option<RenderImage> {
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-    let loaded = image::load_from_memory(&bytes).ok()?;
+    decode_image_bytes(&bytes)
+}
+
+fn decode_image_bytes(bytes: &[u8]) -> Option<RenderImage> {
+    let loaded = image::load_from_memory(bytes).ok()?;
     let rgba = loaded.to_rgba8();
     let (w, h) = rgba.dimensions();
     // RGBA → BGRA
@@ -4068,4 +15293,113 @@ fn decode_image(b64: &str) -> Option<RenderImage> {
     }
     let buffer = image::RgbaImage::from_raw(w, h, bgra)?;
     Some(RenderImage::new(vec![image::Frame::new(buffer)]))
+}
+
+fn load_media_image(path: &str) -> Option<RenderImage> {
+    let bytes = std::fs::read(path).ok()?;
+    decode_image_bytes(&bytes)
+}
+
+/// Video/audio blocks are references only; the system owns the player.
+fn open_media_external(path: &str) {
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    match std::process::Command::new(opener).arg(path).spawn() {
+        Ok(_) => eprintln!("[media] opened {path} with {opener}"),
+        Err(err) => eprintln!("[media] open {path} failed: {err}"),
+    }
+}
+
+/// Pick a composer slot for `session_id`. An empty slot wins. Otherwise a
+/// slot whose session is not in `keep` is reused. `(slot, evicted)`.
+fn claim_composer_slot(
+    slots: &mut [Option<String>],
+    session_id: &str,
+    keep: &[String],
+) -> Option<(usize, bool)> {
+    if slots
+        .iter()
+        .any(|session| session.as_deref() == Some(session_id))
+    {
+        return None;
+    }
+    let slot = slots
+        .iter()
+        .position(|session| session.is_none())
+        .or_else(|| {
+            slots.iter().position(|session| {
+                session
+                    .as_deref()
+                    .is_some_and(|id| !keep.iter().any(|kept| kept == id))
+            })
+        })?;
+    let evicted = slots[slot].is_some();
+    slots[slot] = Some(session_id.to_string());
+    Some((slot, evicted))
+}
+
+#[cfg(test)]
+mod composer_slot_tests {
+    use super::claim_composer_slot;
+
+    #[test]
+    fn visible_split_reclaims_a_slot_held_by_another_tab() {
+        let mut slots: Vec<Option<String>> = (0..64).map(|i| Some(format!("old-{i}"))).collect();
+        slots[0] = Some("shown".to_string());
+        let keep = vec!["shown".to_string()];
+        let (slot, evicted) = claim_composer_slot(&mut slots, "split-new", &keep).unwrap();
+        assert!(evicted);
+        assert_ne!(slot, 0);
+        assert_eq!(slots[slot].as_deref(), Some("split-new"));
+        assert_eq!(slots[0].as_deref(), Some("shown"));
+    }
+
+    #[test]
+    fn empty_slot_is_not_an_eviction() {
+        let mut slots = vec![None, Some("old".to_string())];
+        let (slot, evicted) = claim_composer_slot(&mut slots, "split-new", &[]).unwrap();
+        assert_eq!(slot, 0);
+        assert!(!evicted);
+    }
+}
+
+#[cfg(test)]
+mod key_encode_tests {
+    use super::{ghostty_key, GHOSTTY_MODS_SHIFT};
+    use gpui_kit::{Keystroke, Modifiers};
+
+    fn stroke(key: &str, key_char: Option<&str>, shift: bool) -> Keystroke {
+        Keystroke {
+            modifiers: Modifiers {
+                shift,
+                ..Modifiers::default()
+            },
+            key: key.to_string(),
+            key_char: key_char.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn caps_lock_sends_the_produced_character() {
+        let (_, mods, text, unshifted) = ghostty_key(&stroke("h", Some("H"), false)).unwrap();
+        assert_eq!(text, "H");
+        assert_eq!(mods & GHOSTTY_MODS_SHIFT, 0);
+        assert_eq!(unshifted, u32::from(b'h'));
+    }
+
+    #[test]
+    fn lowercase_and_shift_still_match_the_glyph() {
+        let (_, _, text, _) = ghostty_key(&stroke("h", Some("h"), false)).unwrap();
+        assert_eq!(text, "h");
+        let (_, mods, text, _) = ghostty_key(&stroke("h", Some("H"), true)).unwrap();
+        assert_eq!(text, "H");
+        assert_ne!(mods & GHOSTTY_MODS_SHIFT, 0);
+    }
+
+    #[test]
+    fn ctrl_does_not_send_the_glyph() {
+        let mut ks = stroke("c", Some("c"), false);
+        ks.modifiers.control = true;
+        let (_, _, text, _) = ghostty_key(&ks).unwrap();
+        assert!(text.is_empty(), "{text}");
+    }
 }

@@ -85,8 +85,14 @@ impl DshHost {
         eprintln!("[host] daemon state: {}", state_path.display());
 
         // Fast path: another window/app already started the daemon.
-        if let Some(host) =
-            Self::attach_existing(profile, &version, fingerprint, &state_path).await?
+        if let Some(host) = Self::attach_existing(
+            profile,
+            &version,
+            fingerprint,
+            &state_path,
+            Duration::from_secs(3),
+        )
+        .await?
         {
             eprintln!(
                 "[host] attached to daemon pid={} at {} ({}ms)",
@@ -98,13 +104,30 @@ impl DshHost {
         }
 
         let deadline = Instant::now() + Duration::from_secs(60);
+        let mut seen_state = state_mtime(&state_path);
         loop {
-            // The lock owner may have published state between our attempts.
-            if let Some(host) =
-                Self::attach_existing(profile, &version, fingerprint, &state_path).await?
-            {
-                eprintln!("[host] attached to daemon pid={} at {}", host.pid, host.base);
-                return Ok(host);
+            // If another process owns the lock and published a fresh state,
+            // attach without re-probing a hung daemon every iteration.
+            let current_state = state_mtime(&state_path);
+            if current_state != seen_state {
+                seen_state = current_state;
+                if let Some(host) = Self::attach_existing(
+                    profile,
+                    &version,
+                    fingerprint,
+                    &state_path,
+                    Duration::from_secs(3),
+                )
+                .await?
+                {
+                    eprintln!(
+                        "[host] attached to daemon pid={} at {} ({}ms)",
+                        host.pid,
+                        host.base,
+                        started.elapsed().as_millis()
+                    );
+                    return Ok(host);
+                }
             }
             if Instant::now() > deadline {
                 return Err(anyhow!(
@@ -114,14 +137,30 @@ impl DshHost {
             }
 
             if let Some(lock) = DaemonLock::acquire(&lock_path) {
-                // Re-check after taking the lock: the previous owner may have
-                // published a usable state just before we got here.
-                if let Some(host) =
-                    Self::attach_existing(profile, &version, fingerprint, &state_path).await?
-                {
-                    drop(lock);
-                    eprintln!("[host] attached to daemon pid={} at {}", host.pid, host.base);
-                    return Ok(host);
+                // Re-check only if another process published state while we
+                // were waiting for the lock; otherwise the initial short probe
+                // already proved this state unreachable.
+                let current_state = state_mtime(&state_path);
+                if current_state != seen_state {
+                    seen_state = current_state;
+                    if let Some(host) = Self::attach_existing(
+                        profile,
+                        &version,
+                        fingerprint,
+                        &state_path,
+                        Duration::from_secs(3),
+                    )
+                    .await?
+                    {
+                        drop(lock);
+                        eprintln!(
+                            "[host] attached to daemon pid={} at {} ({}ms)",
+                            host.pid,
+                            host.base,
+                            started.elapsed().as_millis()
+                        );
+                        return Ok(host);
+                    }
                 }
 
                 // Stale daemon from an older runtime or an edited profile.
@@ -152,7 +191,14 @@ impl DshHost {
                 write_daemon_state(&state_path, &state)?;
                 drop(lock);
 
-                let host = Self::from_tokenized(tokenized, pid, version, bundled).await?;
+                let host = Self::from_tokenized(
+                    tokenized,
+                    pid,
+                    version,
+                    bundled,
+                    Duration::from_secs(15),
+                )
+                .await?;
                 eprintln!(
                     "[host] daemon pid={} ready at {} (cold {}ms)",
                     host.pid,
@@ -171,6 +217,7 @@ impl DshHost {
         version: &str,
         fingerprint: u64,
         state_path: &Path,
+        auth_timeout: Duration,
     ) -> Result<Option<Self>> {
         let Some(state) = read_daemon_state(state_path) else {
             return Ok(None);
@@ -185,7 +232,15 @@ impl DshHost {
         let Ok(tokenized) = Url::parse(&state.tokenized) else {
             return Ok(None);
         };
-        match Self::from_tokenized(tokenized.to_string(), state.pid, state.version, true).await {
+        match Self::from_tokenized(
+            tokenized.to_string(),
+            state.pid,
+            state.version,
+            true,
+            auth_timeout,
+        )
+        .await
+        {
             Ok(host) => Ok(Some(host)),
             Err(err) => {
                 // A live pid with a dead HTTP surface should not wedge every
@@ -201,6 +256,7 @@ impl DshHost {
         pid: u32,
         version: String,
         bundled: bool,
+        auth_timeout: Duration,
     ) -> Result<Self> {
         let jar = Arc::new(reqwest::cookie::Jar::default());
         let client = reqwest::Client::builder()
@@ -212,7 +268,7 @@ impl DshHost {
             .build()?;
 
         let tokenized_url = Url::parse(&tokenized).with_context(|| format!("bad url: {tokenized}"))?;
-        let base = Self::exchange_token(&client, tokenized_url.clone()).await?;
+        let base = Self::exchange_token(&client, tokenized_url.clone(), auth_timeout).await?;
         if jar.cookies(&base).is_none() {
             return Err(anyhow!("no session cookie after token exchange"));
         }
@@ -232,7 +288,11 @@ impl DshHost {
     /// 走 `/connect?token=…&interactions=answer`：只有声明 answer 的 peer 才会收到
     /// 需要回答的 forwarded event（审批 `approval/request`、提问 `user-questions/request`）。
     /// 走 `/?token=…` 得到的是浏览器 peer（interactions=none），永远收不到审批。
-    async fn exchange_token(client: &reqwest::Client, tokenized: Url) -> Result<Url> {
+    async fn exchange_token(
+        client: &reqwest::Client,
+        tokenized: Url,
+        timeout: Duration,
+    ) -> Result<Url> {
         let mut connect = tokenized.clone();
         connect.set_path("/connect");
         let existing: Vec<(String, String)> = tokenized
@@ -249,6 +309,7 @@ impl DshHost {
         }
         let resp = client
             .get(connect)
+            .timeout(timeout)
             .send()
             .await
             .context("token exchange request failed")?;
@@ -285,7 +346,12 @@ impl DshHost {
         jar: &reqwest::cookie::Jar,
         tokenized: &Url,
     ) -> Result<String> {
-        let base = DshHost::exchange_token(client, tokenized.clone()).await?;
+        let base = DshHost::exchange_token(
+            client,
+            tokenized.clone(),
+            Duration::from_secs(15),
+        )
+        .await?;
         jar.cookies(&base)
             .and_then(|header| header.to_str().ok().map(|s| s.to_string()))
             .ok_or_else(|| anyhow!("no cookie after /connect re-auth"))
@@ -505,6 +571,10 @@ fn profile_slug(profile: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect()
+}
+
+fn state_mtime(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok().and_then(|meta| meta.modified().ok())
 }
 
 fn read_daemon_state(path: &Path) -> Option<DaemonState> {

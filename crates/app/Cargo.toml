@@ -12,9 +12,20 @@ path = "src/main.rs"
 anyhow.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+reqwest.workspace = true
+url.workspace = true
 dsh-host = { path = "../host" }
 dsh-transport = { path = "../transport" }
-gpui-kit = "0.9"
+gpui-kit = { version = "0.9", features = ["syntect"] }
+# 和 gpui-base 同版本，provider trait 的类型才能对上
+lsp-types = { version = "0.97", features = ["proposed"] }
+regex = "1"
 async-channel = "2"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+# 浏览器块：CEF 作为子窗口贴在 GPUI 窗口上，三端同一引擎，带 CDP。
+cef = { version = "156", features = ["accelerated_osr"] }
+wgpu = "30"
+# GPUI 的 wgpu 后端：复用它的 device 导入浏览器帧，并提供外部纹理绘制原语。
+gpui-wgpu = { package = "gpui-pre-wgpu", path = "../../vendor/gpui-pre/gpui-pre-wgpu" }
+pollster = "0.4"

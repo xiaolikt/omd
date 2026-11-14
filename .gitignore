@@ -1,2 +1,5 @@
 /target
 *.log
+
+# CEF 二进制（1.6G，按平台放本地）
+/vendor/cef/

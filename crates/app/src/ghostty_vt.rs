@@ -3,7 +3,8 @@
 //! 渲染路径走 render-state：`render_state_update`（吃掉脏状态）→
 //! `row_iterator_next_dirty`（只遍历脏行）→ `row_get(CELLS)` →
 //! `row_cells_get(RAW/GRAPHEMES/STYLE/…)`。
-//! VT 写入：`terminal_vt_write`。Kitty 图形：`image_iterator`（后续）。
+//! VT 写入：`terminal_vt_write`。Kitty 图形：render-state image iterator
+//! + `ghostty_kitty_graphics_image` 读已解码像素。
 
 use std::ffi::c_void;
 use std::os::raw::c_int;
@@ -16,6 +17,16 @@ pub type GhosttyCell = u64; // packed value（GhosttyCell，64 位打包描述�
 pub type GhosttyRow = u64;
 
 pub const GHOSTTY_SUCCESS: c_int = 0;
+pub type GhosttyKeyEncoder = *mut c_void;
+pub type GhosttyKeyEvent = *mut c_void;
+pub type GhosttyKittyGraphics = *mut c_void;
+pub type GhosttyKittyGraphicsImage = *mut c_void;
+pub type GhosttyRenderStateImageIterator = *mut c_void;
+// GHOSTTY_MODS_* bits
+pub const GHOSTTY_MODS_SHIFT: u16 = 1;
+pub const GHOSTTY_MODS_CTRL: u16 = 2;
+pub const GHOSTTY_MODS_ALT: u16 = 4;
+pub const GHOSTTY_MODS_SUPER: u16 = 8;
 
 // GhosttyRenderStateData（render.h 真实枚举值）
 pub const RS_DATA_COLS: c_int = 1;
@@ -25,6 +36,32 @@ pub const RS_DATA_ROW_ITERATOR: c_int = 4;
 pub const RS_DATA_CURSOR_VISIBLE: c_int = 11;
 pub const RS_DATA_CURSOR_VIEWPORT_X: c_int = 15;
 pub const RS_DATA_CURSOR_VIEWPORT_Y: c_int = 16;
+pub const RS_DATA_IMAGE_ITERATOR: c_int = 22;
+
+pub const RS_IMAGE_PROTOCOL: c_int = 1;
+pub const RS_IMAGE_ID: c_int = 2;
+pub const RS_IMAGE_GENERATION: c_int = 3;
+pub const RS_IMAGE_COL: c_int = 6;
+pub const RS_IMAGE_ROW: c_int = 7;
+pub const RS_IMAGE_OFFSET_X: c_int = 10;
+pub const RS_IMAGE_OFFSET_Y: c_int = 11;
+pub const RS_IMAGE_PIXEL_W: c_int = 12;
+pub const RS_IMAGE_PIXEL_H: c_int = 13;
+pub const RS_IMAGE_SRC_X: c_int = 14;
+pub const RS_IMAGE_SRC_Y: c_int = 15;
+pub const RS_IMAGE_SRC_W: c_int = 16;
+pub const RS_IMAGE_SRC_H: c_int = 17;
+
+pub const TERM_DATA_KITTY_GRAPHICS: c_int = 30;
+pub const KITTY_IMAGE_WIDTH: c_int = 3;
+pub const KITTY_IMAGE_HEIGHT: c_int = 4;
+pub const KITTY_IMAGE_FORMAT: c_int = 5;
+pub const KITTY_IMAGE_PIXELS: c_int = 7;
+pub const KITTY_FMT_RGB: i32 = 0;
+pub const KITTY_FMT_RGBA: i32 = 1;
+pub const KITTY_FMT_GRAY_ALPHA: i32 = 3;
+pub const KITTY_FMT_GRAY: i32 = 4;
+pub const GHOSTTY_NO_VALUE: c_int = -4;
 
 // GhosttyRenderStateRowData
 pub const RS_ROW_DATA_DIRTY: c_int = 1;
@@ -101,6 +138,13 @@ pub struct GhosttyCellsView {
     pub len: usize,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyString {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
 extern "C" {
     // terminal
     pub fn ghostty_terminal_new(
@@ -118,6 +162,7 @@ extern "C" {
         cell_height_px: u32,
     ) -> c_int;
     pub fn ghostty_terminal_vt_write(terminal: GhosttyTerminal, data: *const u8, len: usize);
+    pub fn ghostty_terminal_get(terminal: GhosttyTerminal, data: c_int, out: *mut c_void) -> c_int;
 
     // render state
     pub fn ghostty_render_state_new(
@@ -163,5 +208,45 @@ extern "C" {
     // cell 值解码（对 GhosttyCell packed value）
     pub fn ghostty_cell_get(cell: GhosttyCell, data: c_int, out: *mut c_void) -> c_int;
 
-    // （保留 set 仅作他用；iterator 用 get 填充，不用 set）
+    // 键盘编码：按终端当前模式（cursor keys / kitty / modifyOtherKeys）产生 PTY 字节
+    pub fn ghostty_key_encoder_new(alloc: *const c_void, out: *mut GhosttyKeyEncoder) -> c_int;
+    pub fn ghostty_key_encoder_free(e: GhosttyKeyEncoder);
+    pub fn ghostty_key_encoder_set_from_terminal(e: GhosttyKeyEncoder, t: GhosttyTerminal) -> c_int;
+    pub fn ghostty_key_encoder_set(e: GhosttyKeyEncoder, opt: c_int, value: *const c_void) -> c_int;
+    pub fn ghostty_key_encoder_encode(
+        e: GhosttyKeyEncoder,
+        ev: GhosttyKeyEvent,
+        buf: *mut u8,
+        cap: usize,
+        len: *mut usize,
+    ) -> c_int;
+    pub fn ghostty_key_event_new(alloc: *const c_void, out: *mut GhosttyKeyEvent) -> c_int;
+    pub fn ghostty_key_event_free(ev: GhosttyKeyEvent);
+    pub fn ghostty_key_event_set_action(ev: GhosttyKeyEvent, action: c_int) -> c_int;
+    pub fn ghostty_key_event_set_key(ev: GhosttyKeyEvent, key: c_int) -> c_int;
+    pub fn ghostty_key_event_set_mods(ev: GhosttyKeyEvent, mods: u16) -> c_int;
+    pub fn ghostty_key_event_set_utf8(ev: GhosttyKeyEvent, utf8: GhosttyString) -> c_int;
+    pub fn ghostty_key_event_set_unshifted_codepoint(ev: GhosttyKeyEvent, cp: u32) -> c_int;
+
+    pub fn ghostty_render_state_image_iterator_new(
+        allocator: *const c_void,
+        out: *mut GhosttyRenderStateImageIterator,
+    ) -> c_int;
+    pub fn ghostty_render_state_image_iterator_free(iterator: GhosttyRenderStateImageIterator);
+    pub fn ghostty_render_state_image_iterator_next(iterator: GhosttyRenderStateImageIterator) -> bool;
+    pub fn ghostty_render_state_image_get(
+        iterator: GhosttyRenderStateImageIterator,
+        data: c_int,
+        out: *mut c_void,
+    ) -> c_int;
+
+    pub fn ghostty_kitty_graphics_image(
+        graphics: GhosttyKittyGraphics,
+        image_id: u32,
+    ) -> GhosttyKittyGraphicsImage;
+    pub fn ghostty_kitty_graphics_image_get(
+        image: GhosttyKittyGraphicsImage,
+        data: c_int,
+        out: *mut c_void,
+    ) -> c_int;
 }
