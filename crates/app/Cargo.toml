@@ -21,6 +21,7 @@ gpui-kit = { version = "0.9", features = ["syntect"] }
 lsp-types = { version = "0.97", features = ["proposed"] }
 regex = "1"
 async-channel = "2"
+futures-util.workspace = true
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 # 浏览器块：CEF 作为子窗口贴在 GPUI 窗口上，三端同一引擎，带 CDP。
@@ -30,4 +31,4 @@ wgpu = "30"
 gpui-wgpu = { package = "gpui-pre-wgpu", path = "../../vendor/gpui-pre/gpui-pre-wgpu" }
 pollster = "0.4"
 # CEF 子窗口的 X11 宿主窗口（和 gpui-pre-linux 用同一个大版本）。
-x11rb = "0.13"
+x11rb = { version = "0.13", features = ["xinput"] }

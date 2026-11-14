@@ -491,6 +491,8 @@ struct Block {
     cwd: Option<String>,
     /// 拉起这个 pane 时写入的命令（terminal-browser 的 listPanes 用）。
     command: Option<String>,
+    /// 非空 = 这个 pane 是浏览器块，值是 CEF 的槽位号。
+    browser: Option<usize>,
     focus: FocusHandle,
 }
 
@@ -517,6 +519,7 @@ impl Block {
             images: Vec::new(),
             cwd: None,
             command: None,
+            browser: None,
             focus,
         }
     }
@@ -3183,7 +3186,8 @@ impl Root {
         stamp("Root::new enter");
         eprintln!("[ui] root created");
         window.set_window_title("OMD");
-        // 浏览器块（实验）：CEF windowless 渲染，帧进 on_paint；CDP 端口留给 agent。
+        // 浏览器块：CEF 子窗口 + CDP 端口。创建成功后在 new 末尾挂成一个 pane。
+        let mut browser_index: Option<usize> = None;
         if std::env::var("OMD_BROWSER").is_ok() {
             let url = std::env::var("OMD_BROWSER_URL")
                 .unwrap_or_else(|_| "https://example.com".to_string());
@@ -3216,7 +3220,10 @@ impl Root {
                 browser::create(1000, 700, &url)
             };
             eprintln!("[browser] created index={index:?}");
+            browser::set_primary(index);
+            browser_index = index;
             // CEF 的消息泵必须跑在 UI 线程上（external_message_pump）。
+            let pump_rx = browser::pump_channel();
             cx.spawn(async move |this, cx: &mut AsyncApp| {
                 let mut last_seq = u64::MAX;
                 let mut last_accel_seq = u64::MAX;
@@ -3224,10 +3231,31 @@ impl Root {
                 let mut frames = 0u64;
                 let start = std::time::Instant::now();
                 loop {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(8))
-                        .await;
-                    browser::pump();
+                    /*
+                    按 CEF 自己的调度泵：空闲时它给 i32::MAX，我们只做低频兜底
+                    轮询；有活时给 0~16ms，用通道立刻叫醒。固定 8ms 空转会
+                    让 Chromium 的合成器以 125Hz 狂转（实测多烧 50 个点 CPU）。
+                    */
+                    /*
+                    CEF 在窗口化模式下几乎一直请求 delay=0（合成器总要下一帧），
+                    不钳制就会以 500 次/秒泵、把主线程烧到 40%+。和 Ghostex 一样
+                    钳到 [8ms, 33ms]：8ms 够 120Hz，33ms 是空闲上限。
+                    */
+                    let delay = match browser::pump_delay_ms() {
+                        d if d <= 0 => 8,
+                        d if d >= 1000 => 200,
+                        d => d.clamp(8, 33),
+                    };
+                    let wait = std::time::Duration::from_millis(delay as u64);
+                    let sleep = cx.background_executor().timer(wait);
+                    let _ = futures_util::future::select(
+                        Box::pin(sleep),
+                        Box::pin(pump_rx.recv()),
+                    )
+                    .await;
+                    if std::env::var("OMD_PUMP_OFF").is_err() {
+                        browser::pump();
+                    }
                     if let Some(index) = index {
                         // GPU 路径：帧到了就请求一次重绘（GPUI 不会自己刷新）。
                         if let Some(accel) = browser::latest_accel(index) {
@@ -3739,6 +3767,9 @@ impl Root {
             root.open_file_panel(path.clone(), window, cx);
             stamp(format!("editor opened {path} via OMD_OPEN_FILE"));
         }
+        // 空间/布局是异步恢复的，new 结束时 current_space 可能还没就绪；
+        // 浏览器 pane 改在第一次 render（空间已就绪）时挂，见 render 开头。
+        let _ = browser_index;
         stamp("Root::new done");
         root
     }
@@ -6466,6 +6497,50 @@ impl Root {
             .map(|space| space.cwd.clone());
         let _ = self.cmds.send_blocking(Cmd::NewSession { cwd });
         cx.notify();
+    }
+
+    /// 把已经创建好的 CEF 浏览器挂成一个 pane：块本身不画任何东西，
+    /// 渲染时由 BrowserElement 把布局矩形同步给 X11 子窗口。
+    fn open_browser_pane(&mut self, index: usize, cx: &mut Context<Self>) {
+        // 干净数据目录下可能一个空间都没有：先确保有一个能挂 pane 的 tab。
+        if self.current_space.is_none() {
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "/".into());
+            let id = self.ensure_space(&cwd);
+            self.current_space = Some(id);
+        }
+        let pane_id = next_pane_id();
+        let focus = cx.focus_handle();
+        let mut pane = Block::new(pane_id, BlockPlacement::Panel, focus);
+        pane.browser = Some(index);
+        self.panes.push(pane);
+        let Some(space_id) = self.current_space.clone() else {
+            eprintln!("[browser-pane] no current space");
+            return;
+        };
+        let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) else {
+            eprintln!("[browser-pane] space {space_id} not found");
+            return;
+        };
+        if space.active_panel.is_none() {
+            let id = next_tab_id();
+            let number = space.panels.iter().map(|tab| tab.number).max().unwrap_or(0) + 1;
+            space.panels.push(Panel::new(id.clone(), number));
+            space.active_panel = Some(id);
+        }
+        let Some(tab_id) = space.active_panel.clone() else {
+            eprintln!("[browser-pane] no active panel");
+            return;
+        };
+        let Some(tab) = space.panels.iter_mut().find(|tab| tab.id == tab_id) else {
+            eprintln!("[browser-pane] tab {tab_id} not found");
+            return;
+        };
+        // chat 右侧分出一格给浏览器
+        let split_ok = tab.layout.split(0, SplitDir::Row, pane_id);
+        eprintln!("[browser-pane] pane={pane_id} split_ok={split_ok}");
+        tab.maximized = None;
     }
 
     fn split_pane(&mut self, leaf: u64, dir: SplitDir, cx: &mut Context<Self>) {
@@ -9302,6 +9377,87 @@ fn pane_divider(pane_id: u64, kind: BlockPlacement, dragging: bool, cx: &mut Con
 
 
 
+/// 浏览器块的 Element。
+///
+/// CEF 子窗口是真正的 X11 窗口，不参与 GPUI 绘制，所以这里不画任何东西：
+/// 只在 `prepaint` 里把 GPUI 算出的布局矩形换算成物理像素交给 X11 宿主。
+/// 分屏、拖动分隔条、最大化都会自动跟随。
+struct BrowserElement {
+    index: usize,
+}
+
+impl IntoElement for BrowserElement {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for BrowserElement {
+    type RequestLayoutState = ();
+    type PrepaintState = Option<Hitbox>;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui_kit::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let style = Style {
+            size: Size::full(),
+            flex_shrink: 1.,
+            ..Default::default()
+        };
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui_kit::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        _: &mut App,
+    ) -> Self::PrepaintState {
+        let scale = window.scale_factor();
+        let x = f32::from(bounds.origin.x) * scale;
+        let y = f32::from(bounds.origin.y) * scale;
+        let width = f32::from(bounds.size.width) * scale;
+        let height = f32::from(bounds.size.height) * scale;
+        crate::browser::child_bounds(
+            self.index,
+            x.round() as i32,
+            y.round() as i32,
+            width.round() as i32,
+            height.round() as i32,
+        );
+        Some(window.insert_hitbox(bounds, HitboxBehavior::Normal))
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui_kit::InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        _: &mut Window,
+        _: &mut App,
+    ) {
+        // 子窗口自己画，GPUI 这块留空。
+    }
+}
+
 /// 递归渲染布局树。
 fn build_layout(
     layout: &Layout,
@@ -10575,6 +10731,15 @@ fn browser_overlay() -> AnyElement {
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 浏览器块：CEF 就绪 + 空间恢复后，把它挂成当前 tab 的一个 pane。
+        #[cfg(target_os = "linux")]
+        if browser::primary().is_some()
+            && !self.panes.iter().any(|pane| pane.browser.is_some())
+        {
+            let index = browser::primary().unwrap();
+            self.open_browser_pane(index, cx);
+            cx.notify();
+        }
         if let Some(id) = self.focus_pending.take() {
             if let Some(pane) = self.panes.iter().find(|pane| pane.id == id) {
                 pane.focus.focus(window, cx);
@@ -12577,6 +12742,15 @@ impl Render for Root {
                         cx,
                     ),
                 );
+                continue;
+            }
+            if let Some(index) = self
+                .panes
+                .iter()
+                .find(|pane| pane.id == pane_id)
+                .and_then(|pane| pane.browser)
+            {
+                leaf_elements.insert(pane_id, BrowserElement { index }.into_any_element());
                 continue;
             }
             let title = media

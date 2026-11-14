@@ -4979,6 +4979,7 @@ dependencies = [
  "cef",
  "dsh-host",
  "dsh-transport",
+ "futures-util",
  "gpui-kit",
  "gpui-pre-wgpu",
  "image",

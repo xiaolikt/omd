@@ -52,6 +52,47 @@ static SLOTS: Mutex<Vec<Slot>> = Mutex::new(Vec::new());
 static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
 /// 当前进程是否 windowless。Chromium 的 Ozone 平台开关据此决定。
 static WINDOWLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// UI 侧当前展示的浏览器槽位（None = 没有浏览器块）。
+static PRIMARY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+pub fn set_primary(index: Option<usize>) {
+    PRIMARY.store(index.unwrap_or(usize::MAX), Ordering::Relaxed);
+}
+
+pub fn primary() -> Option<usize> {
+    match PRIMARY.load(Ordering::Relaxed) {
+        usize::MAX => None,
+        index => Some(index),
+    }
+}
+
+/// CEF 请求的下一次泵延迟（毫秒）。i32::MAX = 暂时没活，不要空转。
+static PUMP_DELAY_MS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(i32::MAX as i64);
+/// 唤醒泵循环的通道：CEF 调度时立刻叫醒 UI 线程，而不是等定时器。
+static PUMP_WAKE: std::sync::OnceLock<async_channel::Sender<()>> = std::sync::OnceLock::new();
+
+/// CEF 通过 `on_schedule_message_pump_work` 告诉我们多久以后需要再泵一次。
+pub fn note_pump_work(delay_ms: i64) {
+    PUMP_DELAY_MS.store(delay_ms, Ordering::Relaxed);
+    if let Some(tx) = PUMP_WAKE.get() {
+        let _ = tx.try_send(());
+    }
+}
+
+pub fn pump_delay_ms() -> i64 {
+    PUMP_DELAY_MS.load(Ordering::Relaxed)
+}
+
+/// 泵循环等待用：CEF 调度时立即返回。
+pub fn pump_channel() -> async_channel::Receiver<()> {
+    let (tx, rx) = async_channel::unbounded();
+    let _ = PUMP_WAKE.set(tx);
+    rx
+}
+
+/// 上一次同步给 X11 的矩形，避免每帧都发 ConfigureWindow。
+static LAST_RECT: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
 /// 外部纹理在 gpui-wgpu 注册表里的 key（单浏览器固定 0）。
 const EXTERNAL_KEY: u32 = 0;
 
@@ -280,6 +321,10 @@ pub fn create_child(
     if let Some(host) = browser.host() {
         host.was_hidden(0);
     }
+    #[cfg(target_os = "linux")]
+    if let Some(window) = browser.host().map(|host| host.window_handle()) {
+        crate::x11_embed::watch(host, window as usize as u32, parent as u32);
+    }
     let slot = &mut slots()[index];
     slot.id = Some(id);
     slot.browser = Some(browser);
@@ -290,6 +335,13 @@ pub fn create_child(
 /// 子窗口跟随 GPUI 布局：移动/缩放宿主，再把同样的尺寸补给 CEF 的窗口，
 /// 让它收到 ConfigureNotify（CefWindowX11 靠这个 resize 浏览器 widget）。
 pub fn child_bounds(index: usize, x: i32, y: i32, width: i32, height: i32) {
+    {
+        let mut last = LAST_RECT.lock().unwrap_or_else(|e| e.into_inner());
+        if *last == Some((x, y, width, height)) {
+            return;
+        }
+        *last = Some((x, y, width, height));
+    }
     let (host, cef_window) = {
         let slots = slots();
         let Some(slot) = slots.get(index) else { return };
@@ -347,6 +399,7 @@ pub fn detach_native_view(index: usize) {
     let host = slots().get_mut(index).and_then(|slot| slot.host.take());
     #[cfg(target_os = "linux")]
     if let Some(host) = host {
+        crate::x11_embed::unwatch(host);
         crate::x11_embed::detach(host);
     }
     let _ = host;
@@ -461,7 +514,7 @@ source 的话：CreateWindow 的错误没人收、MapNotify/ConfigureNotify 永�
 
 glib 符号从已加载的 libglib-2.0 解析（libcef.so 硬依赖它），不增加链接依赖。
 */
-fn glib_dispatch() {
+fn glib_dispatch() -> u32 {
     struct Glib {
         context: *mut std::ffi::c_void,
         pending: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
@@ -498,8 +551,9 @@ fn glib_dispatch() {
             iteration: std::mem::transmute(iteration),
         })
     }) else {
-        return;
+        return 0;
     };
+    let mut n = 0;
     unsafe {
         // 上限防止 pending 一直为真时卡死 UI 线程。
         for _ in 0..256 {
@@ -507,8 +561,10 @@ fn glib_dispatch() {
                 break;
             }
             (glib.iteration)(glib.context, 0);
+            n += 1;
         }
     }
+    n
 }
 
 pub fn pump() {
@@ -536,9 +592,20 @@ pub fn pump() {
             host.send_external_begin_frame();
         }
     }
-    glib_dispatch();
+    let before = glib_dispatch();
     do_message_loop_work();
-    glib_dispatch();
+    let after = glib_dispatch();
+    {
+        static N: AtomicU64 = AtomicU64::new(0);
+        static T: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        N.fetch_add(u64::from(before + after), Ordering::Relaxed);
+        let mut t = T.lock().unwrap_or_else(|e| e.into_inner());
+        let start = *t.get_or_insert_with(std::time::Instant::now);
+        if start.elapsed().as_secs() >= 1 {
+            eprintln!("[pump] glib iterations/s = {}", N.swap(0, Ordering::Relaxed));
+            *t = Some(std::time::Instant::now());
+        }
+    }
     if std::env::var("OMD_BROWSER_DEBUG").is_ok() {
         static C: AtomicU64 = AtomicU64::new(0);
         static T: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -647,6 +714,15 @@ fn dump_texture(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Text
 // CEF App：命令行开关
 // ---------------------------------------------------------------------------
 
+cef::wrap_browser_process_handler! {
+    struct OmdBrowserProcess {}
+    impl BrowserProcessHandler {
+        fn on_schedule_message_pump_work(&self, delay_ms: i64) {
+            note_pump_work(delay_ms);
+        }
+    }
+}
+
 cef::wrap_app! {
     struct OmdApp {}
     impl App {
@@ -673,6 +749,10 @@ cef::wrap_app! {
                 Some(&CefString::from("disable-features")),
                 Some(&CefString::from("SpareRendererForSitePerProcess")),
             );
+        }
+
+        fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
+            Some(OmdBrowserProcess::new())
         }
     }
 }

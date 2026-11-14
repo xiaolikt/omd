@@ -16,6 +16,8 @@ use x11rb::protocol::xproto::{
     ColormapAlloc, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux, InputFocus,
     Rectangle, StackMode, Window, WindowClass,
 };
+use x11rb::protocol::xinput as x11;
+use x11rb::protocol::xinput::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
 struct X11 {
@@ -150,6 +152,105 @@ pub fn destroy(host: u32) {
     let Ok(x11) = lock.lock() else { return };
     let _ = x11.conn.destroy_window(host);
     let _ = x11.conn.flush();
+}
+
+// ---------------------------------------------------------------------------
+// 点击 → X 输入焦点
+// ---------------------------------------------------------------------------
+
+/// 一个嵌入的浏览器：点击落在它的矩形里就把 X 焦点交给 CEF 的子窗口，
+/// 否则交回 GPUI 的主窗口。X11 不会像 Wayland 那样替我们做这件事，而
+/// Chromium 只有收到 X 焦点才会把键盘事件送进页面。
+struct Target {
+    host: Window,
+    cef: Window,
+    parent: Window,
+}
+
+static TARGETS: Mutex<Vec<Target>> = Mutex::new(Vec::new());
+
+/// 登记一个嵌入的浏览器，并确保点击观察线程已经起来。
+pub fn watch(host: u32, cef_window: u32, parent: u32) {
+    if let Ok(mut targets) = TARGETS.lock() {
+        targets.retain(|t| t.host != host);
+        targets.push(Target {
+            host,
+            cef: cef_window,
+            parent,
+        });
+    }
+    start_click_watcher();
+}
+
+pub fn unwatch(host: u32) {
+    if let Ok(mut targets) = TARGETS.lock() {
+        targets.retain(|t| t.host != host);
+    }
+}
+
+fn start_click_watcher() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("x11-click-watcher".into())
+            .spawn(|| {
+                let Ok((conn, screen_index)) = x11rb::connect(None) else {
+                    return;
+                };
+                let root = conn.setup().roots[screen_index].root;
+                // XI2 raw 事件在根窗口上选，子窗口里的点击也能看到。
+                let _ = conn.xinput_xi_query_version(2, 4);
+                let masks = [x11::EventMask {
+                    deviceid: 0, // XIAllDevices
+                    mask: vec![x11::XIEventMask::RAW_BUTTON_PRESS],
+                }];
+                if conn.xinput_xi_select_events(root, &masks).is_err() {
+                    eprintln!("[browser] XInput2 raw 事件不可用，点击不会切换焦点");
+                    return;
+                }
+                let _ = conn.flush();
+                loop {
+                    let Ok(event) = conn.wait_for_event() else { break };
+                    // raw 事件本身不带坐标，按下瞬间的指针位置就是点击点。
+                    let x11rb::protocol::Event::XinputRawButtonPress(_press) = event else {
+                        continue;
+                    };
+                    let Ok(cookie) = conn.query_pointer(root) else { continue };
+                    let Ok(pointer) = cookie.reply() else { continue };
+                    let (x, y) = (pointer.root_x, pointer.root_y);
+                    let focus = {
+                        let targets = match TARGETS.lock() {
+                            Ok(t) => t,
+                            Err(_) => continue,
+                        };
+                        let hit = targets.iter().find(|t| {
+                            screen_rect(&conn, root, t.host)
+                                .is_some_and(|(rx, ry, rw, rh)| {
+                                    x >= rx && x < rx + rw as i16 && y >= ry && y < ry + rh as i16
+                                })
+                        });
+                        hit.map(|t| t.cef)
+                            .or_else(|| targets.first().map(|t| t.parent))
+                    };
+                    if let Some(window) = focus {
+                        let _ = conn.set_input_focus(InputFocus::PARENT, window, x11rb::CURRENT_TIME);
+                        let _ = conn.flush();
+                    }
+                }
+            })
+            .ok();
+    });
+}
+
+/// 窗口在根坐标里的矩形。
+fn screen_rect(conn: &RustConnection, root: Window, window: Window) -> Option<(i16, i16, u16, u16)> {
+    let geometry = conn.get_geometry(window).ok()?.reply().ok()?;
+    let translated = conn
+        .translate_coordinates(window, root, 0, 0)
+        .ok()?
+        .reply()
+        .ok()?;
+    Some((translated.dst_x, translated.dst_y, geometry.width, geometry.height))
 }
 
 /// 宿主窗口在屏幕上的矩形，用于把 GPUI 的鼠标坐标换算成页面坐标。
