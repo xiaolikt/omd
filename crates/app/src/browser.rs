@@ -42,12 +42,16 @@ struct Slot {
     accel: Option<AccelFrame>,
     /// 是否走 windowless（OSR）渲染。子窗口模式由 CEF 自己跟 vsync，不能再推 begin frame。
     windowless: bool,
+    /// 子窗口模式的 X11 宿主窗口（32 位 GPUI 窗口和 24 位 CEF 子窗口之间的桥）。
+    host: Option<u32>,
 }
 
 
 /// 每个 browser 一份；index 对应 UI 侧的 browser pane。
 static SLOTS: Mutex<Vec<Slot>> = Mutex::new(Vec::new());
 static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
+/// 当前进程是否 windowless。Chromium 的 Ozone 平台开关据此决定。
+static WINDOWLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 外部纹理在 gpui-wgpu 注册表里的 key（单浏览器固定 0）。
 const EXTERNAL_KEY: u32 = 0;
 
@@ -86,7 +90,7 @@ fn executable_dir() -> Option<PathBuf> {
 
 /// 启动 CEF 主进程。`remote_port` 给 0 时由 CEF 随机选端口，
 /// 真实端口从 `<cache>/DevToolsActivePort` 读。
-pub fn init(remote_port: i32, cache_dir: &std::path::Path) -> bool {
+pub fn init(remote_port: i32, cache_dir: &std::path::Path, windowless: bool) -> bool {
     // 同上：api_hash 必须先于一切 CEF 调用。
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
     static INITIALIZED: Mutex<bool> = Mutex::new(false);
@@ -117,8 +121,9 @@ pub fn init(remote_port: i32, cache_dir: &std::path::Path) -> bool {
     settings.no_sandbox = 1;
     // Linux 上不支持多线程消息循环，改用外部泵。
     settings.external_message_pump = 1;
-    // 页面画进内存缓冲，不建平台窗口。
-    settings.windowless_rendering_enabled = 1;
+    // 子窗口模式让 CEF 自己建窗口；OSR 模式画进内存缓冲。
+    settings.windowless_rendering_enabled = i32::from(windowless);
+    WINDOWLESS.store(windowless, std::sync::atomic::Ordering::Relaxed);
     settings.remote_debugging_port = remote_port;
     settings.log_severity = LogSeverity::INFO;
     settings.resources_dir_path = CefString::from(dir.join("Resources").to_string_lossy().as_ref());
@@ -129,10 +134,11 @@ pub fn init(remote_port: i32, cache_dir: &std::path::Path) -> bool {
     settings.background_color = 0xff10_1319;
 
     let args = args::Args::new();
+    let mut app = OmdApp::new();
     let rc = initialize(
         Some(args.as_main_args()),
         Some(&settings),
-        None,
+        Some(&mut app),
         std::ptr::null_mut(),
     );
     // CefInitialize 返回 1 表示成功（cef_dll_sys 原样透传）。
@@ -231,15 +237,31 @@ pub fn create_child(
         index
     };
 
+    /*
+    父窗口是 GPUI 的 32 位 ARGB 窗口，CEF 的子窗口是 24 位：直接挂上去
+    X 会 BadMatch/BadDrawable。这里插一层和根窗口同 depth/visual 的宿主，
+    位置和尺寸都由宿主承担，CEF 窗口自己永远是 (0,0,w,h)。
+    */
+    #[cfg(target_os = "linux")]
+    let host = crate::x11_embed::create_host(
+        parent as u32,
+        x as i16,
+        y as i16,
+        width.max(1) as u16,
+        height.max(1) as u16,
+    )?;
+    #[cfg(not(target_os = "linux"))]
+    let host = parent as u32;
+
     let mut window_info = WindowInfo::default();
     window_info.runtime_style = RuntimeStyle::ALLOY;
     let bounds = Rect {
-        x,
-        y,
+        x: 0,
+        y: 0,
         width,
         height,
     };
-    let window_info = window_info.set_as_child(parent as _, &bounds);
+    let window_info = window_info.set_as_child(u64::from(host) as _, &bounds);
 
     let url = CefString::from(url);
     let mut settings = BrowserSettings::default();
@@ -261,7 +283,73 @@ pub fn create_child(
     let slot = &mut slots()[index];
     slot.id = Some(id);
     slot.browser = Some(browser);
+    slot.host = Some(host);
     Some(index)
+}
+
+/// 子窗口跟随 GPUI 布局：移动/缩放宿主，再把同样的尺寸补给 CEF 的窗口，
+/// 让它收到 ConfigureNotify（CefWindowX11 靠这个 resize 浏览器 widget）。
+pub fn child_bounds(index: usize, x: i32, y: i32, width: i32, height: i32) {
+    let (host, cef_window) = {
+        let slots = slots();
+        let Some(slot) = slots.get(index) else { return };
+        (
+            slot.host,
+            slot.browser.as_ref().and_then(|b| b.host()).map(|h| h.window_handle()),
+        )
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(host) = host {
+        crate::x11_embed::set_bounds(
+            host,
+            x as i16,
+            y as i16,
+            width.max(1) as u16,
+            height.max(1) as u16,
+        );
+        if let Some(window) = cef_window {
+            crate::x11_embed::set_child_bounds(
+                window as usize as u32,
+                width.max(1) as u16,
+                height.max(1) as u16,
+            );
+        }
+    }
+    let _ = (host, cef_window);
+}
+
+/// 面板折叠/切标签时整块隐藏，不销毁浏览器（保留会话和滚动位置）。
+pub fn set_visible(index: usize, visible: bool) {
+    let host = slots().get(index).and_then(|slot| slot.host);
+    #[cfg(target_os = "linux")]
+    if let Some(host) = host {
+        crate::x11_embed::set_visible(host, visible);
+    }
+    let _ = host;
+}
+
+/// 点击落在浏览器区域时把 X11 输入焦点交给 CEF 的子窗口。
+pub fn focus(index: usize) {
+    let window = slots()
+        .get(index)
+        .and_then(|slot| slot.browser.as_ref().and_then(|b| b.host()))
+        .map(|host| host.window_handle());
+    #[cfg(target_os = "linux")]
+    if let Some(window) = window {
+        crate::x11_embed::focus(window as usize as u32);
+    }
+    let _ = window;
+}
+
+/// 拆掉浏览器时先把宿主摘出 GPUI 窗口：Chromium 的 GPU 表面还挂在它上面，
+/// 跟着父窗口一起销毁会让 ANGLE 拿到空 visual（三次崩溃后 WebGL 全挂）。
+pub fn detach_native_view(index: usize) {
+    let host = slots().get_mut(index).and_then(|slot| slot.host.take());
+    #[cfg(target_os = "linux")]
+    if let Some(host) = host {
+        crate::x11_embed::detach(host);
+    }
+    let _ = host;
 }
 
 pub fn create(width: u32, height: u32, url: &str) -> Option<usize> {
@@ -363,6 +451,66 @@ pub fn navigate(index: usize, url: &str) -> bool {
     true
 }
 
+/*
+CDXC:CefRuntime:
+CEF 的 external message pump 只排空 Chromium 自己的任务队列。Linux 上 UI 线程
+的 X11 事件源、fd watcher 都挂在 thread-default GMainContext 上，由 embedder 的
+glib 主循环派发（cefclient 有 GTK 循环白拿）。GPUI 跑的是 calloop，不派发 glib
+source 的话：CreateWindow 的错误没人收、MapNotify/ConfigureNotify 永远不来、
+合成器不出帧——窗口黑的，但页面 DOM 一切正常。
+
+glib 符号从已加载的 libglib-2.0 解析（libcef.so 硬依赖它），不增加链接依赖。
+*/
+fn glib_dispatch() {
+    struct Glib {
+        context: *mut std::ffi::c_void,
+        pending: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
+        iteration: unsafe extern "C" fn(*mut std::ffi::c_void, i32) -> i32,
+    }
+    // 只在 GPUI 主线程用，值不跨线程；这里为了放进 OnceLock 才声明。
+    unsafe impl Send for Glib {}
+    unsafe impl Sync for Glib {}
+
+    static GLIB: std::sync::OnceLock<Option<Glib>> = std::sync::OnceLock::new();
+    let Some(glib) = GLIB.get_or_init(|| unsafe {
+        unsafe extern "C" {
+            fn dlopen(filename: *const std::ffi::c_char, flag: i32) -> *mut std::ffi::c_void;
+            fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char)
+                -> *mut std::ffi::c_void;
+        }
+        const RTLD_NOW: i32 = 2;
+        let handle = dlopen(c"libglib-2.0.so.0".as_ptr(), RTLD_NOW);
+        if handle.is_null() {
+            eprintln!("[browser] libglib-2.0 未加载，子窗口可能黑屏");
+            return None;
+        }
+        let default_context = dlsym(handle, c"g_main_context_default".as_ptr());
+        let pending = dlsym(handle, c"g_main_context_pending".as_ptr());
+        let iteration = dlsym(handle, c"g_main_context_iteration".as_ptr());
+        if default_context.is_null() || pending.is_null() || iteration.is_null() {
+            return None;
+        }
+        let get_context: unsafe extern "C" fn() -> *mut std::ffi::c_void =
+            std::mem::transmute(default_context);
+        Some(Glib {
+            context: get_context(),
+            pending: std::mem::transmute(pending),
+            iteration: std::mem::transmute(iteration),
+        })
+    }) else {
+        return;
+    };
+    unsafe {
+        // 上限防止 pending 一直为真时卡死 UI 线程。
+        for _ in 0..256 {
+            if (glib.pending)(glib.context) == 0 {
+                break;
+            }
+            (glib.iteration)(glib.context, 0);
+        }
+    }
+}
+
 pub fn pump() {
     // external begin frame：CEF 不自己出帧，由我们按 60Hz 推合成器。
     // 不推的话页面的 rAF 照跑但 on_paint 永远不来。
@@ -388,7 +536,9 @@ pub fn pump() {
             host.send_external_begin_frame();
         }
     }
+    glib_dispatch();
     do_message_loop_work();
+    glib_dispatch();
     if std::env::var("OMD_BROWSER_DEBUG").is_ok() {
         static C: AtomicU64 = AtomicU64::new(0);
         static T: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -489,6 +639,40 @@ fn dump_texture(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Text
         match img.save(path) {
             Ok(()) => eprintln!("[accel] 已写出 {path} ({width}x{height})"),
             Err(e) => eprintln!("[accel] 写 PNG 失败: {e}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CEF App：命令行开关
+// ---------------------------------------------------------------------------
+
+cef::wrap_app! {
+    struct OmdApp {}
+    impl App {
+        fn on_before_command_line_processing(
+            &self,
+            _process_type: Option<&CefString>,
+            command_line: Option<&mut CommandLine>,
+        ) {
+            use cef::ImplCommandLine as _;
+            let Some(cmd) = command_line else { return };
+            if !WINDOWLESS.load(Ordering::Relaxed) {
+                /*
+                子窗口模式必须把 Chromium 的 Ozone 也钉在 X11：父窗口是 X11 的，
+                它自己 auto 探测到 Wayland 就再也挂不上去。CEF 会把这个开关传给
+                所有子进程，所以只需要在这里加一次。
+                */
+                cmd.append_switch_with_value(
+                    Some(&CefString::from("ozone-platform")),
+                    Some(&CefString::from("x11")),
+                );
+            }
+            // 少留一个空闲 renderer（Chromium 会提前起一个备用进程，约 100MB）。
+            cmd.append_switch_with_value(
+                Some(&CefString::from("disable-features")),
+                Some(&CefString::from("SpareRendererForSitePerProcess")),
+            );
         }
     }
 }

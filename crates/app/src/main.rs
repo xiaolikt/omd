@@ -16,6 +16,8 @@ mod ghostty_vt;
 use ghostty_vt::{GHOSTTY_MODS_ALT, GHOSTTY_MODS_CTRL, GHOSTTY_MODS_SHIFT, GHOSTTY_MODS_SUPER};
 mod lsp;
 mod browser;
+#[cfg(target_os = "linux")]
+mod x11_embed;
 mod term;
 
 fn uuid_like() -> String {
@@ -15016,7 +15018,9 @@ fn main() {
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(9222);
-        let ok = browser::init(port, &cache);
+        // 子窗口模式不打开 windowless；否则 Chromium 不建平台窗口。
+        let windowless = std::env::var("OMD_BROWSER_CHILD").is_err();
+        let ok = browser::init(port, &cache, windowless);
         // 防止 dsh 的 node 子进程继承 devtools 监听 socket。
         #[cfg(target_os = "linux")]
         browser::close_on_exec_cdp_port(port as u16);

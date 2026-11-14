@@ -4990,6 +4990,7 @@ dependencies = [
  "tokio",
  "url",
  "wgpu",
+ "x11rb",
 ]
 
 [[package]]

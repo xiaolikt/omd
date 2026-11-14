@@ -29,3 +29,5 @@ wgpu = "30"
 # GPUI 的 wgpu 后端：复用它的 device 导入浏览器帧，并提供外部纹理绘制原语。
 gpui-wgpu = { package = "gpui-pre-wgpu", path = "../../vendor/gpui-pre/gpui-pre-wgpu" }
 pollster = "0.4"
+# CEF 子窗口的 X11 宿主窗口（和 gpui-pre-linux 用同一个大版本）。
+x11rb = "0.13"
