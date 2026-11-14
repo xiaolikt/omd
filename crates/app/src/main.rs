@@ -9504,13 +9504,111 @@ impl Element for BrowserElement {
         let y = f32::from(bounds.origin.y) * scale;
         let width = f32::from(bounds.size.width) * scale;
         let height = f32::from(bounds.size.height) * scale;
-        crate::browser::child_bounds(
-            self.index,
-            x.round() as i32,
-            y.round() as i32,
-            width.round() as i32,
-            height.round() as i32,
-        );
+        if crate::browser::osr_mode() {
+            // 无窗口模式：CEF 只等一个 view 尺寸，画面走纹理。
+            crate::browser::resize(
+                self.index,
+                width.round().max(1.) as u32,
+                height.round().max(1.) as u32,
+            );
+            let index = self.index;
+            // CEF 的鼠标坐标是 view 坐标（物理像素），GPUI 给的是窗口逻辑坐标。
+            let to_page = move |position: Point<Pixels>| {
+                (
+                    ((f32::from(position.x) - f32::from(bounds.origin.x)) * scale).round() as i32,
+                    ((f32::from(position.y) - f32::from(bounds.origin.y)) * scale).round() as i32,
+                )
+            };
+            let inside = move |position: Point<Pixels>| {
+                position.x >= bounds.origin.x
+                    && position.x < bounds.origin.x + bounds.size.width
+                    && position.y >= bounds.origin.y
+                    && position.y < bounds.origin.y + bounds.size.height
+            };
+            let mods = |modifiers: gpui_kit::Modifiers| -> u32 {
+                let mut bits = 0;
+                if modifiers.shift {
+                    bits |= crate::browser::EVF_SHIFT;
+                }
+                if modifiers.control {
+                    bits |= crate::browser::EVF_CTRL;
+                }
+                if modifiers.alt {
+                    bits |= crate::browser::EVF_ALT;
+                }
+                if modifiers.platform {
+                    bits |= crate::browser::EVF_META;
+                }
+                bits
+            };
+            window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _window, _cx| {
+                if phase.bubble() && inside(ev.position) {
+                    let (x, y) = to_page(ev.position);
+                    crate::browser::osr_mouse_move(index, x, y, mods(ev.modifiers));
+                }
+            });
+            for (button, cef_button) in [
+                (MouseButton::Left, cef::MouseButtonType::LEFT),
+                (MouseButton::Middle, cef::MouseButtonType::MIDDLE),
+                (MouseButton::Right, cef::MouseButtonType::RIGHT),
+            ] {
+                window.on_mouse_event(move |ev: &MouseDownEvent, phase, _window, _cx| {
+                    if phase.bubble() && inside(ev.position) && ev.button == button {
+                        let (x, y) = to_page(ev.position);
+                        crate::browser::osr_mouse_button(
+                            index,
+                            x,
+                            y,
+                            cef_button,
+                            false,
+                            ev.click_count as i32,
+                            mods(ev.modifiers),
+                        );
+                    }
+                });
+                window.on_mouse_event(move |ev: &MouseUpEvent, phase, _window, _cx| {
+                    if phase.bubble() && ev.button == button {
+                        let (x, y) = to_page(ev.position);
+                        crate::browser::osr_mouse_button(
+                            index,
+                            x,
+                            y,
+                            cef_button,
+                            true,
+                            1,
+                            mods(ev.modifiers),
+                        );
+                    }
+                });
+            }
+            window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, _window, _cx| {
+                if phase.bubble() && inside(ev.position) {
+                    let (x, y) = to_page(ev.position);
+                    let (dx, dy) = match ev.delta {
+                        ScrollDelta::Pixels(delta) => {
+                            (f32::from(delta.x), f32::from(delta.y))
+                        }
+                        ScrollDelta::Lines(delta) => (delta.x * 40., delta.y * 40.),
+                    };
+                    crate::browser::osr_mouse_wheel(
+                        index,
+                        x,
+                        y,
+                        dx.round() as i32,
+                        -dy.round() as i32,
+                        mods(ev.modifiers),
+                    );
+                }
+            });
+        } else {
+            crate::browser::child_bounds(
+                self.index,
+                x.round() as i32,
+                y.round() as i32,
+                width.round() as i32,
+                height.round() as i32,
+            );
+        }
         Some(window.insert_hitbox(bounds, HitboxBehavior::Normal))
     }
 
@@ -9518,13 +9616,28 @@ impl Element for BrowserElement {
         &mut self,
         _: Option<&GlobalElementId>,
         _: Option<&gpui_kit::InspectorElementId>,
-        _: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
-        _: &mut Window,
+        window: &mut Window,
         _: &mut App,
     ) {
-        // 子窗口自己画，GPUI 这块留空。
+        // 有窗口时 CEF 自己画（GPUI 这块留空）；OSR 时把导入的 dmabuf 纹理贴上。
+        if !crate::browser::osr_mode() {
+            return;
+        }
+        let Some((width, height)) = crate::browser::accel_size(self.index) else {
+            return;
+        };
+        window.paint_external_texture(
+            bounds,
+            crate::browser::external_key(),
+            Size {
+                width: DevicePixels(width as i32),
+                height: DevicePixels(height as i32),
+            },
+            Corners::default(),
+        );
     }
 }
 
@@ -15274,7 +15387,9 @@ fn main() {
     // 原生子窗口（零拷贝）需要 X11 父窗口：Wayland 没有子 surface 协议。
     // 默认（OMD_BROWSER=1）仍走 Wayland + OSR，只有显式要求子窗口时才切 X11。
     #[cfg(target_os = "linux")]
-    let app = if std::env::var("OMD_BROWSER_CHILD").is_ok() {
+    let app = if std::env::var("OMD_BROWSER_CHILD").is_ok()
+        || std::env::var("OMD_FORCE_X11").is_ok()
+    {
         let mut environment = gpui_kit::GraphicalEnvironment::detect();
         environment.wayland_display = None;
         app.with_windowing(gpui_kit::WindowingRequest::Windowed(environment))

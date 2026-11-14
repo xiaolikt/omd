@@ -492,6 +492,112 @@ pub fn execute_js(index: usize, code: &str) -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// OSR 输入转发
+// ---------------------------------------------------------------------------
+
+// CEF 的 EVENTFLAG_* 位
+pub const EVF_SHIFT: u32 = 1 << 3;
+pub const EVF_CTRL: u32 = 1 << 1;
+pub const EVF_ALT: u32 = 1 << 0;
+pub const EVF_META: u32 = 1 << 2;
+
+/// 这个进程是否走 windowless（OSR）渲染。OSR 下没有原生子窗口，
+/// 鼠标和键盘都由 GPUI 收下来再转发给 Chromium。
+pub fn osr_mode() -> bool {
+    WINDOWLESS.load(Ordering::Relaxed)
+}
+
+/// 外部纹理在 gpui-wgpu 表里的 key。
+pub fn external_key() -> u32 {
+    EXTERNAL_KEY
+}
+
+/// 最新一帧的尺寸；没有帧时返回 None（此时不画）。
+pub fn accel_size(index: usize) -> Option<(u32, u32)> {
+    slots()
+        .get(index)
+        .and_then(|slot| slot.accel)
+        .filter(|frame| frame.width > 0 && frame.height > 0)
+        .map(|frame| (frame.width, frame.height))
+}
+
+fn host_at(index: usize) -> Option<BrowserHost> {
+    slots()
+        .get(index)
+        .and_then(|slot| slot.browser.as_ref())
+        .and_then(|browser| browser.host())
+}
+
+pub fn osr_mouse_move(index: usize, x: i32, y: i32, modifiers: u32) {
+    if let Some(host) = host_at(index) {
+        host.send_mouse_move_event(Some(&MouseEvent { x, y, modifiers }), 0);
+    }
+}
+
+pub fn osr_mouse_button(
+    index: usize,
+    x: i32,
+    y: i32,
+    button: MouseButtonType,
+    up: bool,
+    click_count: i32,
+    modifiers: u32,
+) {
+    if let Some(host) = host_at(index) {
+        host.send_mouse_click_event(
+            Some(&MouseEvent { x, y, modifiers }),
+            button,
+            i32::from(up),
+            click_count,
+        );
+    }
+}
+
+pub fn osr_mouse_wheel(index: usize, x: i32, y: i32, delta_x: i32, delta_y: i32, modifiers: u32) {
+    if let Some(host) = host_at(index) {
+        host.send_mouse_wheel_event(
+            Some(&MouseEvent { x, y, modifiers }),
+            delta_x,
+            delta_y,
+        );
+    }
+}
+
+pub fn osr_key(
+    index: usize,
+    windows_key_code: i32,
+    character: u16,
+    unmodified: u16,
+    modifiers: u32,
+    up: bool,
+) {
+    let Some(host) = host_at(index) else { return };
+    let event = KeyEvent {
+        size: std::mem::size_of::<KeyEvent>(),
+        type_: if up {
+            KeyEventType::KEYUP
+        } else {
+            KeyEventType::KEYDOWN
+        },
+        modifiers,
+        windows_key_code,
+        native_key_code: 0,
+        is_system_key: 0,
+        character,
+        unmodified_character: unmodified,
+        focus_on_editable_field: 0,
+    };
+    host.send_key_event(Some(&event));
+}
+
+/// OSR 下没有原生焦点可给，只能显式告诉 Chromium。
+pub fn osr_focus(index: usize, focused: bool) {
+    if let Some(host) = host_at(index) {
+        host.set_focus(i32::from(focused));
+    }
+}
+
 /// 取这个槽位的 Browser 句柄。
 fn browser_at(index: usize) -> Option<Browser> {
     slots().get(index).and_then(|slot| slot.browser.clone())
@@ -775,6 +881,12 @@ cef::wrap_app! {
                     Some(&CefString::from("ozone-platform")),
                     Some(&CefString::from("x11")),
                 );
+            }
+            // 没有 GPU 的环境（Xvfb、远程会话）跑 OSR：让 Chromium 退到软件合成，
+            // 否则 GPU 进程反复崩掉。
+            if std::env::var("OMD_BROWSER_CPU").is_ok() {
+                cmd.append_switch(Some(&CefString::from("disable-gpu")));
+                cmd.append_switch(Some(&CefString::from("disable-gpu-compositing")));
             }
             // 少留一个空闲 renderer（Chromium 会提前起一个备用进程，约 100MB）。
             cmd.append_switch_with_value(
