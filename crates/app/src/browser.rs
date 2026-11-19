@@ -198,7 +198,30 @@ pub fn init(remote_port: i32, cache_dir: &std::path::Path, windowless: bool) -> 
         return false;
     }
     *INITIALIZED.lock().unwrap() = true;
+    write_cdp_endpoint(remote_port);
     true
+}
+
+/// 写 CDP 端点描述，供 Playwright / 任一 CDP 客户端直连。
+fn write_cdp_endpoint(port: i32) {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(home).join(".local/share/omd");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let value = serde_json::json!({
+        "port": port,
+        "http": format!("http://127.0.0.1:{port}/json"),
+        "targets": format!("http://127.0.0.1:{port}/json/list"),
+        "version": format!("http://127.0.0.1:{port}/json/version"),
+        "pid": std::process::id(),
+    });
+    let _ = std::fs::write(
+        dir.join("browser.cdp.json"),
+        serde_json::to_string_pretty(&value).unwrap_or_default(),
+    );
 }
 
 /// 当前 CEF 的 Wayland 后端无法分配共享捕获缓冲，使用像素上传而非 DMA-BUF。

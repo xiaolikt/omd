@@ -2575,6 +2575,8 @@ struct Root {
     browser_pins: std::collections::HashMap<usize, Value>,
     /// 每个 browser 最近一次看到的页面 URL（导航后重注入标注层）。
     browser_urls: std::collections::HashMap<usize, String>,
+    /// 浏览器地址历史（最近在前）。
+    browser_history: Vec<String>,
     /// 拾取模式是否已对当前页面生效（导航后要重发）。
     browser_pick_sent: std::collections::HashMap<usize, bool>,
     /// 待注入标注层的槽位（render 里在 UI 线程兑现）。
@@ -3529,6 +3531,7 @@ impl Root {
             browser_inputs: std::collections::HashMap::new(),
             browser_pins: std::collections::HashMap::new(),
             browser_urls: std::collections::HashMap::new(),
+            browser_history: state.browser_history,
             browser_pick_sent: std::collections::HashMap::new(),
             browser_needs_inject: std::collections::HashSet::new(),
             browser_input_subs: Vec::new(),
@@ -4916,6 +4919,7 @@ impl Root {
             "git_signoff": self.git_signoff,
             "browser_home": self.browser_home,
             "browser_cdp_port": self.browser_cdp_port,
+            "browser_history": self.browser_history,
             "spaces": spaces,
             "current_space": self.current_space,
             "selected": self.selected,
@@ -7551,6 +7555,10 @@ impl Root {
                                 .unwrap_or_default();
                             if url != known {
                                 root.browser_urls.insert(index, url.clone());
+                                root.browser_history.retain(|u| *u != url);
+                                root.browser_history.insert(0, url.clone());
+                                root.browser_history.truncate(200);
+                                root.save_state();
                                 root.browser_pins.remove(&index);
                                 root.browser_pick_sent.remove(&index);
                                 browser::annotator_reset(index);
@@ -11164,6 +11172,7 @@ fn browser_pane_element(
     focus: FocusHandle,
     input: Entity<InputState>,
     extra: AnyElement,
+    suggestions: Option<AnyElement>,
 ) -> AnyElement {
     let mut bar = div()
         .h(px(HEADER_H))
@@ -11215,6 +11224,8 @@ fn browser_pane_element(
         .flex()
         .flex_col()
         .child(bar)
+        // 地址栏聚焦时的历史建议（下拉在工具条和页面之间）。
+        .children(suggestions)
         // BrowserElement 自己是 flex 子项（grow=1, basis=0），直接挂在列里；
         // 中间再包一层普通 div 会让它拿不到剩余高度（实测塌成 1px）。
         .child(BrowserElement { index, focus })
@@ -17677,7 +17688,85 @@ impl Render for Root {
                             .child(send)
                             .into_any_element()
                     };
-                    leaf_elements.insert(pane_id, browser_pane_element(index, focus, input, extra));
+                    let suggestions = {
+                        let focused = input.read(cx).focus_handle(cx).is_focused(window);
+                        let value = input.read(cx).value().to_string();
+                        if focused {
+                            let current = browser::current_url(index).unwrap_or_default();
+                            let filter = if value == current {
+                                String::new()
+                            } else {
+                                value.to_lowercase()
+                            };
+                            let hits: Vec<String> = self
+                                .browser_history
+                                .iter()
+                                .filter(|u| **u != current)
+                                .filter(|u| {
+                                    filter.is_empty()
+                                        || u.to_lowercase().contains(&filter)
+                                })
+                                .take(6)
+                                .cloned()
+                                .collect();
+                            if hits.is_empty() {
+                                None
+                            } else {
+                                let mut list = div()
+                                    .id(SharedString::from(format!(
+                                        "browser-hist-list-{index}"
+                                    )))
+                                    .flex()
+                                    .flex_col()
+                                    .flex_shrink_0()
+                                    .max_h(px(180.))
+                                    .overflow_y_scroll()
+                                    .bg(rgb(0x14171d))
+                                    .border_b_1()
+                                    .border_color(rgb(0x23272f));
+                                for url in hits {
+                                    let target = url.clone();
+                                    list = list.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "browser-hist-{index}-{url}"
+                                            )))
+                                            .px(px(10.))
+                                            .py(px(4.))
+                                            .text_xs()
+                                            .text_color(rgb(0x9aa3b5))
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgb(0x1c222c)))
+                                            .child(SharedString::from(url))
+                                            .on_click(cx.listener(
+                                                move |this, _ev, win, cx| {
+                                                    if let Some(input) =
+                                                        this.browser_inputs.get(&index)
+                                                    {
+                                                        input.update(cx, |state, cx| {
+                                                            state.set_value(
+                                                                target.clone(),
+                                                                win,
+                                                                cx,
+                                                            )
+                                                        });
+                                                    }
+                                                    browser::navigate(index, &target);
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    );
+                                }
+                                Some(list.into_any_element())
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    leaf_elements.insert(
+                        pane_id,
+                        browser_pane_element(index, focus, input, extra, suggestions),
+                    );
                 }
                 continue;
             }
@@ -19165,6 +19254,8 @@ struct UiState {
     browser_home: String,
     /// 本地偏好：浏览器 CDP 端口。
     browser_cdp_port: u16,
+    /// 浏览器地址历史（最近访问在前，去重，上限 200）。
+    browser_history: Vec<String>,
 }
 
 fn layout_json_has_content(value: &Value) -> bool {
@@ -19206,6 +19297,7 @@ fn load_ui_state_inner() -> UiState {
         git_signoff: false,
         browser_home: "https://example.com".to_string(),
         browser_cdp_port: 9222,
+        browser_history: Vec::new(),
     };
     let Ok(text) = std::fs::read_to_string(ui_state_path()) else {
         return empty();
@@ -19441,6 +19533,17 @@ fn load_ui_state_inner() -> UiState {
             .and_then(|v| v.as_u64())
             .map(|v| v as u16)
             .unwrap_or(9222),
+        browser_history: value
+            .get("browser_history")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .take(200)
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
