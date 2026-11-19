@@ -112,6 +112,9 @@ fn setup_fontconfig() {
         };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') && !SHOW_HIDDEN.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
             if prefixes.iter().any(|prefix| name.starts_with(prefix)) {
                 let path = PathBuf::from(dir).join(&name);
                 if !picked.contains(&path) {
@@ -323,6 +326,9 @@ struct FileItem {
     size: u64,
 }
 
+/// 文件树是否显示点文件（本地偏好）。
+static SHOW_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 fn read_dir_items(dir: &str) -> Vec<FileItem> {
     let mut items: Vec<FileItem> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -376,6 +382,7 @@ enum PaletteAction {
     SwitchSpace(String),
     NewSession,
     TermPane(BlockPlacement),
+    BrowserPane,
     OpenModels,
     OpenSettings,
     OpenFiles,
@@ -2499,7 +2506,6 @@ struct Root {
     settings_tab: SettingsTab,
     /// pluginManager/listPlugins 的结果
     plugins_doc: Value,
-    account_doc: Value,
     settings_tab_error: Option<String>,
     /// 左侧文件栏（纯 Rust 读盘，Tern 风格）
     files_sidebar: bool,
@@ -2524,6 +2530,16 @@ struct Root {
     >,
     /// path -> (errors, warnings)
     diag_counts: std::collections::HashMap<String, (usize, usize)>,
+    /// 本地偏好：工具调用细节展示。
+    work_details: String,
+    /// 本地偏好：文件树显示点文件。
+    files_show_hidden: bool,
+    /// 本地偏好：提交附加 Signed-off-by。
+    git_signoff: bool,
+    /// 本地偏好：浏览器首页。
+    browser_home: String,
+    /// 本地偏好：浏览器 CDP 端口。
+    browser_cdp_port: u16,
     /// server key -> 状态
     lsp_state: std::collections::HashMap<String, lsp::ServerState>,
     /// 已经 didOpen 过的文件路径
@@ -2551,6 +2567,62 @@ struct Root {
     split_dsh_pending: bool,
     /// 当前悬停展开的分屏菜单：(leaf, 方向)
     split_hover: Option<(u64, SplitDir)>,
+    /// CEF 的消息泵只起一次（首次打开浏览器时）。
+    browser_pump_started: bool,
+    /// 每个浏览器槽位的地址栏输入框。
+    browser_inputs: std::collections::HashMap<usize, Entity<InputState>>,
+    /// 每个 browser 当前 pin 集合（标注层回传的 JSON）。
+    browser_pins: std::collections::HashMap<usize, Value>,
+    /// 每个 browser 最近一次看到的页面 URL（导航后重注入标注层）。
+    browser_urls: std::collections::HashMap<usize, String>,
+    /// 拾取模式是否已对当前页面生效（导航后要重发）。
+    browser_pick_sent: std::collections::HashMap<usize, bool>,
+    /// 待注入标注层的槽位（render 里在 UI 线程兑现）。
+    browser_needs_inject: std::collections::HashSet<usize>,
+    /// 地址栏的回车订阅（订阅必须留住，否则立刻失效）。
+    browser_input_subs: Vec<Subscription>,
+    /// credentials/describe 的结果：ref -> { configured, writable }。
+    credentials_doc: Value,
+    /// 正在编辑的 secret：(命名空间, 字段名, ref)。
+    settings_secret_edit: Option<(String, String, String)>,
+    /// 模型编辑器：关闭 / 编辑某个 models 数组里的第 index 个（None = 新增）。
+    model_draft: Option<ModelTarget>,
+    model_id_input: Entity<InputState>,
+    model_name_input: Entity<InputState>,
+    model_ctx_input: Entity<InputState>,
+    model_max_input: Entity<InputState>,
+    model_input_subs: Vec<Subscription>,
+    /// provider 编辑器：None=关闭，Some(None)=新增，Some(Some(route))=编辑。
+    provider_draft: Option<Option<String>>,
+    provider_api: String,
+    provider_id_input: Entity<InputState>,
+    provider_name_input: Entity<InputState>,
+    provider_base_input: Entity<InputState>,
+    provider_keyenv_input: Entity<InputState>,
+    provider_models_input: Entity<InputState>,
+    /// provider 的 API key（只写，不回显）。
+    provider_apikey_input: Entity<InputState>,
+    /// provider 列表的搜索框。
+    provider_search: Entity<InputState>,
+    /// llm/listConfigurableProviders 的结果（dsh/pi-ai 内置的全部 provider）。
+    provider_catalog: Value,
+    /// DeepSeek 账号状态（account/getState）。
+    account_doc: Value,
+    /// account/getProfile 的结果。
+    account_profile: Value,
+    /// account/getBalance 的结果。
+    account_balance: Value,
+    /// agentPresets/list 的结果。
+    agent_presets: Value,
+    /// 已发起登录、还没把 authorizeUrl 打开。
+    account_pending_signin: bool,
+    /// “+ Add model provider” 展开中。
+    adding_provider: bool,
+    /// 添加面板的 tab：0 第三方模型提供商，1 自定义模型 API。
+    provider_add_tab: u8,
+    /// 表单里的「自定义设置」是否展开。
+    customized_open: bool,
+    provider_input_subs: Vec<Subscription>,
     /// 正在等新会话落到哪一个分屏：(leaf, 方向)
     pending_split: Option<(u64, SplitDir)>,
     /// 最近点过的终端 pane。getCurrentPane 对不上 tty 时用它。
@@ -2579,7 +2651,13 @@ struct Root {
     /// 正在编辑的设置项：(ns, path, revision, 是否数字)
     settings_edit: Option<(String, Vec<String>, i64, bool)>,
     settings_input: Entity<InputState>,
+    /// 设置页左侧的搜索框。
+    settings_search: Entity<InputState>,
     plugins_input: Entity<InputState>,
+    /// 设置 → Browser：首页地址。
+    browser_home_input: Entity<InputState>,
+    /// 设置 → Browser：CDP 端口。
+    browser_port_input: Entity<InputState>,
     /// 下一个新 panel 要挂进的 tab（panel 条的「+」用）
     pending_panel_tab: Option<String>,
     /// 拖动 panel：panel id + 锚点 x（每越过一档就挪一格）
@@ -2675,6 +2753,66 @@ async fn serve_control(
             let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
             let params = request.get("params").cloned().unwrap_or(Value::Null);
             let response = match method {
+                "browser.input" => {
+                    // 测试/自动化入口：与真实鼠标键盘同一条 OSR 转发路径。
+                    let index = params
+                        .get("index")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                        .or_else(browser::primary);
+                    match index {
+                        Some(index) => {
+                            let mut actions: Vec<&str> = Vec::new();
+                            if let Some(click) = params.get("click").and_then(|v| v.as_array()) {
+                                if click.len() == 2 {
+                                    let x = click[0].as_i64().unwrap_or(0) as i32;
+                                    let y = click[1].as_i64().unwrap_or(0) as i32;
+                                    browser::osr_focus_slot(index, true);
+                                    browser::osr_mouse_move(index, x, y, 0);
+                                    browser::osr_mouse_button(
+                                        index, x, y, cef::MouseButtonType::LEFT, false, 1, 0,
+                                    );
+                                    browser::osr_mouse_button(
+                                        index, x, y, cef::MouseButtonType::LEFT, true, 1, 0,
+                                    );
+                                    actions.push("click");
+                                }
+                            }
+                            if let Some(key) = params.get("key").and_then(|v| v.as_str()) {
+                                let ch = key.chars().next().unwrap_or('a');
+                                let vk = ch.to_ascii_uppercase() as i32;
+                                browser::osr_focus_slot(index, true);
+                                browser::osr_key(index, vk, ch as u16, 0, false);
+                                browser::osr_key(index, vk, 0, 0, true);
+                                actions.push("key");
+                            }
+                            json!({ "ok": true, "index": index, "actions": actions })
+                        }
+                        None => json!({ "ok": false, "error": "no browser" }),
+                    }
+                }
+                "browser.eval" => {
+                    let index = params
+                        .get("index")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                        .or_else(browser::primary);
+                    match (index, params.get("code").and_then(|v| v.as_str())) {
+                        (Some(index), Some(code)) => {
+                            json!({ "ok": browser::execute_js(index, code), "index": index })
+                        }
+                        _ => json!({ "ok": false, "error": "need code" }),
+                    }
+                }
+                "browser.pins" => {
+                    let snapshot: Vec<Value> = browser::pins_snapshot()
+                        .into_iter()
+                        .map(|(index, json)| {
+                            json!({ "index": index, "pins": serde_json::from_str::<Value>(&json).unwrap_or(Value::Null) })
+                        })
+                        .collect();
+                    json!({ "ok": true, "browsers": snapshot })
+                }
                 "block.list" => {
                     let up = terminal_up.lock().await;
                     let buffers = terminal_buffers.lock().await;
@@ -3222,90 +3360,6 @@ impl Root {
             eprintln!("[browser] created index={index:?}");
             browser::set_primary(index);
             browser_index = index;
-            // CEF 的消息泵必须跑在 UI 线程上（external_message_pump）。
-            let pump_rx = browser::pump_channel();
-            cx.spawn(async move |this, cx: &mut AsyncApp| {
-                let mut last_seq = u64::MAX;
-                let mut last_accel_seq = u64::MAX;
-                let mut shot_done = false;
-                let mut frames = 0u64;
-                let start = std::time::Instant::now();
-                loop {
-                    /*
-                    按 CEF 自己的调度泵：空闲时它给 i32::MAX，我们只做低频兜底
-                    轮询；有活时给 0~16ms，用通道立刻叫醒。固定 8ms 空转会
-                    让 Chromium 的合成器以 125Hz 狂转（实测多烧 50 个点 CPU）。
-                    */
-                    /*
-                    CEF 在窗口化模式下几乎一直请求 delay=0（合成器总要下一帧），
-                    不钳制就会以 500 次/秒泵、把主线程烧到 40%+。和 Ghostex 一样
-                    钳到 [8ms, 33ms]：8ms 够 120Hz，33ms 是空闲上限。
-                    */
-                    let min_ms: i64 = std::env::var("OMD_PUMP_MIN")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(8);
-                    let delay = match browser::pump_delay_ms() {
-                        d if d <= 0 => min_ms,
-                        d if d >= 1000 => 200,
-                        d => d.clamp(min_ms, 33),
-                    };
-                    let wait = std::time::Duration::from_millis(delay as u64);
-                    let sleep = cx.background_executor().timer(wait);
-                    let _ = futures_util::future::select(
-                        Box::pin(sleep),
-                        Box::pin(pump_rx.recv()),
-                    )
-                    .await;
-                    if std::env::var("OMD_PUMP_OFF").is_err() {
-                        browser::pump();
-                    }
-                    if let Some(index) = index {
-                        // GPU 路径：帧到了就请求一次重绘（GPUI 不会自己刷新）。
-                        if let Some(accel) = browser::latest_accel(index) {
-                            if accel.seq != last_accel_seq {
-                                last_accel_seq = accel.seq;
-                                let _ = this.update(cx, |_, cx| cx.notify());
-                                for handle in cx.update(|cx| cx.windows()) {
-                                    let _ = handle.update(cx, |_, window, _| window.refresh());
-                                }
-                                if std::env::var("OMD_BROWSER_DEBUG").is_ok() {
-                                    eprintln!("[pump] accel seq={} refreshed", accel.seq);
-                                }
-                            }
-                        }
-                        if let Some(frame) = browser::latest_frame(index) {
-                            if frame.seq != last_seq {
-                                last_seq = frame.seq;
-                                frames += 1;
-                                if frames <= 3 || frames % 30 == 0 {
-                                    eprintln!(
-                                        "[browser] frame #{frames} {}x{} {:.2}s",
-                                        frame.width,
-                                        frame.height,
-                                        start.elapsed().as_secs_f32()
-                                    );
-                                    if frames == 1 {
-                                        // 冒烟：首帧落盘，肉眼核对页面内容。
-                                        let mut rgba = frame.bgra.clone();
-                                        for px in rgba.chunks_exact_mut(4) {
-                                            px.swap(0, 2);
-                                        }
-                                        if let Some(img) = image::RgbaImage::from_raw(
-                                            frame.width,
-                                            frame.height,
-                                            rgba,
-                                        ) {
-                                            let _ = img.save("/tmp/cef-osr-frame.png");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            })
-            .detach();
         }
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Message… Enter to send · Shift+Enter for newline"));
         let question_input =
@@ -3314,7 +3368,48 @@ impl Root {
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Name…"));
         let commit_input = cx.new(|cx| InputState::new(window, cx).placeholder("Why this change..."));
         let settings_input = cx.new(|cx| InputState::new(window, cx).placeholder("Value…"));
+        let settings_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search settings"));
+        let model_id_input = cx.new(|cx| InputState::new(window, cx).placeholder("model id"));
+        let model_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("display name"));
+        let model_ctx_input = cx.new(|cx| InputState::new(window, cx).placeholder("context window"));
+        let model_max_input = cx.new(|cx| InputState::new(window, cx).placeholder("max output tokens"));
+        let provider_id_input = cx.new(|cx| InputState::new(window, cx).placeholder("route id"));
+        let provider_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("display name"));
+        let provider_base_input = cx.new(|cx| InputState::new(window, cx).placeholder("Leave blank to use the default endpoint"));
+        let provider_keyenv_input = cx.new(|cx| InputState::new(window, cx).placeholder("API_KEY_ENV"));
+        let provider_models_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("model ids, comma separated"));
+        let provider_apikey_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("paste API key (stored in credentials)"));
+        let provider_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search providers…"));
+        let mut provider_input_subs = Vec::new();
+        for input in [
+            &provider_id_input,
+            &provider_name_input,
+            &provider_base_input,
+            &provider_keyenv_input,
+            &provider_models_input,
+            &provider_apikey_input,
+        ] {
+            provider_input_subs.push(cx.subscribe(input, |root, _input, ev: &InputEvent, cx| {
+                if let InputEvent::PressEnter { .. } = ev {
+                    root.save_provider_draft(cx);
+                }
+            }));
+        }
+        let mut model_input_subs = Vec::new();
+        for input in [&model_id_input, &model_name_input, &model_ctx_input, &model_max_input] {
+            model_input_subs.push(cx.subscribe(input, |root, _input, ev: &InputEvent, cx| {
+                if let InputEvent::PressEnter { .. } = ev {
+                    root.save_model_draft(cx);
+                }
+            }));
+        }
         let plugins_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter plugins…"));
+        let browser_home_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com"));
+        let browser_port_input = cx.new(|cx| InputState::new(window, cx).placeholder("9222"));
         let palette_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Run a command or go to a pane…"));
         // 启动即聚焦输入框（OMD_COMPACT=1 时故意不聚焦，用来看收起的输入条）
@@ -3325,13 +3420,7 @@ impl Root {
         }
 
         let enter_sub = cx.subscribe(&input, |this, input_entity, ev: &InputEvent, cx| {
-            if let InputEvent::Change = ev {
-                let v = input_entity.read(cx).value();
-                eprintln!("[ui] TYPING -> value is now {:?}", v);
-            }
             if let InputEvent::PressEnter { shift, .. } = ev {
-                let value = input_entity.read(cx).value();
-                eprintln!("[ui] PressEnter! value={value:?} shift={shift}");
                 let shift = *shift;
                 if !shift {
                     this.send_prompt(cx);
@@ -3436,6 +3525,40 @@ impl Root {
             drag_pane: None,
             drag_split: None,
             drag_leaf: None,
+            browser_pump_started: false,
+            browser_inputs: std::collections::HashMap::new(),
+            browser_pins: std::collections::HashMap::new(),
+            browser_urls: std::collections::HashMap::new(),
+            browser_pick_sent: std::collections::HashMap::new(),
+            browser_needs_inject: std::collections::HashSet::new(),
+            browser_input_subs: Vec::new(),
+            credentials_doc: Value::Null,
+            settings_secret_edit: None,
+            model_draft: None,
+            model_id_input,
+            model_name_input,
+            model_ctx_input,
+            model_max_input,
+            model_input_subs,
+            provider_draft: None,
+            provider_api: "openai-completions".to_string(),
+            provider_id_input,
+            provider_name_input,
+            provider_base_input,
+            provider_keyenv_input,
+            provider_models_input,
+            provider_apikey_input,
+            provider_search,
+            provider_catalog: Value::Null,
+            account_doc: Value::Null,
+            account_profile: Value::Null,
+            account_balance: Value::Null,
+            agent_presets: Value::Null,
+            account_pending_signin: false,
+            adding_provider: false,
+            provider_add_tab: 0,
+            customized_open: false,
+            provider_input_subs,
             term_tabs: state.term_tabs.iter().cloned().collect(),
             show_palette: false,
             palette_tab: PaletteTab::All,
@@ -3479,7 +3602,6 @@ impl Root {
             scroll_tab_steps: 0,
             settings_tab: SettingsTab::General,
             plugins_doc: Value::Null,
-            account_doc: Value::Null,
             settings_tab_error: None,
             files_sidebar: state.files_sidebar,
             files_root: state.files_root.clone(),
@@ -3492,6 +3614,11 @@ impl Root {
             lsp_ev_tx,
             _lsp_events: lsp_events,
             editor_diags: std::collections::HashMap::new(),
+            work_details: state.work_details,
+            files_show_hidden: state.files_show_hidden,
+            git_signoff: state.git_signoff,
+            browser_home: state.browser_home,
+            browser_cdp_port: state.browser_cdp_port,
             diag_counts: std::collections::HashMap::new(),
             lsp_state: std::collections::HashMap::new(),
             lsp_active: std::collections::HashSet::new(),
@@ -3522,7 +3649,10 @@ impl Root {
             settings_error: None,
             settings_edit: None,
             settings_input,
+            settings_search,
             plugins_input,
+            browser_home_input,
+            browser_port_input,
             pending_panel_tab: None,
             tab_drag: None,
             renaming: None,
@@ -3558,6 +3688,14 @@ impl Root {
             pending_question_clear: false,
             _enter_sub: enter_sub,
         };
+        {
+            let home = root.browser_home.clone();
+            let port = root.browser_cdp_port.to_string();
+            root.browser_home_input
+                .update(cx, |state, cx| state.set_value(home, window, cx));
+            root.browser_port_input
+                .update(cx, |state, cx| state.set_value(port, window, cx));
+        }
         // 开发用：用合成块压测 UI 构建（首个 render + 布局/pkg 成本）。
         if let Ok(n) = std::env::var("OMD_STRESS_BLOCKS") {
             let n: usize = n.trim().parse().unwrap_or(0);
@@ -3631,6 +3769,10 @@ impl Root {
             });
             stamp("terminal tab requested via OMD_NEW_TERM_TAB");
         }
+        if std::env::var("OMD_BROWSER_TAB_TEST").is_ok() {
+            root.open_browser_tab(cx);
+            stamp("browser tab requested via OMD_BROWSER_TAB_TEST");
+        }
         if std::env::var("OMD_MOVE_PANEL").is_ok() {
             // 冒烟：把第二个 panel 往右挪一格，验证顺序与持久化
             let second = root
@@ -3668,7 +3810,6 @@ impl Root {
             root.show_settings = true;
             let tab = match which.as_str() {
                 "plugins" => SettingsTab::Plugins,
-                "account" => SettingsTab::Account,
                 _ => SettingsTab::General,
             };
             root.open_settings_tab(tab, window, cx);
@@ -3773,7 +3914,9 @@ impl Root {
         }
         // 空间/布局是异步恢复的，new 结束时 current_space 可能还没就绪；
         // 浏览器 pane 改在第一次 render（空间已就绪）时挂，见 render 开头。
-        let _ = browser_index;
+        if browser_index.is_some() {
+            root.start_browser_pump(cx);
+        }
         stamp("Root::new done");
         root
     }
@@ -4164,14 +4307,6 @@ impl Root {
                             eprintln!("[ui] plugins list: {count} entries");
                             self.plugins_doc = value;
                         }
-                        "account/state" => {
-                            let keys = value
-                                .as_object()
-                                .map(|map| map.keys().cloned().collect::<Vec<_>>().join(","))
-                                .unwrap_or_else(|| value.to_string());
-                            eprintln!("[ui] account state keys: {keys}");
-                            self.account_doc = value;
-                        }
                         "plugins/toggle" => {
                             // 重新拉一遍清单
                             let _ = self.cmds.send_blocking(Cmd::Call {
@@ -4187,6 +4322,72 @@ impl Root {
                                 .and_then(|v| v.as_array())
                                 .cloned()
                                 .unwrap_or_default();
+                        }
+                        "agent/presets" => {
+                            self.agent_presets = value;
+                            cx.notify();
+                        }
+                        "agent/presets/select" => {
+                            self.reload_agent_presets();
+                            cx.notify();
+                        }
+                        "account/profile" => {
+                            self.account_profile = value;
+                            cx.notify();
+                        }
+                        "account/balance" => {
+                            self.account_balance = value;
+                            cx.notify();
+                        }
+                        "account/state" => {
+                            // 登录尝试就绪后拿到 authorizeUrl，只打开一次。
+                            if self.account_pending_signin {
+                                if let Some(url) = value
+                                    .get("attempt")
+                                    .and_then(|attempt| attempt.get("authorizeUrl"))
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string)
+                                {
+                                    let _ = std::process::Command::new("xdg-open")
+                                        .arg(url)
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
+                                        .spawn();
+                                    self.account_pending_signin = false;
+                                }
+                                if value
+                                    .get("status")
+                                    .and_then(|v| v.as_str())
+                                    .map(|status| status == "credential-stored")
+                                    .unwrap_or(false)
+                                {
+                                    self.account_pending_signin = false;
+                                    self.reload_account_details();
+                                }
+                            }
+                            self.account_doc = value;
+                            cx.notify();
+                        }
+                        "account/signin" => {
+                            self.account_doc = value;
+                            cx.notify();
+                        }
+                        "account/signout" => {
+                            self.reload_account();
+                            cx.notify();
+                        }
+                        "llm/providers" => {
+                            self.provider_catalog = value;
+                            self.reload_credentials();
+                            cx.notify();
+                        }
+                        "credentials/describe" => {
+                            self.credentials_doc = value;
+                            cx.notify();
+                        }
+                        "credentials/set" | "credentials/unset" => {
+                            self.reload_credentials();
+                            self.reload_settings();
                         }
                         "settings/describe" => {
                             let names: Vec<String> = value
@@ -4211,6 +4412,8 @@ impl Root {
                             self.settings_doc = value;
                             self.settings_loading = false;
                             self.settings_error = None;
+                            self.reload_credentials();
+                            cx.notify();
                         }
                         _ => {
                             if tag.starts_with("settings/") {
@@ -4221,7 +4424,7 @@ impl Root {
                     },
                     Err(err) => {
                         eprintln!("[ui] rpc error {endpoint}: {}", err.chars().take(300).collect::<String>());
-                        if tag == "plugins/list" || tag == "account/state" || tag == "plugins/toggle" {
+                        if tag == "plugins/list" || tag == "plugins/toggle" {
                             self.settings_tab_error =
                                 Some(err.chars().take(160).collect::<String>());
                         }
@@ -4235,6 +4438,7 @@ impl Root {
                         if tag.starts_with("settings/") || tag == "settings/describe" {
                             self.settings_loading = false;
                             self.settings_error = Some(format!("{endpoint}: {err}"));
+                            cx.notify();
                         }
                     }
                 }
@@ -4520,6 +4724,28 @@ impl Root {
                 self.panes.push(pane);
                 return Layout::Leaf(id);
             }
+            if leaf == "browser" {
+                // 启动桩（OMD_BROWSER=1）可能已经建了浏览器实例；恢复布局时
+                // 复用（已有 pane 直接指过去，只有实例没 pane 就用现有实例），
+                // 避免双实例（两个槽位抢 CEF id，resize/paint 全错位）。
+                if let Some(existing) = self.panes.iter().find(|p| p.browser.is_some()) {
+                    return Layout::Leaf(existing.id);
+                }
+                let reused = browser::primary();
+                let url = value.get("url").and_then(|v| v.as_str());
+                let Some(index) = (match reused {
+                    Some(index) => Some(index),
+                    None => self.spawn_browser(url, cx),
+                }) else {
+                    return Layout::Leaf(0);
+                };
+                let id = next_pane_id();
+                let mut pane = Block::new(id, BlockPlacement::Right, cx.focus_handle());
+                pane.tab_id = Some(tab_id.to_string());
+                pane.browser = Some(index);
+                self.panes.push(pane);
+                return Layout::Leaf(id);
+            }
             if leaf == "editor" {
                 let path = value
                     .get("path")
@@ -4627,6 +4853,11 @@ impl Root {
                             })
                         } else if let Some(path) = pane.editor_path.as_deref() {
                             json!({ "leaf": "editor", "path": path })
+                        } else if let Some(index) = pane.browser {
+                            json!({
+                                "leaf": "browser",
+                                "url": browser::current_url(index).unwrap_or_default(),
+                            })
                         } else if pane.term_id.is_empty() {
                             // 没有终端 = 分屏里的 dsh 聊天面板
                             json!({ "leaf": "chat", "session": pane.session.clone() })
@@ -4680,6 +4911,11 @@ impl Root {
             })
             .collect();
         let value = json!({
+            "work_details": self.work_details,
+            "files_show_hidden": self.files_show_hidden,
+            "git_signoff": self.git_signoff,
+            "browser_home": self.browser_home,
+            "browser_cdp_port": self.browser_cdp_port,
             "spaces": spaces,
             "current_space": self.current_space,
             "selected": self.selected,
@@ -5167,6 +5403,19 @@ impl Root {
 
     /// 提交设置项编辑：字符串/数字都走 settings/mutate。
     fn commit_setting_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_ns, _key, reference)) = self.settings_secret_edit.take() {
+            let raw = self.settings_input.read(cx).value().trim().to_string();
+            if !raw.is_empty() {
+                let _ = self.cmds.send_blocking(Cmd::Call {
+                    tag: "credentials/set".to_string(),
+                    endpoint: "credentials/set".to_string(),
+                    args: json!({ "ref": reference, "value": raw }),
+                });
+            }
+            self.input.read(cx).focus_handle(cx).focus(window, cx);
+            cx.notify();
+            return;
+        }
         let Some((ns, path, revision, is_number)) = self.settings_edit.take() else {
             return;
         };
@@ -5333,10 +5582,11 @@ impl Root {
             self.focus_commit(window, cx);
             return;
         }
-        let ok = if self.git_amend {
-            self.run_git(&["commit", "--amend", "-m", &value])
-        } else {
-            self.run_git(&["commit", "-m", &value])
+        let ok = match (self.git_amend, self.git_signoff) {
+            (true, true) => self.run_git(&["commit", "--amend", "--signoff", "-m", &value]),
+            (true, false) => self.run_git(&["commit", "--amend", "-m", &value]),
+            (false, true) => self.run_git(&["commit", "--signoff", "-m", &value]),
+            (false, false) => self.run_git(&["commit", "-m", &value]),
         };
         if ok {
             self.commit_input
@@ -6116,7 +6366,13 @@ impl Root {
         self.settings_tab = tab;
         self.settings_tab_error = None;
         match tab {
-            SettingsTab::General => self.reload_settings(),
+            SettingsTab::Account => {
+                self.reload_account();
+                self.reload_account_details();
+            }
+            SettingsTab::Presets => {
+                self.reload_agent_presets();
+            }
             SettingsTab::Plugins => {
                 self.plugins_input
                     .update(cx, |state, cx| state.set_value("", window, cx));
@@ -6125,13 +6381,14 @@ impl Root {
                     endpoint: "pluginManager/listPlugins".to_string(),
                     args: json!({}),
                 });
+                self.reload_settings();
             }
-            SettingsTab::Account => {
-                let _ = self.cmds.send_blocking(Cmd::Call {
-                    tag: "account/state".to_string(),
-                    endpoint: "account/getState".to_string(),
-                    args: json!({}),
-                });
+            _ => {
+                self.reload_settings();
+                if tab == SettingsTab::Models {
+                    self.reload_provider_catalog();
+                    self.reload_account();
+                }
             }
         }
     }
@@ -6146,12 +6403,708 @@ impl Root {
         });
     }
 
+    /// 某一页的 revision（写回时带上，避免覆盖别人的并发修改）。
+    fn ns_revision(&self, ns: &str) -> i64 {
+        self.settings_doc
+            .get("namespaces")
+            .and_then(|v| v.as_array())
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|view| view.get("ns").and_then(|v| v.as_str()) == Some(ns))
+            })
+            .and_then(|view| view.get("revision"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+    }
+
+    /// llm-deepseek 的模型数组 + revision。
+    fn llm_models(&self) -> (i64, Vec<Value>) {
+        let view = self
+            .settings_doc
+            .get("namespaces")
+            .and_then(|v| v.as_array())
+            .and_then(|items| {
+                items.iter().find(|ns| {
+                    ns.get("ns").and_then(|v| v.as_str()) == Some("llm-deepseek")
+                })
+            });
+        let revision = view
+            .and_then(|view| view.get("revision"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let models = view
+            .and_then(|view| view.get("value"))
+            .and_then(|value| value.get("models"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        (revision, models)
+    }
+
+    /// llm-pi-ai 的 provider 路由表 + revision。
+    fn pi_providers(&self) -> (i64, serde_json::Map<String, Value>) {
+        let view = self
+            .settings_doc
+            .get("namespaces")
+            .and_then(|v| v.as_array())
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|ns| ns.get("ns").and_then(|v| v.as_str()) == Some("llm-pi-ai"))
+            });
+        let revision = view
+            .and_then(|view| view.get("revision"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let providers = view
+            .and_then(|view| view.get("value"))
+            .and_then(|value| value.get("providers"))
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        (revision, providers)
+    }
+
+    fn open_provider_draft(
+        &mut self,
+        route: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adding_provider = false;
+        let (_, providers) = self.pi_providers();
+        let existing = route
+            .as_ref()
+            .and_then(|key| providers.get(key))
+            .cloned();
+        let text = |value: Option<&Value>| {
+            value
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let id = route.clone().unwrap_or_default();
+        let deepseek = route.as_deref() == Some("deepseek-official");
+        let ds_value = if deepseek {
+            self.settings_doc
+                .get("namespaces")
+                .and_then(|v| v.as_array())
+                .and_then(|items| {
+                    items.iter().find(|ns| {
+                        ns.get("ns").and_then(|v| v.as_str()) == Some("llm-deepseek")
+                    })
+                })
+                .and_then(|ns| ns.get("value"))
+                .cloned()
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        let name = if deepseek {
+            "DeepSeek".to_string()
+        } else {
+            text(existing.as_ref().and_then(|v| v.get("displayName")))
+        };
+        let base = if deepseek {
+            text(Some(&ds_value).and_then(|v| v.get("baseURL")))
+        } else {
+            text(existing.as_ref().and_then(|v| v.get("baseURL")))
+        };
+        let keyenv = if deepseek {
+            "DEEPSEEK_API_KEY".to_string()
+        } else {
+            text(existing.as_ref().and_then(|v| v.get("apiKeyEnv")))
+        };
+        let api = existing
+            .as_ref()
+            .and_then(|v| v.get("api"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("openai-completions")
+            .to_string();
+        let model_ids = existing
+            .as_ref()
+            .and_then(|v| v.get("models"))
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("id").and_then(|v| v.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        self.provider_id_input
+            .update(cx, |state, cx| state.set_value(id, window, cx));
+        self.provider_name_input
+            .update(cx, |state, cx| state.set_value(name, window, cx));
+        self.provider_base_input
+            .update(cx, |state, cx| state.set_value(base, window, cx));
+        self.provider_keyenv_input
+            .update(cx, |state, cx| state.set_value(keyenv, window, cx));
+        self.provider_models_input
+            .update(cx, |state, cx| state.set_value(model_ids, window, cx));
+        self.provider_apikey_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.provider_id_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        self.provider_api = api;
+        self.provider_draft = Some(route);
+        cx.notify();
+    }
+
+    /// 用预设填表单（新 provider）。
+    fn apply_provider_preset(
+        &mut self,
+        preset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(preset) = PROVIDER_PRESETS.get(preset) else {
+            return;
+        };
+        self.provider_id_input
+            .update(cx, |state, cx| state.set_value(preset.route, window, cx));
+        self.provider_name_input
+            .update(cx, |state, cx| state.set_value(preset.name, window, cx));
+        self.provider_base_input
+            .update(cx, |state, cx| state.set_value(preset.base, window, cx));
+        self.provider_keyenv_input
+            .update(cx, |state, cx| state.set_value(preset.key_env, window, cx));
+        self.provider_models_input
+            .update(cx, |state, cx| state.set_value(preset.models.join(", "), window, cx));
+        self.provider_apikey_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.provider_api = preset.api.to_string();
+        self.provider_apikey_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        cx.notify();
+    }
+
+    /// 读 DeepSeek 账号状态。
+    fn reload_account(&mut self) {
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "account/state".to_string(),
+            endpoint: "account/getState".to_string(),
+            args: json!({}),
+        });
+    }
+
+    /// 读账号资料与余额（需要 client 元数据）。
+    fn reload_account_details(&mut self) {
+        let client = json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "locale": "zh-CN",
+            "timezoneOffsetSeconds": 0,
+        });
+        for (tag, endpoint) in [
+            ("account/profile", "account/getProfile"),
+            ("account/balance", "account/getBalance"),
+        ] {
+            let _ = self.cmds.send_blocking(Cmd::Call {
+                tag: tag.to_string(),
+                endpoint: endpoint.to_string(),
+                args: json!({ "client": client.clone() }),
+            });
+        }
+    }
+
+    /// 登录：起一个登录尝试，拿到 authorizeUrl 后用系统浏览器打开，然后轮询状态。
+    fn start_account_signin(&mut self, cx: &mut Context<Self>) {
+        self.account_pending_signin = true;
+        let origin = self.host.trim_end_matches('/').to_string();
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "account/signin".to_string(),
+            endpoint: "account/startSignIn".to_string(),
+            args: json!({
+                "client": {
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "locale": "en-US",
+                    "timezoneOffsetSeconds": 0,
+                },
+                "callbackOrigin": origin,
+                "loginSource": "desktop",
+            }),
+        });
+        // 轮询：浏览器完成授权后 host 会拿到 credential
+        let cmds = self.cmds.clone();
+        cx.spawn(async move |_this, cx: &mut AsyncApp| {
+            for _ in 0..40 {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(1500))
+                    .await;
+                let _ = cmds.send_blocking(Cmd::Call {
+                    tag: "account/state".to_string(),
+                    endpoint: "account/getState".to_string(),
+                    args: json!({}),
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn sign_out_account(&mut self) {
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "account/signout".to_string(),
+            endpoint: "account/signOut".to_string(),
+            args: json!({}),
+        });
+    }
+
+    /// 读 dsh 的 Agent 预设列表。
+    fn reload_agent_presets(&mut self) {
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "agent/presets".to_string(),
+            endpoint: "agentPresets/list".to_string(),
+            args: json!({}),
+        });
+    }
+
+    /// 读 dsh 内置的 provider 目录（44 个，含第三方与插件注册的）。
+    fn reload_provider_catalog(&mut self) {
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "llm/providers".to_string(),
+            endpoint: "llm/listConfigurableProviders".to_string(),
+            args: json!({}),
+        });
+    }
+
+    /// 打开内置 DeepSeek 的 API key 编辑（只写 credentials）。
+    fn open_deepseek_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.provider_apikey_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.provider_apikey_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        self.provider_draft = Some(Some("deepseek-official".to_string()));
+        cx.notify();
+    }
+
+    fn save_provider_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(route) = self.provider_draft.take() else {
+            return;
+        };
+        if matches!(&route, Some(key) if key == "deepseek-official") {
+            let base = self.provider_base_input.read(cx).value().trim().to_string();
+            if !base.is_empty() {
+                let revision = self.ns_revision("llm-deepseek");
+                self.write_setting(
+                    "llm-deepseek",
+                    vec!["baseURL".to_string()],
+                    json!(base),
+                    Some(revision),
+                );
+            }
+            let secret = self
+                .provider_apikey_input
+                .read(cx)
+                .value()
+                .trim()
+                .to_string();
+            if !secret.is_empty() {
+                let _ = self.cmds.send_blocking(Cmd::Call {
+                    tag: "credentials/set".to_string(),
+                    endpoint: "credentials/set".to_string(),
+                    args: json!({ "ref": "DEEPSEEK_API_KEY", "value": secret }),
+                });
+            }
+            cx.notify();
+            return;
+        }
+        let typed = self.provider_id_input.read(cx).value().trim().to_string();
+        let key = route.unwrap_or(typed);
+        if key.is_empty() {
+            self.provider_draft = Some(None);
+            return;
+        }
+        let name = self.provider_name_input.read(cx).value().trim().to_string();
+        let base = self.provider_base_input.read(cx).value().trim().to_string();
+        let keyenv = self
+            .provider_keyenv_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let (revision, _existing) = self.pi_providers();
+        // 只写我们负责的字段；models 由模型编辑器单独维护，绝不清空。
+        let mut ops: Vec<Value> = Vec::new();
+        if !name.is_empty() {
+            ops.push(json!({"op":"set","path":["providers", key, "displayName"],"value":name}));
+        }
+        if !base.is_empty() {
+            ops.push(json!({"op":"set","path":["providers", key, "baseURL"],"value":base}));
+        }
+        if !keyenv.is_empty() {
+            ops.push(json!({"op":"set","path":["providers", key, "apiKeyEnv"],"value":keyenv}));
+        }
+        ops.push(json!({"op":"set","path":["providers", key, "api"],"value":self.provider_api.clone()}));
+        self.write_settings_ops("llm-pi-ai", Value::Array(ops), Some(revision));
+        // 表单里同时填了 API key 就一并写进 credentials。
+        let secret = self.provider_apikey_input.read(cx).value().trim().to_string();
+        if !secret.is_empty() {
+            let reference = self
+                .provider_keyenv_input
+                .read(cx)
+                .value()
+                .trim()
+                .to_string();
+            if !reference.is_empty() {
+                let _ = self.cmds.send_blocking(Cmd::Call {
+                    tag: "credentials/set".to_string(),
+                    endpoint: "credentials/set".to_string(),
+                    args: json!({ "ref": reference, "value": secret }),
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    fn remove_provider(&mut self, route: String) {
+        let (revision, _) = self.pi_providers();
+        self.write_setting_unset(
+            "llm-pi-ai",
+            vec!["providers".to_string(), route],
+            Some(revision),
+        );
+    }
+
+    /// 删一个设置路径（settings/mutate 的 unset op）。
+    fn write_setting_unset(&mut self, ns: &str, path: Vec<String>, revision: Option<i64>) {
+        let mut args = json!({
+            "ns": ns,
+            "ops": [{ "op": "unset", "path": path }],
+        });
+        if let Some(rev) = revision {
+            args["expectedRevision"] = json!(rev);
+        }
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "settings/mutate".to_string(),
+            endpoint: "settings/mutate".to_string(),
+            args,
+        });
+    }
+
+    /// 读某个命名空间顶层的值。
+    fn ns_get(&self, ns: &str, key: &str) -> Value {
+        self.settings_doc
+            .get("namespaces")
+            .and_then(|v| v.as_array())
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|view| view.get("ns").and_then(|v| v.as_str()) == Some(ns))
+            })
+            .and_then(|view| view.get("value"))
+            .and_then(|value| value.get(key))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// 读 settings 里某个 models 数组（ns + 路径）。
+    fn models_at(&self, ns: &str, path: &[String]) -> Vec<Value> {
+        let view = self
+            .settings_doc
+            .get("namespaces")
+            .and_then(|v| v.as_array())
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|view| view.get("ns").and_then(|v| v.as_str()) == Some(ns))
+            });
+        let mut node = view
+            .and_then(|view| view.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        for segment in path {
+            node = node.get(segment).cloned().unwrap_or(Value::Null);
+        }
+        node.as_array().cloned().unwrap_or_default()
+    }
+
+    /// 打开模型编辑表单：`Some(i)` 编辑第 i 个，`None` 新增（DeepSeek 的 models）。
+    fn open_model_draft(
+        &mut self,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_model_draft_at(
+            "llm-deepseek",
+            vec!["models".to_string()],
+            index,
+            window,
+            cx,
+        );
+    }
+
+    fn open_model_draft_at(
+        &mut self,
+        ns: &str,
+        path: Vec<String>,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let models = self.models_at(ns, &path);
+        let (id, name, context, max_tokens) = match index.and_then(|i| models.get(i)) {
+            Some(model) => (
+                model
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                model
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                model
+                    .get("contextWindow")
+                    .and_then(|v| v.as_i64())
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                model
+                    .get("maxTokens")
+                    .and_then(|v| v.as_i64())
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            ),
+            None => (
+                String::new(),
+                String::new(),
+                "1048576".to_string(),
+                "128000".to_string(),
+            ),
+        };
+        self.model_id_input
+            .update(cx, |state, cx| state.set_value(id, window, cx));
+        self.model_name_input
+            .update(cx, |state, cx| state.set_value(name, window, cx));
+        self.model_ctx_input
+            .update(cx, |state, cx| state.set_value(context, window, cx));
+        self.model_max_input
+            .update(cx, |state, cx| state.set_value(max_tokens, window, cx));
+        self.model_id_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        self.model_draft = Some(ModelTarget {
+            ns: ns.to_string(),
+            path,
+            index,
+        });
+        cx.notify();
+    }
+
+    /// 保存模型表单：整体替换目标 `models` 数组。
+    fn save_model_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.model_draft.take() else {
+            return;
+        };
+        let id = self.model_id_input.read(cx).value().trim().to_string();
+        let name = self.model_name_input.read(cx).value().trim().to_string();
+        let context: i64 = self
+            .model_ctx_input
+            .read(cx)
+            .value()
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        if id.is_empty() || name.is_empty() {
+            self.model_draft = Some(target);
+            return;
+        }
+        let mut models = self.models_at(&target.ns, &target.path);
+        let mut entry = match target.index.and_then(|i| models.get(i).cloned()) {
+            Some(existing) => existing,
+            None => json!({
+                "systemPromptUpdate": "in-history",
+                "toolUpdate": "addition-only",
+                "inputModalities": ["text"],
+            }),
+        };
+        entry["id"] = json!(id);
+        entry["name"] = json!(name);
+        if context > 0 {
+            entry["contextWindow"] = json!(context);
+        }
+        let max_tokens: i64 = self
+            .model_max_input
+            .read(cx)
+            .value()
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        if max_tokens > 0 {
+            entry["maxTokens"] = json!(max_tokens);
+        }
+        match target.index {
+            Some(i) if i < models.len() => models[i] = entry,
+            _ => models.push(entry),
+        }
+        let revision = self.ns_revision(&target.ns);
+        self.write_setting(&target.ns, target.path.clone(), Value::Array(models), Some(revision));
+        cx.notify();
+    }
+
+    fn remove_model_at(&mut self, ns: &str, path: Vec<String>, index: usize) {
+        let mut models = self.models_at(ns, &path);
+        if index >= models.len() {
+            return;
+        }
+        models.remove(index);
+        let revision = self.ns_revision(ns);
+        self.write_setting(ns, path, Value::Array(models), Some(revision));
+    }
+
+    fn remove_model(&mut self, index: usize) {
+        let (revision, mut models) = self.llm_models();
+        if index >= models.len() {
+            return;
+        }
+        models.remove(index);
+        self.write_setting(
+            "llm-deepseek",
+            vec!["models".to_string()],
+            Value::Array(models),
+            Some(revision),
+        );
+    }
+
+    fn set_default_model(&mut self, provider: String, model: String) {
+        let revision = self.ns_revision("agent-default-model");
+        if provider.is_empty() {
+            self.write_setting(
+                "agent-default-model",
+                vec!["model".to_string()],
+                Value::String(model),
+                Some(revision),
+            );
+            return;
+        }
+        self.write_settings_ops(
+            "agent-default-model",
+            json!([
+                { "op": "set", "path": ["provider"], "value": provider },
+                { "op": "set", "path": ["model"], "value": model },
+            ]),
+            Some(revision),
+        );
+    }
+
+    /// schema 里声明的 credential ref 集合（secret 字段写到这些 ref 下）。
+    fn credential_refs(&self) -> Vec<String> {
+        let mut refs: Vec<String> = Vec::new();
+        let Some(namespaces) = self.settings_doc.get("namespaces").and_then(|v| v.as_array())
+        else {
+            return refs;
+        };
+        for ns in namespaces {
+            let schema = ns.get("schema").cloned().unwrap_or(Value::Null);
+            let value = ns.get("value").cloned().unwrap_or(Value::Null);
+            if let Some(reference) = credential_ref_of(&schema, &value) {
+                refs.push(reference);
+            }
+            // pi-ai 的路由把 apiKeyEnv 藏在 providers.<route> 里。
+            if ns.get("ns").and_then(|v| v.as_str()) == Some("llm-pi-ai") {
+                if let Some(providers) = value.get("providers").and_then(|v| v.as_object()) {
+                    for route in providers.values() {
+                        if let Some(reference) =
+                            route.get("apiKeyEnv").and_then(|v| v.as_str())
+                        {
+                            if !reference.is_empty() {
+                                refs.push(reference.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 内置 provider 目录里的 auth 环境变量
+        if let Some(items) = self.provider_catalog.as_array() {
+            for entry in items {
+                if let Some(env) = entry
+                    .get("nativeAuth")
+                    .and_then(|auth| auth.get("env"))
+                    .and_then(|v| v.as_array())
+                {
+                    if let Some(first) = env.first().and_then(|v| v.as_str()) {
+                        if !first.is_empty() {
+                            refs.push(first.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        refs.sort();
+        refs.dedup();
+        refs
+    }
+
+    /// 读每个 ref 的"设没设"（值本身不会下发）。
+    fn reload_credentials(&mut self) {
+        let refs = self.credential_refs();
+        if refs.is_empty() {
+            return;
+        }
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "credentials/describe".to_string(),
+            endpoint: "credentials/describe".to_string(),
+            args: json!({ "refs": refs }),
+        });
+    }
+
+    /// 开始编辑一个 secret（输入框永远从空开始，不会回填明文）。
+    fn begin_secret_edit(
+        &mut self,
+        ns: &str,
+        key: &str,
+        reference: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.settings_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        self.settings_secret_edit = Some((ns.to_string(), key.to_string(), reference));
+        cx.notify();
+    }
+
+    fn unset_credential(&mut self, reference: String) {
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "credentials/unset".to_string(),
+            endpoint: "credentials/unset".to_string(),
+            args: json!({ "ref": reference }),
+        });
+    }
+
     /// 写一个设置项：settings/mutate + 一个 path op。
     fn write_setting(&mut self, ns: &str, path: Vec<String>, value: Value, revision: Option<i64>) {
         let mut args = json!({
             "ns": ns,
             "ops": [{ "op": "set", "path": path, "value": value }],
         });
+        if let Some(rev) = revision {
+            args["expectedRevision"] = json!(rev);
+        }
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "settings/mutate".to_string(),
+            endpoint: "settings/mutate".to_string(),
+            args,
+        });
+    }
+
+    /// 一次 mutate 写多个 op（比如同时改 provider 和 model）。
+    fn write_settings_ops(&mut self, ns: &str, ops: Value, revision: Option<i64>) {
+        let mut args = json!({ "ns": ns, "ops": ops });
         if let Some(rev) = revision {
             args["expectedRevision"] = json!(rev);
         }
@@ -6503,10 +7456,260 @@ impl Root {
         cx.notify();
     }
 
-    /// 把已经创建好的 CEF 浏览器挂成一个 pane：块本身不画任何东西，
-    /// 渲染时由 BrowserElement 把布局矩形同步给 X11 子窗口。
-    fn open_browser_pane(&mut self, index: usize, cx: &mut Context<Self>) {
-        // 干净数据目录下可能一个空间都没有：先确保有一个能挂 pane 的 tab。
+    /// 确保 CEF 已启动，并新建一个浏览器实例；返回它的槽位号。
+    fn spawn_browser(&mut self, url: Option<&str>, cx: &mut Context<Self>) -> Option<usize> {
+        let cache = dsh_host::runtime_root().join("cef-cache");
+        let _ = std::fs::create_dir_all(&cache);
+        let port = std::env::var("OMD_CDP_PORT")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(self.browser_cdp_port as i32);
+        // 默认走 OSR；原生子窗口只在显式要求时用。
+        let windowless = std::env::var("OMD_BROWSER_CHILD").is_err();
+        if !browser::init(port, &cache, windowless) {
+            self.error = Some("浏览器引擎启动失败：没找到 CEF 运行时".into());
+            cx.notify();
+            return None;
+        }
+        #[cfg(target_os = "linux")]
+        if windowless && port > 0 {
+            // devtools 的监听 fd 不是 CLOEXEC，dsh 的 node 子进程会把它继承走。
+            browser::close_on_exec_cdp_port(port as u16);
+        }
+        let url = url
+            .map(str::to_string)
+            .or_else(|| std::env::var("OMD_BROWSER_URL").ok())
+            .unwrap_or_else(|| self.browser_home.clone());
+        let index = browser::create(1000, 700, &url);
+        if index.is_none() {
+            self.error = Some("浏览器创建失败".into());
+        }
+        self.start_browser_pump(cx);
+        index
+    }
+
+    /// CEF 的消息泵必须跑在 UI 线程上（external_message_pump）。
+    fn start_browser_pump(&mut self, cx: &mut Context<Self>) {
+        if self.browser_pump_started {
+            return;
+        }
+        self.browser_pump_started = true;
+        let pump_rx = browser::pump_channel();
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let mut seen: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+            loop {
+                /*
+                按 CEF 自己的调度泵：空闲时它给 i32::MAX，我们只做低频兜底轮询；
+                有活时给 0~16ms，用通道立刻叫醒。钳到 [8ms, 33ms]：8ms 够 120Hz，
+                33ms 是空闲上限，否则合成器会以 500 次/秒泵、烧掉 40% 的主线程。
+                */
+                let min_ms: i64 = std::env::var("OMD_PUMP_MIN")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(8);
+                let delay = match browser::pump_delay_ms() {
+                    d if d <= 0 => min_ms,
+                    d if d >= 1000 => 200,
+                    d => d.clamp(min_ms, 33),
+                };
+                let sleep = cx
+                    .background_executor()
+                    .timer(std::time::Duration::from_millis(delay as u64));
+                let _ =
+                    futures_util::future::select(Box::pin(sleep), Box::pin(pump_rx.recv())).await;
+                if std::env::var("OMD_PUMP_OFF").is_err() {
+                    browser::pump();
+                }
+                let changed = this
+                    .update(cx, |root, cx| {
+                        let mut changed = false;
+                        // 每个浏览器 pane 都有自己的槽位和纹理，逐个数新帧。
+                        for index in root.panes.iter().filter_map(|pane| pane.browser) {
+                            if let Some(accel) = browser::latest_accel(index) {
+                                if seen.get(&index).copied() != Some(accel.seq) {
+                                    seen.insert(index, accel.seq);
+                                    changed = true;
+                                }
+                            }
+                        }
+                        // 标注层跟随导航：URL 变了就重注入（首帧也走这里，
+                        // 解决注入早于页面加载被冲掉的问题）。
+                        for index in root
+                            .panes
+                            .iter()
+                            .filter_map(|pane| pane.browser)
+                            .collect::<Vec<_>>()
+                        {
+                            let url = browser::current_url(index).unwrap_or_default();
+                            if url.is_empty() {
+                                continue;
+                            }
+                            let known = root
+                                .browser_urls
+                                .get(&index)
+                                .cloned()
+                                .unwrap_or_default();
+                            if url != known {
+                                root.browser_urls.insert(index, url.clone());
+                                root.browser_pins.remove(&index);
+                                root.browser_pick_sent.remove(&index);
+                                browser::annotator_reset(index);
+                            }
+                            // 注入必须发生在 UI 线程（render），这里只立标志；
+                            // execute_java_script 从其它线程调会被 CEF 静默丢弃。
+                            if !browser::annotator_ready(index) {
+                                root.browser_needs_inject.insert(index);
+                            } else {
+                                root.browser_needs_inject.remove(&index);
+                            }
+                        }
+                        // 标注层回传（console 通道，~1s 一拍）。
+                        let mut pins_updated = false;
+                        for (id, payload) in browser::drain_pins() {
+                            let Some(index) = browser::slot_of_browser_id(id) else {
+                                if std::env::var("OMD_BROWSER_DEBUG").is_ok() {
+                                    eprintln!("[pins] 丢弃无槽位 browser id={id}");
+                                }
+                                continue;
+                            };
+                            if let Ok(value) = serde_json::from_str::<Value>(&payload) {
+                                if root.browser_pins.get(&index) != Some(&value) {
+                                    browser::store_pins(index, &payload);
+                                    root.browser_pins.insert(index, value);
+                                    // 新 pin 还没截图的，请求元素截图（下一帧兑现）。
+                                    if let Some(pins) = root
+                                        .browser_pins
+                                        .get(&index)
+                                        .and_then(|v| v.as_array().cloned())
+                                    {
+                                        for pin in pins {
+                                            let has_shot = pin
+                                                .get("screenshot")
+                                                .and_then(|v| v.as_str())
+                                                .is_some_and(|v| !v.is_empty());
+                                            let Some(pin_id) =
+                                                pin.get("id").and_then(|v| v.as_u64())
+                                            else {
+                                                continue;
+                                            };
+                                            if has_shot {
+                                                continue;
+                                            }
+                                            let Some(box_) = pin.get("box") else { continue };
+                                            let (Some(x), Some(y), Some(w), Some(h)) = (
+                                                box_.get("x").and_then(|v| v.as_u64()),
+                                                box_.get("y").and_then(|v| v.as_u64()),
+                                                box_.get("w").and_then(|v| v.as_u64()),
+                                                box_.get("h").and_then(|v| v.as_u64()),
+                                            ) else {
+                                                continue;
+                                            };
+                                            browser::request_capture(
+                                                index,
+                                                pin_id,
+                                                x as u32,
+                                                y as u32,
+                                                w as u32,
+                                                h as u32,
+                                            );
+                                        }
+                                    }
+                                    pins_updated = true;
+                                }
+                            }
+                        }
+                        // 截图落盘后把路径附回 pin。
+                        for (index, pin_id, path) in browser::drain_captures() {
+                            let Some(pins) = root
+                                .browser_pins
+                                .get_mut(&index)
+                                .and_then(|v| v.as_array_mut())
+                            else {
+                                continue;
+                            };
+                            for pin in pins.iter_mut() {
+                                if pin.get("id").and_then(|v| v.as_u64()) == Some(pin_id) {
+                                    pin.as_object_mut()
+                                        .map(|obj| obj.insert("screenshot".into(), json!(path)));
+                                }
+                            }
+                            if let Ok(text) = serde_json::to_string(
+                                root.browser_pins.get(&index).unwrap_or(&Value::Null),
+                            ) {
+                                browser::store_pins(index, &text);
+                            }
+                            pins_updated = true;
+                        }
+                        if changed || pins_updated {
+                            cx.notify();
+                        }
+                        changed || pins_updated
+                    })
+                    .unwrap_or(false);
+                if changed {
+                    for handle in cx.update(|cx| cx.windows()) {
+                        let _ = handle.update(cx, |_, window, _| window.refresh());
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 浏览器 pane 的地址栏：首次渲染时建，回车就导航。
+    fn ensure_browser_input(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        if let Some(input) = self.browser_inputs.get(&index) {
+            return input.clone();
+        }
+        let url = browser::current_url(index).unwrap_or_default();
+        let input = cx.new(|cx| {
+            let mut state =
+                InputState::new(window, cx).placeholder("Search or enter address…");
+            if !url.is_empty() {
+                state.set_value(url, window, cx);
+            }
+            state
+        });
+        let sub = cx.subscribe(&input, move |root, input, ev: &InputEvent, cx| {
+            if let InputEvent::PressEnter { .. } = ev {
+                let typed = input.read(cx).value().trim().to_string();
+                if typed.is_empty() {
+                    return;
+                }
+                let url = if typed.contains("://") || typed.starts_with("about:") {
+                    typed
+                } else {
+                    format!("https://{typed}")
+                };
+                browser::navigate(index, &url);
+                root.save_state();
+                cx.notify();
+            }
+        });
+        self.browser_input_subs.push(sub);
+        self.browser_inputs.insert(index, input.clone());
+        input
+    }
+
+    /// 把一个浏览器实例挂成 pane：在 `leaf`（0 = 根 chat）旁边按 `dir` 分屏。
+    fn mount_browser_pane(
+        &mut self,
+        index: usize,
+        leaf: u64,
+        dir: SplitDir,
+        cx: &mut Context<Self>,
+    ) {
+        // 同一个 CEF 实例只能画在一个 pane 里；已经挂着就直接聚焦过去。
+        if let Some(pane) = self.panes.iter().find(|pane| pane.browser == Some(index)) {
+            self.focus_pending = Some(pane.id);
+            cx.notify();
+            return;
+        }
         if self.current_space.is_none() {
             let cwd = std::env::current_dir()
                 .map(|p| p.display().to_string())
@@ -6515,16 +7718,13 @@ impl Root {
             self.current_space = Some(id);
         }
         let pane_id = next_pane_id();
-        let focus = cx.focus_handle();
-        let mut pane = Block::new(pane_id, BlockPlacement::Panel, focus);
+        let mut pane = Block::new(pane_id, dir.pane_kind(), cx.focus_handle());
         pane.browser = Some(index);
         self.panes.push(pane);
         let Some(space_id) = self.current_space.clone() else {
-            eprintln!("[browser-pane] no current space");
             return;
         };
         let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) else {
-            eprintln!("[browser-pane] space {space_id} not found");
             return;
         };
         if space.active_panel.is_none() {
@@ -6534,17 +7734,66 @@ impl Root {
             space.active_panel = Some(id);
         }
         let Some(tab_id) = space.active_panel.clone() else {
-            eprintln!("[browser-pane] no active panel");
             return;
         };
-        let Some(tab) = space.panels.iter_mut().find(|tab| tab.id == tab_id) else {
-            eprintln!("[browser-pane] tab {tab_id} not found");
+        if let Some(tab) = space.panels.iter_mut().find(|tab| tab.id == tab_id) {
+            let leaf = if tab.layout.has(leaf) { leaf } else { 0 };
+            tab.layout.split(leaf, dir, pane_id);
+            tab.maximized = None;
+        }
+        if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) {
+            pane.tab_id = Some(tab_id);
+        }
+        self.save_state();
+        cx.notify();
+    }
+
+    /// 分屏菜单里的「browser block」。
+    fn split_with_browser(&mut self, leaf: u64, dir: SplitDir, cx: &mut Context<Self>) {
+        let Some(index) = self.spawn_browser(None, cx) else {
             return;
         };
-        // chat 右侧分出一格给浏览器
-        let split_ok = tab.layout.split(0, SplitDir::Row, pane_id);
-        eprintln!("[browser-pane] pane={pane_id} split_ok={split_ok}");
-        tab.maximized = None;
+        self.mount_browser_pane(index, leaf, dir, cx);
+    }
+
+    /// 「+」菜单里的「browser」：新建一个只放浏览器的 tab。
+    fn open_browser_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.spawn_browser(None, cx) else {
+            return;
+        };
+        if self.current_space.is_none() {
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "/".into());
+            let id = self.ensure_space(&cwd);
+            self.current_space = Some(id);
+        }
+        let pane_id = next_pane_id();
+        let mut pane = Block::new(pane_id, BlockPlacement::Panel, cx.focus_handle());
+        pane.browser = Some(index);
+        self.panes.push(pane);
+        let Some(space_id) = self.current_space.clone() else {
+            return;
+        };
+        if let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) {
+            let id = next_tab_id();
+            let number = space.panels.iter().map(|tab| tab.number).max().unwrap_or(0) + 1;
+            let mut panel = Panel::new(id.clone(), number);
+            panel.layout = Layout::Leaf(pane_id);
+            space.panels.push(panel);
+            space.active_panel = Some(id.clone());
+            if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) {
+                pane.tab_id = Some(id);
+            }
+        }
+        self.save_state();
+        cx.notify();
+    }
+
+    /// 把已经创建好的 CEF 浏览器挂成一个 pane：块本身不画任何东西，
+    /// 渲染时由 BrowserElement 把布局矩形同步给 X11 子窗口。
+    fn open_browser_pane(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.mount_browser_pane(index, 0, SplitDir::Row, cx);
     }
 
     fn split_pane(&mut self, leaf: u64, dir: SplitDir, cx: &mut Context<Self>) {
@@ -6843,7 +8092,7 @@ impl Root {
         let tabs = space.map(|space| space.all_panels()).unwrap_or_default();
 
         if matches!(self.palette_tab, PaletteTab::All | PaletteTab::Commands) {
-            let commands: [(PaletteAction, &str, String); 9] = [
+            let commands: [(PaletteAction, &str, String); 10] = [
                 (
                     PaletteAction::NewSession,
                     "New panel",
@@ -6858,6 +8107,11 @@ impl Root {
                     PaletteAction::TermPane(BlockPlacement::Right),
                     "Terminal · right",
                     "side by side".to_string(),
+                ),
+                (
+                    PaletteAction::BrowserPane,
+                    "Browser",
+                    "open a page next to the chat".to_string(),
                 ),
                 (
                     PaletteAction::OpenModels,
@@ -7046,6 +8300,7 @@ impl Root {
                 };
                 self.split_pane(0, dir, cx)
             }
+            PaletteAction::BrowserPane => self.split_with_browser(0, SplitDir::Row, cx),
             PaletteAction::GitStageAll => {
                 self.open_git_changes(cx);
                 self.run_git(&["add", "-A"]);
@@ -7126,6 +8381,15 @@ impl Root {
                 return true;
             }
         }
+        // Ctrl/Cmd+I:对当前(或唯一)浏览器 pane 切换标注拾取
+        if ctrl && key == "i" {
+            // 现在单浏览器实例:直接用 primary(多 pane 后再按焦点选)。
+            if let Some(index) = browser::primary() {
+                browser::toggle_pick(index);
+                cx.notify();
+                return true;
+            }
+        }
         if self.files_sidebar && key == "f2" {
             if let Some(path) = self.files_selected.clone() {
                 if std::path::Path::new(&path).is_file() && !self.editors.contains_key(&file_panel_id(&path)) {
@@ -7135,7 +8399,7 @@ impl Root {
             }
         }
         // 设置项编辑中：Enter 提交 / Esc 取消
-        if self.settings_edit.is_some() {
+        if self.settings_edit.is_some() || self.settings_secret_edit.is_some() {
             return match key {
                 "enter" => {
                     self.commit_setting_edit(window, cx);
@@ -7143,6 +8407,7 @@ impl Root {
                 }
                 "escape" => {
                     self.settings_edit = None;
+                    self.settings_secret_edit = None;
                     self.input.read(cx).focus_handle(cx).focus(window, cx);
                     cx.notify();
                     true
@@ -7655,7 +8920,62 @@ impl Root {
         if text.is_empty() {
             return;
         }
+        // 浏览器标注攒批:发出消息时自动附带当前所有 pin,随后清空。
+        let text = match self.browser_pins_digest() {
+            Some(digest) => format!("{text}\n{digest}"),
+            None => text,
+        };
         self.send_text(text, cx);
+        self.browser_pins_consume();
+    }
+
+    /// 当前所有浏览器 pane 的 pin 摘要(用于随消息发送)。
+    fn browser_pins_digest(&self) -> Option<String> {
+        let mut lines: Vec<String> = Vec::new();
+        for (index, pins) in &self.browser_pins {
+            let Some(list) = pins.as_array() else { continue };
+            if list.is_empty() {
+                continue;
+            }
+            let url = browser::current_url(*index).unwrap_or_default();
+            for pin in list {
+                let tag = pin.get("tag").and_then(|v| v.as_str()).unwrap_or("?");
+                let selector = pin.get("selector").and_then(|v| v.as_str()).unwrap_or("");
+                let text = pin.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let comment = pin.get("comment").and_then(|v| v.as_str()).unwrap_or("");
+                let shot = pin.get("screenshot").and_then(|v| v.as_str()).unwrap_or("");
+                let id = pin.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let mut line = format!("- #{id} <{tag}> {selector} | {text}");
+                if !comment.is_empty() {
+                    line.push_str(&format!(" | 批注: {comment}"));
+                }
+                if !shot.is_empty() {
+                    line.push_str(&format!(" | 截图: {shot}"));
+                }
+                if !url.is_empty() {
+                    line.push_str(&format!(" | 页面: {url}"));
+                }
+                lines.push(line);
+            }
+        }
+        if lines.is_empty() {
+            None
+        } else {
+            Some(format!("[browser annotations]\n{}", lines.join("\n")))
+        }
+    }
+
+    /// pin 已随消息发出:清 Rust 状态 + 快照 + 页面上的 pin。
+    fn browser_pins_consume(&mut self) {
+        if self.browser_pins.is_empty() {
+            return;
+        }
+        let indexes: Vec<usize> = self.browser_pins.keys().copied().collect();
+        self.browser_pins.clear();
+        browser::clear_pins_snapshot();
+        for index in indexes {
+            browser::execute_js(index, "window.__omdPins = []; window.__omdSetPick && window.__omdSetPick(window.__omdPins); 'cleared'");
+        }
     }
 
     /// Chat panes on the tab in front of the user. Composer slots stay with
@@ -7879,19 +9199,474 @@ fn truncate_line(s: &str, n: usize) -> String {
 /// 设置面板的分页。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SettingsTab {
-    General,
-    Plugins,
     Account,
+    General,
+    Models,
+    Plugins,
+    Presets,
+    Browser,
+    Git,
+    File,
 }
 
 impl SettingsTab {
-    const ALL: [SettingsTab; 3] = [SettingsTab::General, SettingsTab::Plugins, SettingsTab::Account];
+    /// dsh 桌面端设置侧栏的顺序。
+    const ALL: [SettingsTab; 8] = [
+        SettingsTab::Account,
+        SettingsTab::General,
+        SettingsTab::Models,
+        SettingsTab::Plugins,
+        SettingsTab::Presets,
+        SettingsTab::Browser,
+        SettingsTab::Git,
+        SettingsTab::File,
+    ];
+
     fn label(self) -> &'static str {
         match self {
+            SettingsTab::Account => "Account & balance",
             SettingsTab::General => "General",
-            SettingsTab::Plugins => "Plugins",
-            SettingsTab::Account => "Account",
+            SettingsTab::Models => "Models",
+            SettingsTab::Plugins => "Built-in plugins",
+            SettingsTab::Presets => "Agent presets",
+            SettingsTab::Browser => "Browser",
+            SettingsTab::Git => "Git",
+            SettingsTab::File => "File",
         }
+    }
+
+    fn glyph(self) -> &'static str {
+        match self {
+            SettingsTab::Account => "◉",
+            SettingsTab::General => "⚙",
+            SettingsTab::Models => "▤",
+            SettingsTab::Plugins => "❏",
+            SettingsTab::Presets => "✦",
+            SettingsTab::Browser => "◍",
+            SettingsTab::Git => "⑂",
+            SettingsTab::File => "▸",
+        }
+    }
+
+    /// 这一页渲染哪些 dsh 设置命名空间（顺序即显示顺序）。
+    fn namespaces(self) -> &'static [&'static str] {
+        match self {
+            SettingsTab::Browser | SettingsTab::Git | SettingsTab::File => &[],
+            SettingsTab::General => &[
+                "ui-settings-general",
+                "ui-settings",
+                "ui-conversation",
+                "locale",
+                "ui-theme",
+                "ui-chat",
+                "bash-sandbox",
+                "web",
+                "web-search-deepseek",
+                "web-deepseek-api",
+                "session-log-deepseek",
+                "agent-loop",
+                "subagent",
+                "permission",
+            ],
+            SettingsTab::Models => &[
+                "llm-deepseek",
+                "llm-deepseek-account",
+                "agent-default-model",
+                "subagent-model-selection-settings",
+                "llm-pi-ai",
+            ],
+            SettingsTab::Presets => &["agent-preset-registry"],
+            SettingsTab::Account | SettingsTab::Plugins => &[],
+        }
+    }
+}
+
+/// `maxParallelToolCalls` / `baseURL` → `Max parallel tool calls` / `Base URL`。
+fn humanize_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    let mut out = String::new();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if index > 0 && ch.is_uppercase() {
+            let prev = chars[index - 1];
+            let next = chars.get(index + 1).copied();
+            // 词边界：小写→大写，或连续大写后接小写（URL / APIKey 之类）。
+            if prev.is_lowercase()
+                || prev.is_ascii_digit()
+                || (prev.is_uppercase() && next.is_some_and(|n| n.is_lowercase()))
+            {
+                out.push(' ');
+            }
+        }
+        if index == 0 {
+            out.extend(ch.to_uppercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// `next-input` → `Next input`（枚举值当按钮文字用）。
+fn humanize_choice(value: &str) -> String {
+    let mut out = String::new();
+    for (index, part) in value.split('-').enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out
+}
+
+/// 网页版设置页的原始文案（dsh-client-ui-chat 的 `settings.*` 词条）。
+fn settings_field_copy(ns: &str, key: &str) -> Option<(&'static str, &'static str)> {
+    match (ns, key) {
+        ("ui-chat", "transcriptView") => Some((
+            "Work details",
+            "Choose how much detail to show for tool calls",
+        )),
+        ("ui-chat", "collapseTiming") => Some((
+            "When to Collapse Work Details",
+            "Choose when to automatically collapse work details",
+        )),
+        ("ui-chat", "foldedReplies") => Some((
+            "Replies After Collapse",
+            "Choose which assistant replies stay visible when work details collapse",
+        )),
+        ("ui-chat", "performanceUsage") => Some((
+            "Performance & usage",
+            "Choose how much performance and usage information to show",
+        )),
+        ("ui-chat", "linkOpening") => Some((
+            "Open chat links in",
+            "Choose where to open web links",
+        )),
+        _ => None,
+    }
+}
+
+/// 枚举值的按钮文案（同样是网页版的词条）。
+fn settings_choice_copy(ns: &str, key: &str, value: &str) -> Option<&'static str> {
+    match (ns, key, value) {
+        ("ui-chat", "transcriptView", "compact") => Some("Compact"),
+        ("ui-chat", "transcriptView", "standard") => Some("Standard"),
+        ("ui-chat", "transcriptView", "detailed") => Some("Detailed"),
+        ("ui-chat", "transcriptView", "verbose") => Some("Verbose"),
+        ("ui-chat", "collapseTiming", "completion") => Some("On completion"),
+        ("ui-chat", "collapseTiming", "next-input") => Some("On next message"),
+        ("ui-chat", "foldedReplies", "all") => Some("All replies"),
+        ("ui-chat", "foldedReplies", "final") => Some("Final answer only"),
+        ("ui-chat", "performanceUsage", "compact") => Some("Compact"),
+        ("ui-chat", "performanceUsage", "detailed") => Some("Detailed"),
+        ("ui-chat", "linkOpening", "sidebar") => Some("In-App Sidebar"),
+        ("ui-chat", "linkOpening", "new-tab") => Some("Default Browser"),
+        _ => None,
+    }
+}
+
+/// 命名空间的显示名（dsh 自己的 schema 没有 title，这里补一张小表）。
+fn settings_ns_title(ns: &str) -> &'static str {
+    match ns {
+        "ui-settings-general" => "General",
+        "ui-settings" => "Settings panel",
+        "ui-conversation" => "Composer",
+        "locale" => "Language",
+        "ui-theme" => "Theme",
+        "ui-chat" => "Transcript",
+        "llm-deepseek" => "DeepSeek API",
+        "llm-deepseek-account" => "DeepSeek account limits",
+        "agent-default-model" => "Advanced model options",
+        "subagent-model-selection-settings" => "Subagent models",
+        "llm-pi-ai" => "Other providers",
+        "agent-loop" => "Agent loop",
+        "subagent" => "Subagents",
+        "permission" => "Permissions",
+        "agent-preset-registry" => "Agent presets",
+        "bash-sandbox" => "Shell sandbox",
+        "web" => "Web tools",
+        "web-search-deepseek" => "Web search",
+        "web-deepseek-api" => "DeepSeek web API",
+        "session-log-deepseek" => "Session log",
+        "ui-settings-account" => "Account onboarding",
+        _ => "Settings",
+    }
+}
+
+/// `role=credential-ref` 字段名（比如 `apiKeyEnv`）。
+fn credential_ref_field(schema: &Value) -> Option<String> {
+    let dict = schema_root(schema)?.get("dict")?.as_object()?;
+    for (key, uid) in dict {
+        let Some(node) = uid.as_i64().and_then(|uid| schema_lookup(schema, uid)) else {
+            continue;
+        };
+        let role = node
+            .get("meta")
+            .and_then(|meta| meta.get("role"))
+            .and_then(|role| role.as_str());
+        if role == Some("credential-ref") {
+            return Some(key.clone());
+        }
+    }
+    None
+}
+
+/// 命名空间里 `role=credential-ref` 字段的当前值（也就是 secret 存到哪个 ref 下）。
+fn credential_ref_of(schema: &Value, value: &Value) -> Option<String> {
+    let dict = schema_root(schema)?.get("dict")?.as_object()?;
+    for (key, uid) in dict {
+        let Some(node) = uid.as_i64().and_then(|uid| schema_lookup(schema, uid)) else {
+            continue;
+        };
+        let role = node
+            .get("meta")
+            .and_then(|meta| meta.get("role"))
+            .and_then(|role| role.as_str());
+        if role != Some("credential-ref") {
+            continue;
+        }
+        let current = value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                node.get("meta")
+                    .and_then(|meta| meta.get("default"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
+        if let Some(current) = current {
+            return Some(current);
+        }
+    }
+    None
+}
+
+/// 复杂值只显示个摘要（数组/对象不在这里编辑）。
+fn other_preview(value: &Value) -> String {
+    match value {
+        Value::Array(items) => format!("[{} items]", items.len()),
+        Value::Object(map) => format!("{{{} fields}}", map.len()),
+        other => other.to_string(),
+    }
+}
+
+/// 设置页里只读的一行（标题 + 值）。
+fn info_row(label: &str, value: &str) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(14.))
+        .px(px(16.))
+        .py(px(11.))
+        .border_t_1()
+        .border_color(rgb(0x1d2229))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_sm()
+                .text_color(rgb(0xe8ecf4))
+                .child(SharedString::from(label.to_string())),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x8b93a7))
+                .child(SharedString::from(value.to_string())),
+        )
+        .into_any_element()
+}
+
+/// `@deepseek-ai/dsh-plugin-manager/tools` → `Plugin Manager / Tools`。
+fn plugin_display_name(module: &str) -> String {
+    let mut name = module.trim();
+    if let Some(rest) = name.strip_prefix("@deepseek-ai/") {
+        name = rest;
+    }
+    let name = name.strip_prefix("dsh-").unwrap_or(name);
+    let mut out = String::new();
+    for (index, part) in name.split(['-', '/', '_']).filter(|p| !p.is_empty()).enumerate() {
+        if index > 0 {
+            out.push_str(" / ");
+        }
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    if out.is_empty() {
+        module.to_string()
+    } else {
+        out
+    }
+}
+
+/// 头像底色（按 id 取一个稳定的颜色）。
+fn provider_accent(id: &str) -> u32 {
+    const PALETTE: [u32; 6] = [0x2f6fb5, 0x3f7a55, 0x8a5a2b, 0x6b4c8a, 0x2b7a7a, 0x8a4b4b];
+    let sum: usize = id.bytes().map(|b| b as usize).sum();
+    PALETTE[sum % PALETTE.len()]
+}
+
+/// 正在编辑的模型：目标数组的命名空间 + 路径 + 下标（None = 新增）。
+#[derive(Clone)]
+struct ModelTarget {
+    ns: String,
+    path: Vec<String>,
+    index: Option<usize>,
+}
+
+/// provider 列表里一行的来源。
+#[derive(Clone)]
+enum ProviderKind {
+    Deepseek,
+    Route(String),
+    Available { name: String, env: Option<String> },
+}
+
+/// 常见 provider 的预设：选一个只需要填 API key。
+struct ProviderPreset {
+    route: &'static str,
+    name: &'static str,
+    api: &'static str,
+    base: &'static str,
+    key_env: &'static str,
+    models: &'static [&'static str],
+}
+
+const PROVIDER_PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        route: "openai",
+        name: "OpenAI",
+        api: "openai-completions",
+        base: "https://api.openai.com/v1",
+        key_env: "OPENAI_API_KEY",
+        models: &["gpt-4o", "gpt-4o-mini"],
+    },
+    ProviderPreset {
+        route: "anthropic",
+        name: "Anthropic",
+        api: "anthropic-messages",
+        base: "https://api.anthropic.com/v1",
+        key_env: "ANTHROPIC_API_KEY",
+        models: &["claude-sonnet-4-5", "claude-opus-4-1"],
+    },
+    ProviderPreset {
+        route: "google",
+        name: "Google Gemini",
+        api: "openai-completions",
+        base: "https://generativelanguage.googleapis.com/v1beta/openai",
+        key_env: "GEMINI_API_KEY",
+        models: &["gemini-2.5-pro", "gemini-2.5-flash"],
+    },
+    ProviderPreset {
+        route: "xai",
+        name: "xAI",
+        api: "openai-completions",
+        base: "https://api.x.ai/v1",
+        key_env: "XAI_API_KEY",
+        models: &["grok-4", "grok-3-mini"],
+    },
+    ProviderPreset {
+        route: "groq",
+        name: "Groq",
+        api: "openai-completions",
+        base: "https://api.groq.com/openai/v1",
+        key_env: "GROQ_API_KEY",
+        models: &["llama-3.3-70b-versatile"],
+    },
+    ProviderPreset {
+        route: "mistral",
+        name: "Mistral",
+        api: "openai-completions",
+        base: "https://api.mistral.ai/v1",
+        key_env: "MISTRAL_API_KEY",
+        models: &["mistral-large-latest"],
+    },
+];
+
+/// 字段控件类型：从 schemastery 的 JSON 里推。
+#[derive(Clone)]
+enum FieldKind {
+    Bool,
+    Number,
+    Text,
+    Choice(Vec<String>),
+    ReadOnly,
+    Secret,
+    Other,
+}
+
+fn schema_lookup<'a>(schema: &'a Value, uid: i64) -> Option<&'a Value> {
+    schema.get("refs")?.get(uid.to_string())
+}
+
+fn schema_root(schema: &Value) -> Option<&Value> {
+    schema_lookup(schema, schema.get("uid")?.as_i64()?)
+}
+
+/// 取 `schema` 里 `key` 字段的节点类型。
+fn field_kind(schema: &Value, key: &str) -> FieldKind {
+    let Some(root_uid) = schema.get("uid").and_then(|v| v.as_i64()) else {
+        return FieldKind::Other;
+    };
+    let Some(root) = schema_lookup(schema, root_uid) else {
+        return FieldKind::Other;
+    };
+    let Some(uid) = root
+        .get("dict")
+        .and_then(|dict| dict.get(key))
+        .and_then(|v| v.as_i64())
+    else {
+        return FieldKind::Other;
+    };
+    let Some(node) = schema_lookup(schema, uid) else {
+        return FieldKind::Other;
+    };
+    match node.get("type").and_then(|v| v.as_str()) {
+        Some("boolean") => FieldKind::Bool,
+        Some("number") => FieldKind::Number,
+        Some("string") => match node
+            .get("meta")
+            .and_then(|meta| meta.get("role"))
+            .and_then(|role| role.as_str())
+        {
+            Some("secret") => FieldKind::Secret,
+            _ => FieldKind::Text,
+        },
+        Some("const") => FieldKind::ReadOnly,
+        Some("union") => {
+            let mut options = Vec::new();
+            for item in node
+                .get("list")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+            {
+                let Some(uid) = item.as_i64() else { continue };
+                let Some(alt) = schema_lookup(schema, uid) else {
+                    continue;
+                };
+                if alt.get("type").and_then(|v| v.as_str()) == Some("const") {
+                    if let Some(value) = alt.get("value").and_then(|v| v.as_str()) {
+                        options.push(value.to_string());
+                    }
+                }
+            }
+            if options.len() >= 2 {
+                FieldKind::Choice(options)
+            } else {
+                FieldKind::Text
+            }
+        }
+        _ => FieldKind::Other,
     }
 }
 
@@ -9384,13 +11159,12 @@ fn pane_divider(pane_id: u64, kind: BlockPlacement, dragging: bool, cx: &mut Con
 /// 浏览器 pane：上面一条 GPUI 画的工具条（前进/后退/刷新 + 地址），
 /// 下面整块交给 CEF 子窗口。工具条高度变了，BrowserElement 的布局矩形
 /// 自动跟着变，X11 宿主也就跟着挪。
-fn browser_pane_element(index: usize, focus: FocusHandle) -> AnyElement {
-    let url = browser::current_url(index).unwrap_or_default();
-    let shown = if url.is_empty() {
-        "about:blank".to_string()
-    } else {
-        url
-    };
+fn browser_pane_element(
+    index: usize,
+    focus: FocusHandle,
+    input: Entity<InputState>,
+    extra: AnyElement,
+) -> AnyElement {
     let mut bar = div()
         .h(px(HEADER_H))
         .flex_shrink_0()
@@ -9427,8 +11201,15 @@ fn browser_pane_element(index: usize, focus: FocusHandle) -> AnyElement {
             .flex_1()
             .min_w(px(0.))
             .overflow_hidden()
-            .child(div().text_xs().text_color(rgb(0x6b7386)).child(shown)),
+            .child(
+                Input::new(&input)
+                    .appearance(false)
+                    .bordered(false)
+                    .focus_bordered(false)
+                    .h_full(),
+            ),
     );
+    bar = bar.child(extra);
     div()
         .size_full()
         .flex()
@@ -9562,7 +11343,7 @@ impl Element for BrowserElement {
                         return;
                     }
                     // 点在页面外就把键盘交还 GPUI。
-                    crate::browser::osr_set_focused(inside(ev.position));
+                    crate::browser::osr_focus_slot(index, inside(ev.position));
                     if inside(ev.position) && ev.button == button {
                         focus.focus(_window, cx);
                         let (x, y) = to_page(ev.position);
@@ -9659,6 +11440,14 @@ impl Element for BrowserElement {
             if !phase.bubble() || !crate::browser::osr_focused() {
                 return;
             }
+            // Ctrl/Cmd+I:切换标注拾取（快捷键不进页面）。
+            if (ev.keystroke.modifiers.control || ev.keystroke.modifiers.platform)
+                && ev.keystroke.key == "i"
+            {
+                crate::browser::toggle_pick(index);
+                cx.stop_propagation();
+                return;
+            }
             if let Some(vk) = crate::browser::vk_for(&ev.keystroke.key) {
                 let ch = ev
                     .keystroke
@@ -9685,7 +11474,7 @@ impl Element for BrowserElement {
         };
         window.paint_external_texture(
             bounds,
-            crate::browser::external_key(),
+            crate::browser::external_key(self.index),
             Size {
                 width: DevicePixels(width as i32),
                 height: DevicePixels(height as i32),
@@ -9781,12 +11570,98 @@ fn split_divider(split_id: u64, index: usize, dir: SplitDir, cx: &mut Context<Ro
     .into_any_element()
 }
 
+/// 分屏菜单的三行（chat / terminal / browser）。HoverCard 和旧的悬浮层共用。
+fn split_menu_rows(
+    leaf: u64,
+    dir: SplitDir,
+    weak_dsh: WeakEntity<Root>,
+    weak_term: WeakEntity<Root>,
+    weak_browser: WeakEntity<Root>,
+) -> Stateful<Div> {
+    let row = |id: String, glyph: &str, glyph_color: u32, label: &str| {
+        div()
+            .id(SharedString::from(id))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.))
+            .px(px(8.))
+            .py(px(5.))
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(0x20232b)))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(glyph_color))
+                    .child(SharedString::from(glyph)),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xe8ecf4))
+                    .child(SharedString::from(label)),
+            )
+    };
+
+    div()
+        .id(SharedString::from(format!("split-menu-{leaf}")))
+        .flex()
+        .flex_col()
+        .gap(px(1.))
+        .w(px(148.))
+        .p(px(4.))
+        .rounded(px(8.))
+        .bg(rgb(0x1b1e26))
+        .border_1()
+        .border_color(rgb(0x2c3340))
+        .shadow_lg()
+        .child(
+            row(
+                format!("split-row-dsh-{leaf}"),
+                "◆",
+                0x00b4ff,
+                "chat block",
+            )
+            .on_click(move |_ev, _win, cx| {
+                let _ = weak_dsh.update(cx, |root, cx| {
+                    root.split_with_dsh(leaf, dir, cx);
+                });
+            }),
+        )
+        .child(
+            row(
+                format!("split-row-term-{leaf}"),
+                ">",
+                0x00d98a,
+                "terminal block",
+            )
+            .on_click(move |_ev, _win, cx| {
+                let _ = weak_term.update(cx, |root, cx| {
+                    root.split_pane(leaf, dir, cx);
+                });
+            }),
+        )
+        .child(
+            row(
+                format!("split-row-browser-{leaf}"),
+                "◐",
+                0xffa657,
+                "browser block",
+            )
+            .on_click(move |_ev, _win, cx| {
+                let _ = weak_browser.update(cx, |root, cx| {
+                    root.split_with_browser(leaf, dir, cx);
+                });
+            }),
+        )
+}
+
 /// panel 头右上角的分屏按钮（Herdr 那种：▯ 右分屏 / ⊟ 下分屏）。
 fn panel_split_buttons(leaf: u64, cx: &mut Context<Root>) -> AnyElement {
     // 只有 ▯ / ⊟ 两个按钮：
     // - 直接点 = 该方向分屏，新面板是 dsh（见 split_with_dsh）
-    // - 悬停 = 下面弹小菜单（dsh / terminal），菜单是自己画的，
-    //   没有遮罩，所以按钮始终可点
+    // - 悬停 = 弹出小菜单（chat / terminal / browser）
     let mut row = div().flex().flex_row().items_center().gap(px(2.)).flex_shrink_0();
 
     for (vertical, dir, name) in [
@@ -9794,35 +11669,43 @@ fn panel_split_buttons(leaf: u64, cx: &mut Context<Root>) -> AnyElement {
         (false, SplitDir::Col, gpui_kit::assets::IconName::PanelBottom),
     ] {
         let weak = cx.entity().downgrade();
+        let trigger = div()
+            .id(SharedString::from(format!(
+                "panel-split-{}-{leaf}",
+                if vertical { "right" } else { "bottom" }
+            )))
+            .w(px(20.))
+            .h(px(18.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(0x20232b)))
+            .child(Icon::new(name).with_size(px(12.)).text_color(rgb(0x707786)))
+            .on_click(move |_ev, _win, cx| {
+                // 直接点 = dsh（按需求：split 出来的是 dsh 面板）
+                let _ = weak.update(cx, |root, cx| {
+                    root.split_with_dsh(leaf, dir, cx);
+                });
+            });
+        let (weak_dsh, weak_term, weak_browser) = (
+            cx.entity().downgrade(),
+            cx.entity().downgrade(),
+            cx.entity().downgrade(),
+        );
         row = row.child(
-            div()
-                .id(SharedString::from(format!(
-                    "panel-split-{}-{leaf}",
-                    if vertical { "right" } else { "bottom" }
-                )))
-                .w(px(20.))
-                .h(px(18.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_sm()
-                .cursor_pointer()
-                .hover(|style| style.bg(rgb(0x20232b)))
-                .child(Icon::new(name).with_size(px(12.)).text_color(rgb(0x707786)))
-                .on_hover(cx.listener(move |this, hovered, _win, cx| {
-                    if *hovered {
-                        this.open_split_menu(leaf, dir, cx);
-                    } else {
-                        this.close_split_menu_soon(cx);
-                    }
-                }))
-                .on_click(move |_ev, _win, cx| {
-                    // 直接点 = dsh（按需求：split 出来的是 dsh 面板）
-                    let _ = weak.update(cx, |root, cx| {
-                        root.split_hover = None;
-                        root.split_with_dsh(leaf, dir, cx);
-                    });
-                }),
+            gpui_kit::base::HoverCard::new(SharedString::from(format!(
+                "panel-split-card-{}-{leaf}",
+                if vertical { "right" } else { "bottom" }
+            )))
+            .anchor(gpui_kit::Anchor::TopRight)
+            .open_delay(std::time::Duration::from_millis(120))
+            .close_delay(std::time::Duration::from_millis(180))
+            .trigger(trigger)
+            .content(move |_state, _window, _cx| {
+                split_menu_rows(leaf, dir, weak_dsh, weak_term, weak_browser)
+            }),
         );
     }
 
@@ -10267,6 +12150,7 @@ fn split_menu_for(_pane_id: u64, _is_maximized: bool, _cx: &mut Context<Root>) -
 fn split_hover_menu(leaf: u64, dir: SplitDir, cx: &mut Context<Root>) -> AnyElement {
     let weak_dsh = cx.entity().downgrade();
     let weak_term = cx.entity().downgrade();
+    let weak_browser = cx.entity().downgrade();
     let weak_keep = cx.entity().downgrade();
 
     let row = |id: String, glyph: &str, glyph_color: u32, label: &str, _hint: &str| {
@@ -10353,8 +12237,29 @@ fn split_hover_menu(leaf: u64, dir: SplitDir, cx: &mut Context<Root>) -> AnyElem
                 });
             }),
         )
-        .on_mouse_down(MouseButton::Left, move |_ev, _win, _cx| {
-            // 菜单内部的点击不要冒泡到 pane 头（那里会启动拖拽）
+        .child(
+            row(
+                format!("split-hover-browser-{leaf}"),
+                "◐",
+                0xffa657,
+                "browser block",
+                if dir == SplitDir::Row {
+                    "split right"
+                } else {
+                    "split down"
+                },
+            )
+            .on_click(move |_ev, _win, cx| {
+                let _ = weak_browser.update(cx, |root, cx| {
+                    root.split_hover = None;
+                    root.split_with_browser(leaf, dir, cx);
+                });
+            }),
+        )
+        .on_mouse_down(MouseButton::Left, move |_ev, _win, cx| {
+            // 菜单内部的点击不要冒泡到 pane 体/头（那里会切会话、启动拖拽，
+            // 一 notify 就把菜单拆了，行上的 click 永远收不到鼠标抬起）。
+            cx.stop_propagation();
             let _ = &weak_keep;
         })
         .into_any_element()
@@ -10913,58 +12818,6 @@ fn render_question(
         .into_any_element()
 }
 
-/// 浏览器块的临时展示层：把 CEF 的 GPU 帧画在固定区域上。
-fn browser_overlay() -> AnyElement {
-    if std::env::var("OMD_BROWSER").is_err() {
-        return div().into_any_element();
-    }
-    canvas(
-        |bounds, window, _| {
-            // 浏览器画面是外部驱动的：每次布局都预约下一帧，形成绘制循环。
-            if std::env::var("OMD_BROWSER").is_ok() {
-                window.request_animation_frame();
-            }
-            if std::env::var("OMD_BROWSER_DEBUG").is_ok() {
-                static P: AtomicU64 = AtomicU64::new(0);
-                let n = P.fetch_add(1, Ordering::Relaxed) + 1;
-                if n <= 2 {
-                    eprintln!("[overlay] prepaint #{n} {bounds:?}");
-                }
-            }
-        },
-        |bounds, _, window, _cx| {
-            let frame = browser::latest_accel(0);
-            if std::env::var("OMD_BROWSER_DEBUG").is_ok() {
-                static N: AtomicU64 = AtomicU64::new(0);
-                let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-                if n <= 5 {
-                    eprintln!("[overlay] paint #{n} frame={:?}", frame.map(|f| (f.width, f.height, f.seq)));
-                }
-            }
-            if frame.is_some() {
-                // 浏览器帧是外部驱动的，GPUI 不会自己重绘：持续要下一帧。
-                window.request_animation_frame();
-            }
-            if let Some(frame) = frame {
-                window.paint_external_texture(
-                    bounds,
-                    0,
-                    size(
-                        DevicePixels(frame.width as i32),
-                        DevicePixels(frame.height as i32),
-                    ),
-                    Corners::default(),
-                );
-            }
-        },
-    )
-    .absolute()
-    .left(px(40.))
-    .top(px(120.))
-    .w(px(800.))
-    .h(px(520.))
-    .into_any_element()
-}
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -11774,7 +13627,7 @@ impl Render for Root {
                 .cloned()
                 .unwrap_or_default();
             let mut sections: Vec<AnyElement> = Vec::new();
-            if self.settings_loading {
+            if self.settings_loading && namespaces.is_empty() {
                 sections.push(
                     div()
                         .text_xs()
@@ -11791,12 +13644,113 @@ impl Render for Root {
                         .into_any_element(),
                 );
             }
+            let query = self.settings_search.read(cx).value().trim().to_lowercase();
+            let page_namespaces = self.settings_tab.namespaces();
+            // secret 控件（schema 里的 secret 字段和 credential-ref 的"写 key"共用）。
+            let weak_secret = cx.entity().downgrade();
+            let secret_control = move |ns: String,
+                                       key: String,
+                                       reference: String,
+                                       configured: bool,
+                                       writable: bool,
+                                       editing: bool,
+                                       input: &Entity<InputState>|
+                  -> AnyElement {
+                if editing {
+                    return div()
+                        .w(px(240.))
+                        .child(
+                            Input::new(input)
+                                .bordered(false)
+                                .appearance(false)
+                                .focus_bordered(false)
+                                .text_xs(),
+                        )
+                        .into_any_element();
+                }
+                let weak_click = weak_secret.clone();
+                let ref_click = reference.clone();
+                let ns_click = ns.clone();
+                let key_click = key.clone();
+                let mut group = div().flex().flex_row().items_center().gap(px(8.));
+                group = group.child(
+                    div()
+                        .id(SharedString::from(format!("set-{ns}-{key}")))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.))
+                        .px(px(10.))
+                        .py(px(6.))
+                        .rounded(px(8.))
+                        .bg(rgb(0x0f131b))
+                        .border_1()
+                        .border_color(rgb(0x252b38))
+                        .cursor_pointer()
+                        .hover(|style| style.border_color(rgb(0x35506b)))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(if configured {
+                                    rgb(0xe8ecf4)
+                                } else {
+                                    rgb(0x6b7386)
+                                })
+                                .child(if configured { "••••••••" } else { "Not set" }),
+                        )
+                        .on_click(move |_ev, win, cx| {
+                            if !writable || ref_click.is_empty() {
+                                return;
+                            }
+                            let _ = weak_click.update(cx, |root, cx| {
+                                root.begin_secret_edit(
+                                    &ns_click,
+                                    &key_click,
+                                    ref_click.clone(),
+                                    win,
+                                    cx,
+                                );
+                            });
+                        }),
+                );
+                if configured && writable {
+                    let weak_clear = weak_secret.clone();
+                    let ref_clear = reference.clone();
+                    group = group.child(
+                        div()
+                            .id(SharedString::from(format!("clear-{ns}-{key}")))
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded(px(6.))
+                            .text_xs()
+                            .text_color(rgb(0x8b93a7))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x1a212b)))
+                            .child("Clear")
+                            .on_click(move |_ev, _win, cx| {
+                                let _ = weak_clear.update(cx, |root, cx| {
+                                    root.unset_credential(ref_clear.clone());
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+                group.into_any_element()
+            };
             for ns_view in &namespaces {
                 let ns = ns_view
                     .get("ns")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                // 有搜索词时跨页搜索，不再受当前页限制。
+                if query.is_empty()
+                    && !page_namespaces.is_empty()
+                    && !page_namespaces.contains(&ns.as_str())
+                {
+                    continue;
+                }
+                let schema = ns_view.get("schema").cloned().unwrap_or(Value::Null);
                 let revision = ns_view.get("revision").and_then(|v| v.as_i64()).unwrap_or(0);
                 let value = ns_view.get("value").cloned().unwrap_or(Value::Null);
                 let user = ns_view.get("user").cloned().unwrap_or(Value::Null);
@@ -11806,214 +13760,435 @@ impl Render for Root {
                     .cloned()
                     .unwrap_or_default();
                 let mut rows: Vec<AnyElement> = Vec::new();
-                let fields: Vec<(String, Value)> = value
-                    .as_object()
-                    .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                    .unwrap_or_default();
+                // 以 schema 的字段表为准（顺序稳定，且没有默认值的项也能显示），
+                // 值优先取当前解析结果，其次 schema 默认值。
+                let mut fields: Vec<(String, Value)> = Vec::new();
+                if let Some(dict) = schema_root(&schema)
+                    .and_then(|root| root.get("dict"))
+                    .and_then(|dict| dict.as_object())
                 {
-                    for (key, field) in &fields {
-                        let field = field;
-                        let mut path = vec![key.clone()];
-                        let overridden = user
-                            .get(key)
-                            .map(|v| !v.is_null())
-                            .unwrap_or(false);
-                        let editing_this = self
-                            .settings_edit
-                            .as_ref()
-                            .is_some_and(|(e_ns, e_path, _, _)| e_ns == &ns && e_path == &path);
-                        let control: AnyElement = if editing_this {
-                            div()
-                                .w(px(220.))
-                                .child(
-                                    Input::new(&self.settings_input)
-                                        .bordered(false)
-                                        .appearance(false)
-                                        .focus_bordered(false)
-                                        .text_xs(),
-                                )
-                                .into_any_element()
-                        } else {
-                            match field {
-                                Value::Bool(on) => {
-                                    let on = *on;
-                                    div()
-                                        .id(SharedString::from(format!("set-{ns}-{key}")))
-                                        .px(px(8.))
-                                        .py(px(2.))
-                                        .rounded_sm()
-                                        .cursor_pointer()
-                                        .bg(rgb(0x20232b))
-                                        .text_xs()
-                                        .text_color(if on { rgb(0x00d98a) } else { rgb(0x9ca3b0) })
-                                        .child(if on { "on" } else { "off" })
-                                        .on_click(cx.listener({
-                                            let ns = ns.clone();
-                                            let path = path.clone();
-                                            move |this, _ev, _win, cx| {
+                    for (key, uid) in dict {
+                        let default = uid
+                            .as_i64()
+                            .and_then(|uid| schema_lookup(&schema, uid))
+                            .and_then(|node| node.get("meta"))
+                            .and_then(|meta| meta.get("default"))
+                            .cloned();
+                        let current = value.get(key).cloned().or(default).unwrap_or(Value::Null);
+                        fields.push((key.clone(), current));
+                    }
+                }
+                if fields.is_empty() {
+                    fields = value
+                        .as_object()
+                        .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                        .unwrap_or_default();
+                }
+                let mut shown = 0usize;
+                for (key, field) in &fields {
+                    // models 有专门的编辑器，别在通用卡片里再列一遍。
+                    if ns == "llm-deepseek" && key == "models" {
+                        continue;
+                    }
+                    // provider/model 由上面的跨 provider 选择器负责。
+                    if ns == "agent-default-model" && (key == "provider" || key == "model") {
+                        continue;
+                    }
+                    // providers 有专门的编辑器。
+                    if ns == "llm-pi-ai" && key == "providers" {
+                        continue;
+                    }
+                    // role=secret 的字段值永远不会下发，只能知道"设没设"。
+                    let secret_set = secrets.iter().find_map(|secret| {
+                        let first = secret
+                            .get("path")?
+                            .as_array()?
+                            .first()?
+                            .as_str()?;
+                        (first == key).then(|| {
+                            secret
+                                .get("set")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                        })
+                    });
+                    let (title, description) = match settings_field_copy(&ns, key) {
+                        Some((title, description)) => (title.to_string(), description.to_string()),
+                        None => (humanize_key(key), format!("{ns}.{key}")),
+                    };
+                    if !query.is_empty() {
+                        let hay = format!(
+                            "{} {} {} {}",
+                            title.to_lowercase(),
+                            description.to_lowercase(),
+                            ns.to_lowercase(),
+                            key.to_lowercase()
+                        );
+                        if !hay.contains(&query) {
+                            continue;
+                        }
+                    }
+                    let path = vec![key.clone()];
+                    let overridden = user.get(key).map(|v| !v.is_null()).unwrap_or(false);
+                    let editing_this = self
+                        .settings_edit
+                        .as_ref()
+                        .is_some_and(|(e_ns, e_path, _, _)| e_ns == &ns && e_path == &path);
+                    let kind = field_kind(&schema, key);
+                    let control: AnyElement = if editing_this {
+                        div()
+                            .w(px(240.))
+                            .child(
+                                Input::new(&self.settings_input)
+                                    .bordered(false)
+                                    .appearance(false)
+                                    .focus_bordered(false)
+                                    .text_xs(),
+                            )
+                            .into_any_element()
+                    } else {
+                        match kind {
+                            FieldKind::Choice(options) => {
+                                let current = field.as_str().unwrap_or("").to_string();
+                                let mut group = div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(2.))
+                                    .rounded(px(8.))
+                                    .bg(rgb(0x1a1f29))
+                                    .p(px(2.));
+                                for opt in options {
+                                    let active = current == opt;
+                                    let label = settings_choice_copy(&ns, key, &opt)
+                                        .map(str::to_string)
+                                        .unwrap_or_else(|| humanize_choice(&opt));
+                                    let ns_arg = ns.clone();
+                                    let path_arg = path.clone();
+                                    let opt_arg = opt.clone();
+                                    group = group.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "set-{ns}-{key}-{opt}"
+                                            )))
+                                            .px(px(12.))
+                                            .py(px(5.))
+                                            .rounded(px(6.))
+                                            .bg(if active {
+                                                rgb(0x2c3646)
+                                            } else {
+                                                rgb(0x1a1f29)
+                                            })
+                                            .text_xs()
+                                            .text_color(if active {
+                                                rgb(0xeef2f8)
+                                            } else {
+                                                rgb(0x8b93a7)
+                                            })
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgb(0x252c39)))
+                                            .child(SharedString::from(label))
+                                            .on_click(cx.listener(move |this, _ev, _win, cx| {
                                                 if !editable {
                                                     return;
                                                 }
                                                 this.write_setting(
-                                                    &ns,
-                                                    path.clone(),
-                                                    Value::Bool(!on),
+                                                    &ns_arg,
+                                                    path_arg.clone(),
+                                                    Value::String(opt_arg.clone()),
                                                     Some(revision),
                                                 );
                                                 cx.notify();
-                                            }
-                                        }))
-                                        .into_any_element()
+                                            })),
+                                    );
                                 }
-                                Value::Number(n) => {
-                                    let text = n.to_string();
-                                    let is_number = true;
+                                group.into_any_element()
+                            }
+                            FieldKind::Bool => {
+                                let on = field.as_bool().unwrap_or(false);
+                                let ns_arg = ns.clone();
+                                let path_arg = path.clone();
+                                div()
+                                    .id(SharedString::from(format!("set-{ns}-{key}")))
+                                    .relative()
+                                    .w(px(42.))
+                                    .h(px(24.))
+                                    .rounded(px(12.))
+                                    .bg(if on { rgb(0x2f6fb5) } else { rgb(0x2b3240) })
+                                    .cursor_pointer()
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .top(px(3.))
+                                            .left(px(if on { 21. } else { 3. }))
+                                            .w(px(18.))
+                                            .h(px(18.))
+                                            .rounded(px(9.))
+                                            .bg(rgb(0xffffff)),
+                                    )
+                                    .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                        if !editable {
+                                            return;
+                                        }
+                                        this.write_setting(
+                                            &ns_arg,
+                                            path_arg.clone(),
+                                            Value::Bool(!on),
+                                            Some(revision),
+                                        );
+                                        cx.notify();
+                                    }))
+                                    .into_any_element()
+                            }
+                            FieldKind::ReadOnly => {
+                                let shown: String =
+                                    field.to_string().chars().take(40).collect();
+                                div()
+                                    .px(px(10.))
+                                    .py(px(5.))
+                                    .rounded(px(6.))
+                                    .bg(rgb(0x1a1f29))
+                                    .text_xs()
+                                    .text_color(rgb(0x8b93a7))
+                                    .child(SharedString::from(shown))
+                                    .into_any_element()
+                            }
+                            FieldKind::Secret => {
+                                let reference =
+                                    credential_ref_of(&schema, &value).unwrap_or_default();
+                                let info = self.credentials_doc.get(&reference);
+                                let configured = info
+                                    .and_then(|v| v.get("configured"))
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                let writable = info
+                                    .and_then(|v| v.get("writable"))
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(true);
+                                let editing_secret = self
+                                    .settings_secret_edit
+                                    .as_ref()
+                                    .is_some_and(|(e_ns, e_key, _)| e_ns == &ns && e_key == key);
+                                secret_control(
+                                    ns.clone(),
+                                    key.clone(),
+                                    reference,
+                                    configured,
+                                    writable && editable,
+                                    editing_secret,
+                                    &self.settings_input,
+                                )
+                            }
+                            FieldKind::Other => {
+                                if let Some(set) = secret_set {
                                     div()
-                                        .id(SharedString::from(format!("set-{ns}-{key}")))
-                                        .px(px(8.))
-                                        .py(px(2.))
-                                        .rounded_sm()
-                                        .cursor_pointer()
-                                        .bg(rgb(0x20232b))
+                                        .px(px(10.))
+                                        .py(px(5.))
+                                        .rounded(px(6.))
+                                        .bg(rgb(0x1a1f29))
                                         .text_xs()
-                                        .text_color(rgb(0xe8ecf4))
-                                        .child(SharedString::from(text.clone()))
-                                        .on_click(cx.listener({
-                                            let ns = ns.clone();
-                                            let path = path.clone();
-                                            move |this, _ev, win, cx| {
-                                                this.begin_setting_edit(
-                                                    ns.clone(),
-                                                    path.clone(),
-                                                    revision,
-                                                    is_number,
-                                                    text.clone(),
-                                                    win,
-                                                    cx,
-                                                );
-                                            }
-                                        }))
+                                        .text_color(if set {
+                                            rgb(0x59c48a)
+                                        } else {
+                                            rgb(0x8b93a7)
+                                        })
+                                        .child(if set { "Set" } else { "Not set" })
                                         .into_any_element()
-                                }
-                                Value::String(text) => {
-                                    let full = text.clone();
-                                    let shown: String = full.chars().take(60).collect();
-                                    let is_number = false;
+                                } else {
+                                    let shown: String =
+                                        other_preview(field).chars().take(48).collect();
                                     div()
-                                        .id(SharedString::from(format!("set-{ns}-{key}")))
-                                        .px(px(8.))
-                                        .py(px(2.))
-                                        .rounded_sm()
-                                        .cursor_pointer()
-                                        .bg(rgb(0x20232b))
+                                        .max_w(px(260.))
+                                        .overflow_hidden()
                                         .text_xs()
-                                        .text_color(rgb(0xe8ecf4))
-                                        .child(SharedString::from(shown))
-                                        .on_click(cx.listener({
-                                            let ns = ns.clone();
-                                            let path = path.clone();
-                                            move |this, _ev, win, cx| {
-                                                this.begin_setting_edit(
-                                                    ns.clone(),
-                                                    path.clone(),
-                                                    revision,
-                                                    is_number,
-                                                    full.clone(),
-                                                    win,
-                                                    cx,
-                                                );
-                                            }
-                                        }))
-                                        .into_any_element()
-                                }
-                                other => {
-                                    let shown: String = other.to_string().chars().take(60).collect();
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(0x707786))
+                                        .font_family("monospace")
+                                        .text_color(rgb(0x5f6878))
                                         .child(SharedString::from(shown))
                                         .into_any_element()
                                 }
                             }
-                        };
-                        rows.push(
+                            FieldKind::Number | FieldKind::Text => {
+                                let is_number = matches!(kind, FieldKind::Number);
+                                let full = match field {
+                                    Value::String(text) => text.clone(),
+                                    Value::Null => String::new(),
+                                    value => value.to_string(),
+                                };
+                                let shown: String = if full.is_empty() {
+                                    "—".to_string()
+                                } else {
+                                    full.chars().take(46).collect()
+                                };
+                                let ns_arg = ns.clone();
+                                let path_arg = path.clone();
+                                let full_arg = full.clone();
+                                div()
+                                    .id(SharedString::from(format!("set-{ns}-{key}")))
+                                    .w(px(240.))
+                                    .px(px(10.))
+                                    .py(px(6.))
+                                    .rounded(px(8.))
+                                    .bg(rgb(0x0f131b))
+                                    .border_1()
+                                    .border_color(rgb(0x252b38))
+                                    .text_xs()
+                                    .text_color(rgb(0xe8ecf4))
+                                    .cursor_pointer()
+                                    .overflow_hidden()
+                                    .child(SharedString::from(shown))
+                                    .on_click(cx.listener(move |this, _ev, win, cx| {
+                                        if !editable {
+                                            return;
+                                        }
+                                        this.begin_setting_edit(
+                                            ns_arg.clone(),
+                                            path_arg.clone(),
+                                            revision,
+                                            is_number,
+                                            full_arg.clone(),
+                                            win,
+                                            cx,
+                                        );
+                                    }))
+                                    .into_any_element()
+                            }
+                        }
+                    };
+                    let mut row = div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(20.))
+                        .px(px(16.))
+                        .py(px(12.));
+                    if shown > 0 {
+                        row = row.border_t_1().border_color(rgb(0x1d2229));
+                    }
+                    shown += 1;
+                    rows.push(
+                        row.child(
                             div()
                                 .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(8.))
-                                .py(px(3.))
+                                .flex_col()
+                                .gap(px(3.))
+                                .flex_1()
+                                .min_w(px(0.))
                                 .child(
                                     div()
-                                        .w(px(210.))
+                                        .text_sm()
+                                        .text_color(rgb(0xe8ecf4))
+                                        .child(SharedString::from(title)),
+                                )
+                                .child(
+                                    div()
                                         .text_xs()
                                         .text_color(if overridden {
-                                            rgb(0x00b4ff)
+                                            rgb(0x4e9ad6)
                                         } else {
-                                            rgb(0x9ca3b0)
+                                            rgb(0x6b7386)
                                         })
-                                        .child(SharedString::from(key.clone())),
-                                )
-                                .child(control)
-                                .into_any_element(),
+                                        .child(SharedString::from(description.clone())),
+                                ),
+                        )
+                        .child(div().flex_shrink_0().child(control))
+                        .into_any_element(),
+                    );
+                }
+                // 只有 credential-ref、没有 secret 字段的命名空间（llm-deepseek 等）：
+                // 补一行「API key」，写进同一个 ref。
+                let has_secret_field = fields
+                    .iter()
+                    .any(|(key, _)| matches!(field_kind(&schema, key), FieldKind::Secret));
+                if !has_secret_field {
+                    if let Some(reference) = credential_ref_of(&schema, &value) {
+                        let info = self.credentials_doc.get(&reference);
+                        let configured = info
+                            .and_then(|v| v.get("configured"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let writable = info
+                            .and_then(|v| v.get("writable"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        let editing = self
+                            .settings_secret_edit
+                            .as_ref()
+                            .is_some_and(|(e_ns, e_key, _)| {
+                                e_ns == &ns && e_key == "__api_key"
+                            });
+                        let control = secret_control(
+                            ns.clone(),
+                            "__api_key".to_string(),
+                            reference.clone(),
+                            configured,
+                            writable && editable,
+                            editing,
+                            &self.settings_input,
+                        );
+                        let mut row = div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(20.))
+                            .px(px(16.))
+                            .py(px(12.));
+                        if shown > 0 {
+                            row = row.border_t_1().border_color(rgb(0x1d2229));
+                        }
+                        shown += 1;
+                        rows.push(
+                            row.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(3.))
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(0xe8ecf4))
+                                            .child("API key"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x6b7386))
+                                            .child(SharedString::from(format!(
+                                                "credentials · {reference}"
+                                            ))),
+                                    ),
+                            )
+                            .child(div().flex_shrink_0().child(control))
+                            .into_any_element(),
                         );
                     }
                 }
-                if !secrets.is_empty() {
-                    let names: Vec<String> = secrets
-                        .iter()
-                        .map(|secret| {
-                            let name = secret
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("?")
-                                .to_string();
-                            let set = secret
-                                .get("configured")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            format!("{name} {}", if set { "✓" } else { "—" })
-                        })
-                        .collect();
-                    rows.push(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x5a6070))
-                            .child(SharedString::from(format!(
-                                "secrets: {}",
-                                names.join("  ")
-                            )))
-                            .into_any_element(),
-                    );
+                if shown == 0 {
+                    continue;
                 }
                 sections.push(
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(2.))
-                        .py(px(8.))
+                        .gap(px(8.))
+                        .mb(px(24.))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x7d8695))
+                                .child(SharedString::from(settings_ns_title(&ns))),
+                        )
                         .child(
                             div()
                                 .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(8.))
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_family("monospace")
-                                        .text_color(rgb(0xe8ecf4))
-                                        .child(SharedString::from(ns.clone())),
-                                )
-                                .child(div().flex_1())
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(0x5a6070))
-                                        .child(SharedString::from(format!("rev {revision}"))),
-                                ),
+                                .flex_col()
+                                .rounded(px(10.))
+                                .bg(rgb(0x151a23))
+                                .border_1()
+                                .border_color(rgb(0x222836))
+                                .overflow_hidden()
+                                .children(rows),
                         )
-                        .children(rows)
                         .into_any_element(),
                 );
             }
@@ -12095,8 +14270,12 @@ impl Render for Root {
                         .to_string();
                     let enabled = item.get("enabled").and_then(|v| v.as_bool());
                     let read_only = item.get("readOnlyReason").is_some();
+                    if read_only {
+                        continue;
+                    }
+                    let display = plugin_display_name(&name);
                     if !filter.is_empty() {
-                        let hay = format!("{id} {name} {version}").to_lowercase();
+                        let hay = format!("{id} {name} {display} {version}").to_lowercase();
                         if !hay.contains(&filter) {
                             continue;
                         }
@@ -12109,37 +14288,49 @@ impl Render for Root {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(8.))
-                            .py(px(3.))
+                            .gap(px(12.))
+                            .px(px(16.))
+                            .py(px(11.))
+                            .border_t_1()
+                            .border_color(rgb(0x1d2229))
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
                                     .flex_1()
                                     .min_w(px(0.))
-                                    .child(div().text_sm().child(SharedString::from(name)))
-                                    .children(if version.is_empty() {
-                                        None
-                                    } else {
-                                        Some(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(0x707786))
-                                                .child(SharedString::from(version)),
-                                        )
-                                    }),
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(0xe8ecf4))
+                                            .child(SharedString::from(display)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x6b7386))
+                                            .child(SharedString::from(name)),
+                                    ),
                             )
                             .children(match enabled {
                                 Some(on) => {
                                     let mut chip = div()
                                         .id(SharedString::from(format!("plugin-toggle-{id}")))
-                                        .px(px(8.))
-                                        .py(px(2.))
-                                        .rounded_sm()
-                                        .bg(rgb(0x20232b))
-                                        .text_xs()
-                                        .text_color(if on { rgb(0x00d98a) } else { rgb(0x9ca3b0) })
-                                        .child(if on { "on" } else { "off" });
+                                        .relative()
+                                        .w(px(42.))
+                                        .h(px(24.))
+                                        .rounded(px(12.))
+                                        .bg(if on { rgb(0x2f6fb5) } else { rgb(0x2b3240) })
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .top(px(3.))
+                                                .left(px(if on { 21. } else { 3. }))
+                                                .w(px(18.))
+                                                .h(px(18.))
+                                                .rounded(px(9.))
+                                                .bg(rgb(0xffffff)),
+                                        );
                                     if !read_only {
                                         chip = chip
                                             .cursor_pointer()
@@ -12184,120 +14375,2426 @@ impl Render for Root {
                 }
             }
 
-            // ---- Account 分页 ----
-            let mut account_rows: Vec<AnyElement> = Vec::new();
-            if self.settings_tab == SettingsTab::Account {
-                if let Some(err) = self.settings_tab_error.clone() {
-                    account_rows.push(
+            // ---- Models：模型目录编辑器 ----
+            let mut models_rows: Vec<AnyElement> = Vec::new();
+            if self.settings_tab == SettingsTab::Models {
+                let (_, models) = self.llm_models();
+                let default_id = self
+                    .settings_doc
+                    .get("namespaces")
+                    .and_then(|v| v.as_array())
+                    .and_then(|items| {
+                        items.iter().find(|ns| {
+                            ns.get("ns").and_then(|v| v.as_str())
+                                == Some("agent-default-model")
+                        })
+                    })
+                    .and_then(|view| view.get("value"))
+                    .and_then(|value| value.get("model"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                // ---- DeepSeek 账号（登录 / 登出）----
+                {
+                    let signed_in = self
+                        .account_doc
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .map(|status| status == "credential-stored")
+                        .unwrap_or(false);
+                    models_rows.push(
                         div()
-                            .text_xs()
-                            .text_color(rgb(0xff5663))
-                            .child(SharedString::from(err))
+                            .flex()
+                            .flex_row()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap(px(12.))
+                            .px(px(16.))
+                            .py(px(11.))
+                            .mb(px(10.))
+                            .rounded(px(10.))
+                            .bg(rgb(0x151a23))
+                            .border_1()
+                            .border_color(rgb(0x222836))
+                            .child(
+                                div()
+                                    .w(px(34.))
+                                    .h(px(34.))
+                                    .flex_shrink_0()
+                                    .rounded(px(9.))
+                                    .bg(rgb(0x1d4a6b))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x8fd0f5))
+                                            .child("DS"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(0xeef2f8))
+                                            .child("DeepSeek account"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(6.))
+                                            .child(
+                                                div()
+                                                    .w(px(8.))
+                                                    .h(px(8.))
+                                                    .rounded(px(4.))
+                                                    .bg(if signed_in {
+                                                        rgb(0x3fbf7f)
+                                                    } else {
+                                                        rgb(0xe06c75)
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(if signed_in {
+                                                        rgb(0x59c48a)
+                                                    } else {
+                                                        rgb(0x8b93a7)
+                                                    })
+                                                    .child(if signed_in { "Signed in" } else { "Not signed in" }),
+                                            ),
+                                    ),
+                            )
                             .into_any_element(),
                     );
                 }
-                if let Some(map) = self.account_doc.as_object() {
-                    for (key, value) in map {
-                        let shown = match value {
-                            Value::String(text) => text.chars().take(80).collect::<String>(),
-                            other => other.to_string().chars().take(80).collect::<String>(),
-                        };
-                        account_rows.push(
+
+                // ---- Providers：已配置的卡片 + 添加面板 ----
+                let (_, providers) = self.pi_providers();
+                let provider_query = self
+                    .provider_search
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_lowercase();
+                if self.adding_provider {
+                    // 两个 tab：第三方模型提供商 / 自定义模型 API
+                    models_rows.push(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(2.))
+                            .p(px(3.))
+                            .mb(px(10.))
+                            .rounded(px(8.))
+                            .bg(rgb(0x101a23))
+                            .border_1()
+                            .border_color(rgb(0x1f3a4c))
+                            .child(
+                                div()
+                                    .id("provider-tab-third")
+                                    .px(px(14.))
+                                    .py(px(5.))
+                                    .rounded(px(6.))
+                                    .bg(if self.provider_add_tab == 0 {
+                                        rgb(0x2c3646)
+                                    } else {
+                                        rgb(0x101a23)
+                                    })
+                                    .text_sm()
+                                    .text_color(if self.provider_add_tab == 0 {
+                                        rgb(0xeef2f8)
+                                    } else {
+                                        rgb(0x8b93a7)
+                                    })
+                                    .cursor_pointer()
+                                    .child("Third-party providers")
+                                    .on_click(cx.listener(|this, _ev, _win, cx| {
+                                        this.provider_add_tab = 0;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("provider-tab-custom")
+                                    .px(px(14.))
+                                    .py(px(5.))
+                                    .rounded(px(6.))
+                                    .bg(if self.provider_add_tab == 1 {
+                                        rgb(0x2c3646)
+                                    } else {
+                                        rgb(0x101a23)
+                                    })
+                                    .text_sm()
+                                    .text_color(if self.provider_add_tab == 1 {
+                                        rgb(0xeef2f8)
+                                    } else {
+                                        rgb(0x8b93a7)
+                                    })
+                                    .cursor_pointer()
+                                    .child("Custom model API")
+                                    .on_click(cx.listener(|this, _ev, _win, cx| {
+                                        this.provider_add_tab = 1;
+                                        cx.notify();
+                                    })),
+                            )
+                            .into_any_element(),
+                    );
+                    if self.provider_add_tab == 0 {
+                        models_rows.push(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x8b93a7))
+                                .mb(px(8.))
+                                .child(
+                                    "Pick a provider from the built-in catalog and enter its API key.",
+                                )
+                                .into_any_element(),
+                        );
+                        models_rows.push(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .flex_shrink_0()
+                                .items_center()
+                                .gap(px(8.))
+                                .px(px(12.))
+                                .py(px(5.))
+                                .mb(px(8.))
+                                .rounded(px(8.))
+                                .bg(rgb(0x101a23))
+                                .border_1()
+                                .border_color(rgb(0x1f3a4c))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(0x5f7a8c))
+                                        .child("⌕"),
+                                )
+                                .child(
+                                    div().flex_1().min_w(px(0.)).child(
+                                        Input::new(&self.provider_search)
+                                            .bordered(false)
+                                            .appearance(false)
+                                            .focus_bordered(false)
+                                            .text_sm(),
+                                    ),
+                                )
+                                .into_any_element(),
+                        );
+                    } else {
+                        models_rows.push(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.))
+                                .p(px(14.))
+                                .rounded(px(10.))
+                                .bg(rgb(0x11161f))
+                                .border_1()
+                                .border_color(rgb(0x222836))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x8b93a7))
+                                        .child("Enter a route id, base URL and model list for any compatible endpoint."),
+                                )
+                                .child(
+                                    div()
+                                        .id("provider-add-custom")
+                                        .px(px(14.))
+                                        .py(px(5.))
+                                        .rounded(px(6.))
+                                        .bg(rgb(0x2f6fb5))
+                                        .text_xs()
+                                        .text_color(rgb(0xffffff))
+                                        .cursor_pointer()
+                                        .child("New custom provider")
+                                        .on_click(cx.listener(|this, _ev, win, cx| {
+                                            this.open_provider_draft(None, win, cx);
+                                        })),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                }
+
+                let key_only = false;
+                if key_only {
+                    models_rows.push(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_shrink_0()
+                            .gap(px(10.))
+                            .p(px(14.))
+                            .mb(px(16.))
+                            .rounded(px(10.))
+                            .bg(rgb(0x151a23))
+                            .border_1()
+                            .border_color(rgb(0x2b4a63))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0xe8ecf4))
+                                    .child("DeepSeek API key"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x8b93a7))
+                                    .child("Stored as DEEPSEEK_API_KEY"),
+                            )
+                            .child(
+                                div()
+                                    .px(px(8.))
+                                    .py(px(5.))
+                                    .rounded(px(8.))
+                                    .bg(rgb(0x0f131b))
+                                    .border_1()
+                                    .border_color(rgb(0x252b38))
+                                    .child(
+                                        Input::new(&self.provider_apikey_input)
+                                            .bordered(false)
+                                            .appearance(false)
+                                            .focus_bordered(false)
+                                            .text_sm(),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .id("deepseek-key-save")
+                                            .px(px(12.))
+                                            .py(px(5.))
+                                            .rounded(px(6.))
+                                            .bg(rgb(0x2f6fb5))
+                                            .text_xs()
+                                            .text_color(rgb(0xffffff))
+                                            .cursor_pointer()
+                                            .child("Save")
+                                            .on_click(cx.listener(|this, _ev, _win, cx| {
+                                                this.save_provider_draft(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("deepseek-key-cancel")
+                                            .px(px(12.))
+                                            .py(px(5.))
+                                            .rounded(px(6.))
+                                            .bg(rgb(0x1a1f29))
+                                            .text_xs()
+                                            .text_color(rgb(0x8b93a7))
+                                            .cursor_pointer()
+                                            .child("Cancel")
+                                            .on_click(cx.listener(|this, _ev, _win, cx| {
+                                                this.provider_draft = None;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .into_any_element(),
+                    );
+                }
+
+                if self.provider_draft.is_some() && !key_only {
+                    let editing = matches!(self.provider_draft, Some(Some(_)));
+                    let editing_route = match &self.provider_draft {
+                        Some(Some(route)) if route != "deepseek-official" => Some(route.clone()),
+                        _ => None,
+                    };
+                    let route_now = self.provider_id_input.read(cx).value().trim().to_string();
+                    let env_now = self.provider_keyenv_input.read(cx).value().trim().to_string();
+                    let key_set = !env_now.is_empty()
+                        && self.credentials_doc.get(&env_now)
+                            .and_then(|info| info.get("configured"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                    let title = if route_now.is_empty() {
+                        if editing { "Edit provider".to_string() } else { "Add provider".to_string() }
+                    } else if editing {
+                        format!("Edit provider · {route_now}")
+                    } else {
+                        format!("Add provider · {route_now}")
+                    };
+                    let field = |label: &str, input: &Entity<InputState>| {
+                        div().flex().flex_col().gap(px(4.)).flex_1().min_w(px(0.))
+                            .child(div().text_xs().text_color(rgb(0x7d8695)).child(SharedString::from(label.to_string())))
+                            .child(div().px(px(8.)).py(px(5.)).rounded(px(8.)).bg(rgb(0x0f131b)).border_1()
+                                .border_color(rgb(0x252b38))
+                                .child(Input::new(input).bordered(false).appearance(false).focus_bordered(false).text_sm()))
+                    };
+                    let model_ns = if route_now == "deepseek-official" { "llm-deepseek" } else { "llm-pi-ai" };
+                    let model_path = if route_now == "deepseek-official" {
+                        vec!["models".to_string()]
+                    } else {
+                        vec!["providers".to_string(), route_now.clone(), "models".to_string()]
+                    };
+                    let models = if route_now.is_empty() { Vec::new() } else { self.models_at(model_ns, &model_path) };
+                    let mut models_col = div().flex().flex_col().gap(px(6.))
+                        .child(div().text_xs().text_color(rgb(0x7d8695)).child("Models"));
+                    if route_now.is_empty() {
+                        models_col = models_col.child(div().text_xs().text_color(rgb(0x6b7386)).child("Enter a route id first, then add models"));
+                    }
+                    for (index, model) in models.iter().enumerate() {
+                        let id = model.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let display = model.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
+                        let path_edit = model_path.clone();
+                        let path_remove = model_path.clone();
+                        models_col = models_col.child(
+                            div().flex().flex_row().items_center().gap(px(8.)).px(px(10.)).py(px(6.))
+                                .rounded(px(6.)).bg(rgb(0x0f131b))
+                                .child(div().flex().flex_col().gap(px(2.)).flex_1().min_w(px(0.))
+                                    .child(div().text_sm().text_color(rgb(0xe8ecf4)).child(SharedString::from(display)))
+                                    .child(div().text_xs().text_color(rgb(0x6b7386)).child(SharedString::from(id))))
+                                .child(div().id(SharedString::from(format!("prov-m-edit-{index}")))
+                                    .px(px(8.)).py(px(3.)).rounded(px(6.)).text_xs().text_color(rgb(0x8b93a7))
+                                    .cursor_pointer().hover(|s| s.bg(rgb(0x1a212b))).child("Edit")
+                                    .on_click(cx.listener(move |this, _ev, win, cx| {
+                                        this.open_model_draft_at(model_ns, path_edit.clone(), Some(index), win, cx);
+                                    })))
+                                .child(div().id(SharedString::from(format!("prov-m-del-{index}")))
+                                    .px(px(8.)).py(px(3.)).rounded(px(6.)).text_xs().text_color(rgb(0x8b93a7))
+                                    .cursor_pointer().hover(|s| s.bg(rgb(0x3a1f24))).child("Remove")
+                                    .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                        this.remove_model_at(model_ns, path_remove.clone(), index);
+                                        cx.notify();
+                                    }))),
+                        );
+                    }
+                    let path_add = model_path.clone();
+                    let route_add = route_now.clone();
+                    models_col = models_col.child(
+                        div().id("prov-model-add").px(px(10.)).py(px(5.)).rounded(px(6.)).bg(rgb(0x1a1f29))
+                            .text_xs().text_color(rgb(0xb4bccb)).cursor_pointer().hover(|s| s.bg(rgb(0x252c39)))
+                            .child("+ Add model")
+                            .on_click(cx.listener(move |this, _ev, win, cx| {
+                                if route_add.is_empty() { return; }
+                                this.open_model_draft_at(model_ns, path_add.clone(), None, win, cx);
+                            })),
+                    );
+                    let mut custom = div().flex().flex_col().gap(px(10.))
+                        .child(div().flex().flex_row().gap(px(10.))
+                            .child(field("Route id", &self.provider_id_input))
+                            .child(field("Display name", &self.provider_name_input)))
+                        .child(div().flex().flex_row().gap(px(10.))
+                            .child(field("Base URL", &self.provider_base_input))
+                            .child(field("Key env", &self.provider_keyenv_input)))
+                        .child(models_col)
+                        .child({
+                            let mut protocols = div().flex().flex_col().gap(px(6.))
+                                .child(div().text_xs().text_color(rgb(0x7d8695)).child("Protocol"))
+                                .child(div().flex().flex_row().gap(px(6.)));
+                            for (value, label) in [
+                                ("openai-completions", "OpenAI Completions"),
+                                ("openai-responses", "OpenAI Responses"),
+                                ("anthropic-messages", "Anthropic Messages"),
+                            ] {
+                                let active = self.provider_api == value;
+                                let value_owned = value.to_string();
+                                protocols = protocols.child(
+                                    div().id(SharedString::from(format!("prov-proto-{value}")))
+                                        .px(px(10.)).py(px(4.)).rounded(px(6.))
+                                        .bg(if active { rgb(0x2c3646) } else { rgb(0x1a1f29) })
+                                        .text_xs().text_color(if active { rgb(0xeef2f8) } else { rgb(0x8b93a7) })
+                                        .cursor_pointer().child(SharedString::from(label))
+                                        .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                            this.provider_api = value_owned.clone();
+                                            cx.notify();
+                                        })),
+                                );
+                            }
+                            protocols
+                        });
+                    models_rows.push(
+                        div().flex().flex_col().flex_shrink_0().gap(px(10.)).p(px(14.)).mb(px(16.))
+                            .rounded(px(10.)).bg(rgb(0x151a23)).border_1().border_color(rgb(0x2b4a63))
+                            .child(div().text_sm().text_color(rgb(0xe8ecf4)).child(SharedString::from(title)))
+                            .child(div().flex().flex_col().gap(px(4.))
+                                .child(div().text_xs().text_color(rgb(0x7d8695))
+                                    .child(SharedString::from(if env_now.is_empty() {
+                                        "API key".to_string()
+                                    } else {
+                                        format!("API key (env {env_now})")
+                                    })))
+                                .child(div().px(px(8.)).py(px(5.)).rounded(px(8.)).bg(rgb(0x0f131b))
+                                    .border_1().border_color(rgb(0x252b38))
+                                    .child(Input::new(&self.provider_apikey_input)
+                                        .bordered(false).appearance(false).focus_bordered(false).text_sm()))
+                                .children((!env_now.is_empty() && !key_set).then(|| {
+                                    div().text_xs().text_color(rgb(0xc9a15a))
+                                        .child(SharedString::from(format!(
+                                            "Env var not detected. Enter an API key, or configure {env_now} in your env."
+                                        )))
+                                })))
+                            .child(div().id("provider-custom-toggle").flex().flex_row().items_center().gap(px(6.))
+                                .text_xs().text_color(rgb(0x8b93a7)).cursor_pointer()
+                                .child(if self.customized_open { "▾ 自定义设置" } else { "▸ 自定义设置" })
+                                .on_click(cx.listener(|this, _ev, _win, cx| {
+                                    this.customized_open = !this.customized_open;
+                                    cx.notify();
+                                })))
+                            .children(self.customized_open.then_some(custom))
+                            .child(div().flex().flex_row().gap(px(8.))
+                                .child(div().id("provider-save").px(px(14.)).py(px(5.)).rounded(px(6.))
+                                    .bg(rgb(0x2f6fb5)).text_xs().text_color(rgb(0xffffff)).cursor_pointer()
+                                    .child("Save")
+                                    .on_click(cx.listener(|this, _ev, _win, cx| { this.save_provider_draft(cx); })))
+                                .child(div().id("provider-cancel").px(px(14.)).py(px(5.)).rounded(px(6.))
+                                    .bg(rgb(0x1a1f29)).text_xs().text_color(rgb(0x8b93a7)).cursor_pointer()
+                                    .child("Cancel")
+                                    .on_click(cx.listener(|this, _ev, _win, cx| {
+                                        this.provider_draft = None;
+                                        cx.notify();
+                                    })))
+                                .children(editing_route.map(|route| {
+                                    div().id("provider-remove").px(px(14.)).py(px(5.)).rounded(px(6.))
+                                        .bg(rgb(0x3a1f24)).text_xs().text_color(rgb(0xff8a95)).cursor_pointer()
+                                        .child("Remove")
+                                        .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                            this.remove_provider(route.clone());
+                                            this.provider_draft = None;
+                                            cx.notify();
+                                        }))
+                                })))
+                            .into_any_element(),
+                    );
+                }
+
+                // 组合：内置 DeepSeek + 已配置路由 + 插件注册 + 预设
+                let deepseek_ok = self
+                    .credentials_doc
+                    .get("DEEPSEEK_API_KEY")
+                    .and_then(|info| info.get("configured"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let groups = self
+                    .model_catalog
+                    .get("groups")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut specs: Vec<(String, String, String, bool, ProviderKind)> = Vec::new();
+                let catalog = self
+                    .provider_catalog
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                specs.push((
+                    "deepseek-official".to_string(),
+                    "DeepSeek".to_string(),
+                    "llm-deepseek · API key".to_string(),
+                    deepseek_ok,
+                    ProviderKind::Deepseek,
+                ));
+                let mut catalog_ids: Vec<String> = Vec::new();
+                for entry in &catalog {
+                    let id = entry
+                        .get("provider")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if id.is_empty() || id == "deepseek-official" {
+                        continue;
+                    }
+                    let ns = entry
+                        .get("settingsNs")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if ns != "llm-pi-ai" {
+                        continue;
+                    }
+                    catalog_ids.push(id.clone());
+                    let name = entry
+                        .get("displayName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&id)
+                        .to_string();
+                    let env = entry
+                        .get("nativeAuth")
+                        .and_then(|auth| auth.get("env"))
+                        .and_then(|v| v.as_array())
+                        .and_then(|items| items.first())
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let configured = providers.contains_key(&id)
+                        || entry
+                            .get("declared")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                    let ok = configured
+                        && env
+                            .as_deref()
+                            .map(|reference| {
+                                self.credentials_doc
+                                    .get(reference)
+                                    .and_then(|info| info.get("configured"))
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(configured);
+                    let sub = if configured {
+                        let api = providers
+                            .get(&id)
+                            .and_then(|cfg| cfg.get("api"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let model_count = providers
+                            .get(&id)
+                            .and_then(|cfg| cfg.get("models"))
+                            .and_then(|v| v.as_array())
+                            .map(|items| items.len())
+                            .unwrap_or(0);
+                        if api.is_empty() {
+                            "configured".to_string()
+                        } else {
+                            format!("{api} · {model_count} models")
+                        }
+                    } else {
+                        match &env {
+                            Some(reference) => format!("not configured · {reference}"),
+                            None => "not configured".to_string(),
+                        }
+                    };
+                    let kind = if providers.contains_key(&id) {
+                        ProviderKind::Route(id.clone())
+                    } else {
+                        ProviderKind::Available {
+                            name: name.clone(),
+                            env: env.clone(),
+                        }
+                    };
+                    specs.push((id, name, sub, ok, kind));
+                }
+                // 配置里有、目录里没有的自定义路由
+                for (route, config) in &providers {
+                    if catalog_ids.iter().any(|id| id == route) {
+                        continue;
+                    }
+                    let name = config
+                        .get("displayName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(route)
+                        .to_string();
+                    let key_env = config
+                        .get("apiKeyEnv")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let ok = self
+                        .credentials_doc
+                        .get(key_env)
+                        .and_then(|info| info.get("configured"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let api = config.get("api").and_then(|v| v.as_str()).unwrap_or("");
+                    let base = config.get("baseURL").and_then(|v| v.as_str()).unwrap_or("");
+                    let model_count = config
+                        .get("models")
+                        .and_then(|v| v.as_array())
+                        .map(|items| items.len())
+                        .unwrap_or(0);
+                    specs.push((
+                        route.clone(),
+                        name,
+                        format!("{api} · {base} · {model_count} models"),
+                        ok,
+                        ProviderKind::Route(route.clone()),
+                    ));
+                }
+                // 目录还没拉到时用内置预设兜底
+                if catalog.is_empty() {
+                    for preset in PROVIDER_PRESETS {
+                        specs.push((
+                            preset.route.to_string(),
+                            preset.name.to_string(),
+                            "preset · not configured".to_string(),
+                            false,
+                            ProviderKind::Available {
+                                name: preset.name.to_string(),
+                                env: Some(preset.key_env.to_string()),
+                            },
+                        ));
+                    }
+                }
+                let total = specs.len();
+                let writable_rows: Vec<&(String, String, String, bool, ProviderKind)> = specs
+                    .iter()
+                    .filter(|row| !matches!(row.4, ProviderKind::Available { .. }))
+                    .collect();
+                let adding_rows: Vec<&(String, String, String, bool, ProviderKind)> = specs
+                    .iter()
+                    .filter(|row| matches!(row.4, ProviderKind::Available { .. }))
+                    .filter(|row| {
+                        provider_query.is_empty()
+                            || row.1.to_lowercase().contains(&provider_query)
+                            || row.0.to_lowercase().contains(&provider_query)
+                    })
+                    .collect();
+                let shown: Vec<&(String, String, String, bool, ProviderKind)> =
+                    if self.adding_provider && self.provider_add_tab == 0 {
+                        adding_rows
+                    } else if self.adding_provider {
+                        Vec::new()
+                    } else {
+                        writable_rows
+                    };
+                let mut provider_items: Vec<AnyElement> = Vec::new();
+                if shown.is_empty() {
+                    provider_items.push(
+                        div()
+                            .px(px(16.))
+                            .py(px(14.))
+                            .text_xs()
+                            .text_color(rgb(0x707786))
+                            .child("No providers match")
+                            .into_any_element(),
+                    );
+                }
+                for (id, name, sub, ok, kind) in &shown {
+                    if matches!(kind, ProviderKind::Deepseek) {
+                        let configured = *ok;
+                        provider_items.push(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(12.))
+                                .px(px(16.))
+                                .py(px(12.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(3.))
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(8.))
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(rgb(0xe8ecf4))
+                                                        .child("DeepSeek"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w(px(8.))
+                                                        .h(px(8.))
+                                                        .rounded(px(4.))
+                                                        .bg(if configured {
+                                                            rgb(0x3fbf7f)
+                                                        } else {
+                                                            rgb(0xe06c75)
+                                                        }),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x6b7386))
+                                                .child("deepseek-official"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("provider-edit-deepseek")
+                                        .px(px(12.))
+                                        .py(px(5.))
+                                        .rounded(px(6.))
+                                        .bg(rgb(0x1a1f29))
+                                        .text_xs()
+                                        .text_color(rgb(0xd0d4dc))
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(rgb(0x252c39)))
+                                        .child("Edit")
+                                        .on_click(cx.listener(|this, _ev, win, cx| {
+                                            this.open_provider_draft(
+                                                Some("deepseek-official".to_string()),
+                                                win,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .into_any_element(),
+                        );
+                        continue;
+                    }
+                    let _ = (id, sub, ok);
+                    let name_owned = name.clone();
+                    let kind = kind.clone();
+                    provider_items.push(
+                        div()
+                            .id(SharedString::from(format!("provider-row-{id}")))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .px(px(14.))
+                            .py(px(9.))
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x1a212b)))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0xeef2f8))
+                                    .child(SharedString::from(name_owned)),
+                            )
+                            .on_click(cx.listener(move |this, _ev, win, cx| match kind.clone() {
+                                ProviderKind::Deepseek => this.open_deepseek_key(win, cx),
+                                ProviderKind::Route(route) => {
+                                    this.open_provider_draft(Some(route), win, cx)
+                                }
+                                ProviderKind::Available { name, env } => {
+                                    this.open_provider_draft(None, win, cx);
+                                    let route = name
+                                        .to_lowercase()
+                                        .chars()
+                                        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                                        .collect::<String>();
+                                    this.provider_id_input.update(cx, |state, cx| {
+                                        state.set_value(route, win, cx)
+                                    });
+                                    this.provider_name_input.update(cx, |state, cx| {
+                                        state.set_value(name, win, cx)
+                                    });
+                                    if let Some(env) = env {
+                                        this.provider_keyenv_input.update(cx, |state, cx| {
+                                            state.set_value(env, win, cx)
+                                        });
+                                    }
+                                }
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                let _ = total;
+                models_rows.push(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_shrink_0()
+                        .rounded(px(10.))
+                        .bg(rgb(0x151a23))
+                        .border_1()
+                        .border_color(rgb(0x222836))
+                        .overflow_hidden()
+                        .p(px(4.))
+                        .mb(px(10.))
+                        .children(provider_items)
+                        .into_any_element(),
+                );
+                models_rows.push(if self.adding_provider {
+                    div()
+                        .id("provider-add-cancel")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .h(px(38.))
+                        .mb(px(24.))
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(rgb(0x2c3340))
+                        .text_sm()
+                        .text_color(rgb(0x8b93a7))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0x1a212b)))
+                        .child("Cancel")
+                        .on_click(cx.listener(|this, _ev, _win, cx| {
+                            this.adding_provider = false;
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                } else {
+                    div()
+                        .id("provider-add")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(8.))
+                        .h(px(38.))
+                        .mb(px(24.))
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(rgb(0x2c3340))
+                        .text_sm()
+                        .text_color(rgb(0xd0d4dc))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0x1a212b)))
+                        .child("+  Add model provider")
+                        .on_click(cx.listener(|this, _ev, win, cx| {
+                            this.adding_provider = true;
+                            this.provider_search
+                                .read(cx)
+                                .focus_handle(cx)
+                                .focus(win, cx);
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                });
+
+                
+                // 新增 / 编辑表单
+                if self.model_draft.is_some() {
+                    let editing = matches!(&self.model_draft, Some(target) if target.index.is_some());
+                    let field = |label: &str, input: &Entity<InputState>| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x7d8695))
+                                    .child(SharedString::from(label.to_string())),
+                            )
+                            .child(
+                                div()
+                                    .px(px(8.))
+                                    .py(px(5.))
+                                    .rounded(px(8.))
+                                    .bg(rgb(0x0f131b))
+                                    .border_1()
+                                    .border_color(rgb(0x252b38))
+                                    .child(
+                                        Input::new(input)
+                                            .bordered(false)
+                                            .appearance(false)
+                                            .focus_bordered(false)
+                                            .text_sm(),
+                                    ),
+                            )
+                    };
+                    models_rows.push(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_shrink_0()
+                            .gap(px(10.))
+                            .p(px(14.))
+                            .mb(px(16.))
+                            .rounded(px(10.))
+                            .bg(rgb(0x151a23))
+                            .border_1()
+                            .border_color(rgb(0x2b4a63))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0xe8ecf4))
+                                    .child(if editing {
+                                        "Edit model"
+                                    } else {
+                                        "New model"
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(10.))
+                                    .child(field("ID", &self.model_id_input))
+                                    .child(field("Display name", &self.model_name_input))
+                                    .child(field("Context window", &self.model_ctx_input))
+                                    .child(field("Max output tokens", &self.model_max_input)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .id("model-save")
+                                            .px(px(12.))
+                                            .py(px(5.))
+                                            .rounded(px(6.))
+                                            .bg(rgb(0x2f6fb5))
+                                            .text_xs()
+                                            .text_color(rgb(0xffffff))
+                                            .cursor_pointer()
+                                            .child("Save")
+                                            .on_click(cx.listener(|this, _ev, _win, cx| {
+                                                this.save_model_draft(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("model-cancel")
+                                            .px(px(12.))
+                                            .py(px(5.))
+                                            .rounded(px(6.))
+                                            .bg(rgb(0x1a1f29))
+                                            .text_xs()
+                                            .text_color(rgb(0x8b93a7))
+                                            .cursor_pointer()
+                                            .child("Cancel")
+                                            .on_click(cx.listener(|this, _ev, _win, cx| {
+                                                this.model_draft = None;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .into_any_element(),
+                    );
+                }
+
+                let mut items: Vec<AnyElement> = Vec::new();
+                for (index, model) in models.iter().enumerate() {
+                    let id = model
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = model
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&id)
+                        .to_string();
+                    let context = model
+                        .get("contextWindow")
+                        .and_then(|v| v.as_i64())
+                        .map(|value| format!("{value} ctx"))
+                        .unwrap_or_default();
+                    let is_default = id == default_id;
+                    let id_arg = id.clone();
+                    let mut row = div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(12.))
+                        .px(px(16.))
+                        .py(px(11.));
+                    if index > 0 {
+                        row = row.border_t_1().border_color(rgb(0x1d2229));
+                    }
+                    row = row
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.))
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(rgb(0xe8ecf4))
+                                                .child(SharedString::from(name)),
+                                        )
+                                        .children(is_default.then(|| {
+                                            div()
+                                                .px(px(6.))
+                                                .py(px(1.))
+                                                .rounded(px(4.))
+                                                .bg(rgb(0x1d3a2a))
+                                                .text_xs()
+                                                .text_color(rgb(0x59c48a))
+                                                .child("default")
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x6b7386))
+                                        .child(SharedString::from(if context.is_empty() {
+                                            id.clone()
+                                        } else {
+                                            format!("{id} · {context}")
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.))
+                                .children((!is_default).then(|| {
+                                    let id_arg = id_arg.clone();
+                                    div()
+                                        .id(SharedString::from(format!("model-default-{index}")))
+                                        .px(px(8.))
+                                        .py(px(4.))
+                                        .rounded(px(6.))
+                                        .text_xs()
+                                        .text_color(rgb(0x8b93a7))
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(rgb(0x1a212b)))
+                                        .child("Set default")
+                                        .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                            this.set_default_model(
+                                                "deepseek-official".to_string(),
+                                                id_arg.clone(),
+                                            );
+                                            cx.notify();
+                                        }))
+                                }))
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("model-edit-{index}")))
+                                        .px(px(8.))
+                                        .py(px(4.))
+                                        .rounded(px(6.))
+                                        .text_xs()
+                                        .text_color(rgb(0x8b93a7))
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(rgb(0x1a212b)))
+                                        .child("Edit")
+                                        .on_click(cx.listener(move |this, _ev, win, cx| {
+                                            this.open_model_draft(Some(index), win, cx);
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("model-remove-{index}")))
+                                        .px(px(8.))
+                                        .py(px(4.))
+                                        .rounded(px(6.))
+                                        .text_xs()
+                                        .text_color(rgb(0x8b93a7))
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(rgb(0x3a1f24)))
+                                        .child("Remove")
+                                        .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                            this.remove_model(index);
+                                            cx.notify();
+                                        })),
+                                ),
+                        );
+                    items.push(row.into_any_element());
+                }
+                if items.is_empty() {
+                    items.push(
+                        div()
+                            .px(px(16.))
+                            .py(px(14.))
+                            .text_xs()
+                            .text_color(rgb(0x707786))
+                            .child("No models configured")
+                            .into_any_element(),
+                    );
+                }
+                
+                // ---- Default model：跨 provider 选择 ----
+                let current_provider = self
+                    .settings_doc
+                    .get("namespaces")
+                    .and_then(|v| v.as_array())
+                    .and_then(|items| {
+                        items.iter().find(|ns| {
+                            ns.get("ns").and_then(|v| v.as_str())
+                                == Some("agent-default-model")
+                        })
+                    })
+                    .and_then(|view| view.get("value"))
+                    .and_then(|value| value.get("provider"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let current_model = self
+                    .settings_doc
+                    .get("namespaces")
+                    .and_then(|v| v.as_array())
+                    .and_then(|items| {
+                        items.iter().find(|ns| {
+                            ns.get("ns").and_then(|v| v.as_str())
+                                == Some("agent-default-model")
+                        })
+                    })
+                    .and_then(|view| view.get("value"))
+                    .and_then(|value| value.get("model"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // 1) 先列配置里声明的 provider（没 key 也能选，方便先配好再填 key）
+                let groups = self
+                    .model_catalog
+                    .get("groups")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut providers_view: Vec<(String, String, Vec<(String, String)>)> = Vec::new();
+                {
+                    let (_, models) = self.llm_models();
+                    let listed: Vec<(String, String)> = models
+                        .iter()
+                        .filter_map(|model| {
+                            let id = model.get("id")?.as_str()?.to_string();
+                            let name = model
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(&id)
+                                .to_string();
+                            Some((id, name))
+                        })
+                        .collect();
+                    if !listed.is_empty() {
+                        providers_view.push((
+                            "deepseek-official".to_string(),
+                            "DeepSeek".to_string(),
+                            listed,
+                        ));
+                    }
+                    let (_, providers) = self.pi_providers();
+                    for (route, config) in &providers {
+                        let name = config
+                            .get("displayName")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(route)
+                            .to_string();
+                        let listed: Vec<(String, String)> = config
+                            .get("models")
+                            .and_then(|v| v.as_array())
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(|model| {
+                                        let id = model.get("id")?.as_str()?.to_string();
+                                        let name = model
+                                            .get("name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or(&id)
+                                            .to_string();
+                                        Some((id, name))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if !listed.is_empty() {
+                            providers_view.push((route.clone(), name, listed));
+                        }
+                    }
+                }
+                // 2) provider 可用（有 key）时用 catalog 覆盖同名条目的模型列表
+                for group in &groups {
+                    let provider = group
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let provider_name = group
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&provider)
+                        .to_string();
+                    let models = group
+                        .get("models")
+                        .and_then(|v| v.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .map(|model| {
+                                    let id = model
+                                        .get("id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let name = model
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or(&id)
+                                        .to_string();
+                                    (id, name)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if models.is_empty() {
+                        continue;
+                    }
+                    if let Some(existing) = providers_view
+                        .iter_mut()
+                        .find(|(id, _, _)| id == &provider)
+                    {
+                        *existing = (provider, provider_name, models);
+                    } else {
+                        providers_view.push((provider, provider_name, models));
+                    }
+                }
+                let mut default_items: Vec<AnyElement> = Vec::new();
+                let mut first_row = true;
+                for (provider, provider_name, models) in &providers_view {
+                    for (model_id, model_name) in models {
+                        let active =
+                            provider == &current_provider && model_id == &current_model;
+                        let provider_arg = provider.clone();
+                        let model_arg = model_id.clone();
+                        let mut row = div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(12.))
+                            .px(px(16.))
+                            .py(px(11.));
+                        if !first_row {
+                            row = row.border_t_1().border_color(rgb(0x1d2229));
+                        }
+                        first_row = false;
+                        row = row
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(3.))
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(8.))
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(rgb(0xe8ecf4))
+                                                    .child(SharedString::from(model_name)),
+                                            )
+                                            .children(active.then(|| {
+                                                div()
+                                                    .px(px(6.))
+                                                    .py(px(1.))
+                                                    .rounded(px(4.))
+                                                    .bg(rgb(0x1d3a2a))
+                                                    .text_xs()
+                                                    .text_color(rgb(0x59c48a))
+                                                    .child("default")
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x6b7386))
+                                            .child(SharedString::from(format!(
+                                                "{provider_name} · {model_id}"
+                                            ))),
+                                    ),
+                            )
+                            .children((!active).then(|| {
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "default-{provider}-{model_id}"
+                                    )))
+                                    .px(px(8.))
+                                    .py(px(4.))
+                                    .rounded(px(6.))
+                                    .text_xs()
+                                    .text_color(rgb(0x8b93a7))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(0x1a212b)))
+                                    .child("Use")
+                                    .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                        this.set_default_model(
+                                            provider_arg.clone(),
+                                            model_arg.clone(),
+                                        );
+                                        cx.notify();
+                                    }))
+                            }));
+                        default_items.push(row.into_any_element());
+                    }
+                }
+                if default_items.is_empty() {
+                    default_items.push(
+                        div()
+                            .px(px(16.))
+                            .py(px(14.))
+                            .text_xs()
+                            .text_color(rgb(0x707786))
+                            .child("No models yet — add a provider or set an API key")
+                            .into_any_element(),
+                    );
+                }
+                            }
+
+            // ---- 账号与余额 ----
+            let mut account_rows: Vec<AnyElement> = Vec::new();
+            {
+                let signed_in = self
+                    .account_doc
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .map(|status| status == "credential-stored")
+                    .unwrap_or(false);
+                let usage = self
+                    .account_doc
+                    .get("links")
+                    .and_then(|links| links.get("usageUrl"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let topup = self
+                    .account_doc
+                    .get("links")
+                    .and_then(|links| links.get("topUpUrl"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let mut rows: Vec<AnyElement> = Vec::new();
+                rows.push(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(20.))
+                        .px(px(16.))
+                        .py(px(12.))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.))
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(0xe8ecf4))
+                                        .child("DeepSeek account"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(if signed_in {
+                                            rgb(0x59c48a)
+                                        } else {
+                                            rgb(0x8b93a7)
+                                        })
+                                        .child(if signed_in { "Signed in" } else { "Not signed in" }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("account-action")
+                                .px(px(12.))
+                                .py(px(5.))
+                                .rounded(px(6.))
+                                .bg(if signed_in {
+                                    rgb(0x1a1f29)
+                                } else {
+                                    rgb(0x2f6fb5)
+                                })
+                                .text_xs()
+                                .text_color(if signed_in {
+                                    rgb(0x8b93a7)
+                                } else {
+                                    rgb(0xffffff)
+                                })
+                                .cursor_pointer()
+                                .child(if signed_in { "Sign out" } else { "Sign in" })
+                                .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                    if signed_in {
+                                        this.sign_out_account();
+                                    } else {
+                                        this.start_account_signin(cx);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .into_any_element(),
+                );
+                // 资料（昵称 / 联系方式）
+                if signed_in {
+                    if let Some(profile) = self.account_profile.get("value") {
+                        let name = profile
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let contact = profile
+                            .get("contact")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !name.is_empty() || !contact.is_empty() {
+                            rows.push(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(24.))
+                                    .px(px(16.))
+                                    .py(px(10.))
+                                    .border_t_1()
+                                    .border_color(rgb(0x1d2229))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x8b93a7))
+                                            .child("Account"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(2.))
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(rgb(0xe8ecf4))
+                                                    .child(SharedString::from(name)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(0x6b7386))
+                                                    .child(SharedString::from(contact)),
+                                            ),
+                                    )
+                                    .into_any_element(),
+                            );
+                        }
+                    }
+                    // 余额
+                    if let Some(wallets) = self
+                        .account_balance
+                        .get("value")
+                        .and_then(|v| v.as_array())
+                    {
+                        if !wallets.is_empty() {
+                            let text = wallets
+                                .iter()
+                                .filter_map(|wallet| {
+                                    let currency = wallet.get("currency")?.as_str()?;
+                                    let balance = wallet.get("balance")?.as_str()?;
+                                    Some(format!("{balance} {currency}"))
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" · ");
+                            rows.push(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(24.))
+                                    .px(px(16.))
+                                    .py(px(10.))
+                                    .border_t_1()
+                                    .border_color(rgb(0x1d2229))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x8b93a7))
+                                            .child("Balance"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(0xe8ecf4))
+                                            .child(SharedString::from(text)),
+                                    )
+                                    .into_any_element(),
+                            );
+                        }
+                    }
+                }
+                let mut links_row = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(16.))
+                    .py(px(10.))
+                    .border_t_1()
+                    .border_color(rgb(0x1d2229));
+                for (label, url) in [("Usage", usage), ("Top up", topup)] {
+                    if url.is_empty() {
+                        continue;
+                    }
+                    let url_owned = url.clone();
+                    links_row = links_row.child(
+                        div()
+                            .id(SharedString::from(format!("account-link-{label}")))
+                            .px(px(10.))
+                            .py(px(5.))
+                            .rounded(px(6.))
+                            .bg(rgb(0x1a1f29))
+                            .text_xs()
+                            .text_color(rgb(0xb4bccb))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x252c39)))
+                            .child(SharedString::from(label))
+                            .on_click(move |_ev, _win, _cx| {
+                                let _ = std::process::Command::new("xdg-open")
+                                    .arg(url_owned.clone())
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .spawn();
+                            }),
+                    );
+                }
+                rows.push(links_row.into_any_element());
+                account_rows.push(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_shrink_0()
+                        .rounded(px(10.))
+                        .bg(rgb(0x151a23))
+                        .border_1()
+                        .border_color(rgb(0x222836))
+                        .overflow_hidden()
+                        .children(rows)
+                        .into_any_element(),
+                );
+            }
+
+            // ---- 通用设置（按 dsh 的行与顺序）----
+            let mut general_rows: Vec<AnyElement> = Vec::new();
+            if self.settings_tab == SettingsTab::General {
+                let row = |title: &str, desc: &str, control: AnyElement| -> AnyElement {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(20.))
+                        .px(px(16.))
+                        .py(px(11.))
+                        .border_t_1()
+                        .border_color(rgb(0x1d2229))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(0xe8ecf4))
+                                        .child(SharedString::from(title.to_string())),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x6b7386))
+                                        .child(SharedString::from(desc.to_string())),
+                                ),
+                        )
+                        .child(control)
+                        .into_any_element()
+                };
+                let segmented = |ns: &'static str,
+                                 key: &'static str,
+                                 options: &'static [(&'static str, &'static str)]|
+                 -> AnyElement {
+                    let current = self
+                        .ns_get(ns, key)
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let revision = self.ns_revision(ns);
+                    let mut row = div().flex().flex_row().gap(px(6.));
+                    for (value, label) in options {
+                        let active = *value == current;
+                        let value_owned = value.to_string();
+                        row = row.child(
+                            div()
+                                .id(SharedString::from(format!("gen-{ns}-{key}-{value}")))
+                                .px(px(10.))
+                                .py(px(4.))
+                                .rounded(px(6.))
+                                .bg(if active { rgb(0x2c3646) } else { rgb(0x1a1f29) })
+                                .text_xs()
+                                .text_color(if active { rgb(0xeef2f8) } else { rgb(0x8b93a7) })
+                                .cursor_pointer()
+                                .child(SharedString::from(*label))
+                                .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                    this.write_setting(
+                                        ns,
+                                        vec![key.to_string()],
+                                        json!(value_owned.clone()),
+                                        Some(revision),
+                                    );
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                    row.into_any_element()
+                };
+
+                let local_seg = |field: &'static str,
+                                 options: &'static [(&'static str, &'static str)]|
+                 -> AnyElement {
+                    let current = match field {
+                        "work_details" => self.work_details.clone(),
+                        _ => String::new(),
+                    };
+                    let mut row = div().flex().flex_row().gap(px(6.));
+                    for (value, label) in options {
+                        let active = *value == current;
+                        let value_owned = value.to_string();
+                        row = row.child(
+                            div()
+                                .id(SharedString::from(format!("local-{field}-{value}")))
+                                .px(px(10.))
+                                .py(px(4.))
+                                .rounded(px(6.))
+                                .bg(if active { rgb(0x2c3646) } else { rgb(0x1a1f29) })
+                                .text_xs()
+                                .text_color(if active { rgb(0xeef2f8) } else { rgb(0x8b93a7) })
+                                .cursor_pointer()
+                                .child(SharedString::from(*label))
+                                .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                    if field == "work_details" {
+                                        this.work_details = value_owned.clone();
+                                    }
+                                    this.save_state();
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                    row.into_any_element()
+                };
+
+                let local_toggle = |field: &'static str, title: &'static str, desc: &'static str| -> AnyElement {
+                    let current = match field {
+                        "files_show_hidden" => self.files_show_hidden,
+                        "git_signoff" => self.git_signoff,
+                        _ => false,
+                    };
+                    let knob = div()
+                        .w(px(14.))
+                        .h(px(14.))
+                        .mr(px(2.))
+                        .ml(px(2.))
+                        .rounded(px(7.))
+                        .bg(rgb(0xffffff));
+                    let track = div()
+                        .w(px(34.))
+                        .h(px(18.))
+                        .rounded(px(9.))
+                        .bg(if current { rgb(0x2f6fb5) } else { rgb(0x2a3040) })
+                        .flex()
+                        .flex_row()
+                        .items_center();
+                    let switch = div()
+                        .id(SharedString::from(format!("local-toggle-{field}")))
+                        .cursor_pointer()
+                        .child(if current {
+                            track.justify_end().child(knob)
+                        } else {
+                            track.justify_start().child(knob)
+                        })
+                        .on_click(cx.listener(move |this, _ev, _win, cx| {
+                            if field == "files_show_hidden" {
+                                this.files_show_hidden = !this.files_show_hidden;
+                                SHOW_HIDDEN.store(
+                                    this.files_show_hidden,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            } else if field == "git_signoff" {
+                                this.git_signoff = !this.git_signoff;
+                            }
+                            this.save_state();
+                            cx.notify();
+                        }));
+                    row(title, desc, switch.into_any_element())
+                };
+
+                let font_size = self
+                    .ns_get("ui-theme", "fontSize")
+                    .as_i64()
+                    .unwrap_or(14);
+                let font_rev = self.ns_revision("ui-theme");
+                general_rows.push(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_shrink_0()
+                        .rounded(px(10.))
+                        .bg(rgb(0x151a23))
+                        .border_1()
+                        .border_color(rgb(0x222836))
+                        .overflow_hidden()
+                        .mb(px(16.))
+                        .child(row(
+                            "Appearance",
+                            "",
+                            segmented(
+                                "ui-theme",
+                                "preference",
+                                &[("light", "Light"), ("dark", "Dark"), ("system", "System")],
+                            ),
+                        ))
+                        .child(row(
+                            "Font size",
+                            "Only affects conversation content",
                             div()
                                 .flex()
                                 .flex_row()
                                 .items_center()
                                 .gap(px(8.))
-                                .py(px(3.))
                                 .child(
                                     div()
-                                        .w(px(150.))
+                                        .id("gen-font-dec")
+                                        .px(px(10.))
+                                        .py(px(2.))
+                                        .rounded(px(6.))
+                                        .bg(rgb(0x1a1f29))
                                         .text_xs()
-                                        .text_color(rgb(0x9ca3b0))
-                                        .child(SharedString::from(key.clone())),
+                                        .text_color(rgb(0x8b93a7))
+                                        .cursor_pointer()
+                                        .child("−")
+                                        .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                            let next = (font_size - 1).max(10);
+                                            this.write_setting(
+                                                "ui-theme",
+                                                vec!["fontSize".to_string()],
+                                                json!(next),
+                                                Some(font_rev),
+                                            );
+                                            cx.notify();
+                                        })),
                                 )
                                 .child(
                                     div()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .text_xs()
+                                        .text_sm()
                                         .text_color(rgb(0xe8ecf4))
-                                        .child(SharedString::from(shown)),
+                                        .child(SharedString::from(format!("{font_size}"))),
+                                )
+                                .child(div().text_xs().text_color(rgb(0x8b93a7)).child("px"))
+                                .child(
+                                    div()
+                                        .id("gen-font-inc")
+                                        .px(px(10.))
+                                        .py(px(2.))
+                                        .rounded(px(6.))
+                                        .bg(rgb(0x1a1f29))
+                                        .text_xs()
+                                        .text_color(rgb(0x8b93a7))
+                                        .cursor_pointer()
+                                        .child("+")
+                                        .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                            let next = (font_size + 1).min(24);
+                                            this.write_setting(
+                                                "ui-theme",
+                                                vec!["fontSize".to_string()],
+                                                json!(next),
+                                                Some(font_rev),
+                                            );
+                                            cx.notify();
+                                        })),
                                 )
                                 .into_any_element(),
-                        );
-                    }
-                } else {
-                    account_rows.push(
+                        ))
+                        .child(row(
+                            "Work details",
+                            "Choose how much detail to show for tool calls",
+                            local_seg(
+                                "work_details",
+                                &[
+                                    ("compact", "Compact"),
+                                    ("standard", "Standard"),
+                                    ("detailed", "Detailed"),
+                                    ("verbose", "Verbose"),
+                                ],
+                            ),
+                        ))
+                        .child(row(
+                            "When to Collapse Work Details",
+                            "Choose when to automatically collapse work details",
+                            segmented(
+                                "ui-chat",
+                                "collapseTiming",
+                                &[("completion", "On completion"), ("next-input", "On next input")],
+                            ),
+                        ))
+                        .child(row(
+                            "Replies After Collapse",
+                            "Choose which assistant replies stay visible when work details collapse",
+                            segmented(
+                                "ui-chat",
+                                "foldedReplies",
+                                &[("all", "All replies"), ("final", "Final reply only")],
+                            ),
+                        ))
+                        .child(row(
+                            "Open chat links in",
+                            "Choose where to open web links",
+                            segmented(
+                                "ui-chat",
+                                "linkOpening",
+                                &[
+                                    ("sidebar", "In-App Sidebar"),
+                                    ("newTab", "Default Browser"),
+                                ],
+                            ),
+                        ))
+                        .child(row(
+                            "Send behavior while busy",
+                            "What Enter and the Send button do while the agent is running; Cmd/Ctrl+Enter uses the other behavior",
+                            segmented(
+                                "ui-conversation",
+                                "busyEnter",
+                                &[("queue", "Queue"), ("steer", "Steer")],
+                            ),
+                        ))
+                        .child(row(
+                            "Performance & usage",
+                            "Choose how much performance and usage information to show",
+                            segmented(
+                                "ui-chat",
+                                "performanceUsage",
+                                &[("compact", "Compact"), ("detailed", "Detailed")],
+                            ),
+                        ))
+                        .into_any_element(),
+                );
+                let toggle = |ns: &'static str, key: &'static str| -> AnyElement {
+                    let current = self.ns_get(ns, key).as_bool().unwrap_or(true);
+                    let revision = self.ns_revision(ns);
+                    div()
+                        .id(SharedString::from(format!("gen-toggle-{ns}-{key}")))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        .cursor_pointer()
+                        .child({
+                            let knob = div()
+                                .w(px(14.))
+                                .h(px(14.))
+                                .mr(px(2.))
+                                .ml(px(2.))
+                                .rounded(px(7.))
+                                .bg(rgb(0xffffff));
+                            let track = div()
+                                .w(px(34.))
+                                .h(px(18.))
+                                .rounded(px(9.))
+                                .bg(if current { rgb(0x2f6fb5) } else { rgb(0x2a3040) })
+                                .flex()
+                                .flex_row()
+                                .items_center();
+                            if current {
+                                track.justify_end().child(knob)
+                            } else {
+                                track.justify_start().child(knob)
+                            }
+                        })
+                        .on_click(cx.listener(move |this, _ev, _win, cx| {
+                            this.write_setting(
+                                ns,
+                                vec![key.to_string()],
+                                json!(!current),
+                                Some(revision),
+                            );
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                };
+                let language = self
+                    .ns_get("locale", "preference")
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                let lang_rev = self.ns_revision("locale");
+                general_rows.push(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_shrink_0()
+                        .rounded(px(10.))
+                        .bg(rgb(0x151a23))
+                        .border_1()
+                        .border_color(rgb(0x222836))
+                        .overflow_hidden()
+                        .mb(px(16.))
+                        .child(row(
+                            "Permission",
+                            "Choose the default permission mode for new sessions",
+                            segmented(
+                                "permission",
+                                "defaultPreset",
+                                &[
+                                    ("read-only", "Read Only"),
+                                    ("workspace-write", "Workspace Write"),
+                                ],
+                            ),
+                        ))
+                        .child(row(
+                            "Language",
+                            "",
+                            {
+                                let mut seg = div().flex().flex_row().gap(px(6.));
+                                for (value, label) in [("en", "English"), ("zh-CN", "简体中文")] {
+                                    let active = language == value;
+                                    let value_owned = value.to_string();
+                                    seg = seg.child(
+                                        div()
+                                            .id(SharedString::from(format!("gen-locale-{value}")))
+                                            .px(px(10.))
+                                            .py(px(4.))
+                                            .rounded(px(6.))
+                                            .bg(if active { rgb(0x2c3646) } else { rgb(0x1a1f29) })
+                                            .text_xs()
+                                            .text_color(if active { rgb(0xeef2f8) } else { rgb(0x8b93a7) })
+                                            .cursor_pointer()
+                                            .child(SharedString::from(label))
+                                            .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                                this.write_setting(
+                                                    "locale",
+                                                    vec!["preference".to_string()],
+                                                    json!(value_owned.clone()),
+                                                    Some(lang_rev),
+                                                );
+                                                cx.notify();
+                                            })),
+                                    );
+                                }
+                                seg.into_any_element()
+                            },
+                        ))
+                        .child(row(
+                            "Show coding view",
+                            "Shows trajectory, code diffs, and all Agent presets",
+                            toggle("ui-settings", "enabled"),
+                        ))
+                        .child(row(
+                            "Upload Session Log when using the official model API",
+                            "Help improve DeepSeek models and products.",
+                            toggle("session-log-deepseek", "enabled"),
+                        ))
+                        .into_any_element(),
+                );
+                let version = std::env::var("DSH_BIN")
+                    .ok()
+                    .and_then(|path| {
+                        path.split("/runtime/")
+                            .nth(1)
+                            .and_then(|rest| rest.split('/').next())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                general_rows.push(
+                    div()
+                        .px(px(16.))
+                        .py(px(10.))
+                        .text_xs()
+                        .text_color(rgb(0x5f6878))
+                        .child(SharedString::from(if version.is_empty() {
+                            "Current version: unknown".to_string()
+                        } else {
+                            format!("Current version: {version}")
+                        }))
+                        .into_any_element(),
+                );
+
+            }
+
+            // ---- Agent 预设 ----
+            let mut preset_rows: Vec<AnyElement> = Vec::new();
+            if self.settings_tab == SettingsTab::Presets {
+                let presets = self
+                    .agent_presets
+                    .get("presets")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut list = div()
+                    .flex()
+                    .flex_col()
+                    .flex_shrink_0()
+                    .rounded(px(10.))
+                    .bg(rgb(0x151a23))
+                    .border_1()
+                    .border_color(rgb(0x222836))
+                    .overflow_hidden();
+                if presets.is_empty() {
+                    list = list.child(
                         div()
+                            .px(px(16.))
+                            .py(px(14.))
                             .text_xs()
                             .text_color(rgb(0x707786))
-                            .child("No account state")
-                            .into_any_element(),
+                            .child("No presets reported"),
                     );
                 }
-                let cmds_in = self.cmds.clone();
-                let cmds_out = self.cmds.clone();
-                account_rows.push(
+                for preset in &presets {
+                    let id = preset
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let is_default = preset
+                        .get("isDefault")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let label = match id.as_str() {
+                        "ptc" => "PTC".to_string(),
+                        "minimal" => "Minimal".to_string(),
+                        "cordis" => "Cordis".to_string(),
+                        "standard" => "Standard".to_string(),
+                        other => other.to_string(),
+                    };
+                    let select_id = id.clone();
+                    list = list.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(12.))
+                            .px(px(16.))
+                            .py(px(11.))
+                            .border_t_1()
+                            .border_color(rgb(0x1d2229))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0xe8ecf4))
+                                    .flex_1()
+                                    .child(SharedString::from(label)),
+                            )
+                            .children(if is_default {
+                                Some(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x59c48a))
+                                        .child("Default"),
+                                )
+                            } else {
+                                None
+                            })
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("preset-use-{id}")))
+                                    .px(px(12.))
+                                    .py(px(4.))
+                                    .rounded(px(6.))
+                                    .bg(rgb(0x1a1f29))
+                                    .text_xs()
+                                    .text_color(rgb(0xb4bccb))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(0x252c39)))
+                                    .child("Set default")
+                                    .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                        let _ = this.cmds.send_blocking(Cmd::Call {
+                                            tag: "agent/presets/select".to_string(),
+                                            endpoint: "agentPresets/select".to_string(),
+                                            args: json!({ "id": select_id.clone() }),
+                                        });
+                                        cx.notify();
+                                    })),
+                            ),
+                    );
+                }
+                preset_rows.push(list.into_any_element());
+            }
+
+            // ---- 我们自己的页面：Browser / Git / File ----
+            let mut browser_rows: Vec<AnyElement> = Vec::new();
+            let mut git_rows: Vec<AnyElement> = Vec::new();
+            let mut file_rows: Vec<AnyElement> = Vec::new();
+            if self.settings_tab == SettingsTab::Browser {
+                browser_rows.push(info_row("Renderer", "CEF 156 · Chromium 156 (windowless)"));
+                let text_field = |label: &'static str, handle: &Entity<InputState>| -> AnyElement {
                     div()
                         .flex()
                         .flex_row()
-                        .gap(px(8.))
-                        .pt(px(8.))
+                        .items_center()
+                        .gap(px(14.))
+                        .px(px(16.))
+                        .py(px(8.))
+                        .border_t_1()
+                        .border_color(rgb(0x1d2229))
                         .child(
                             div()
-                                .id("account-signin")
-                                .px(px(10.))
-                                .py(px(3.))
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .bg(rgb(0x20232b))
-                                .text_xs()
-                                .text_color(rgb(0x00b4ff))
-                                .hover(|style| style.bg(rgb(0x23272f)))
-                                .child("sign in")
-                                .on_click(move |_ev, _win, _cx| {
-                                    let _ = cmds_in.send_blocking(Cmd::Call {
-                                        tag: "account/signin".to_string(),
-                                        endpoint: "account/startSignIn".to_string(),
-                                        args: json!({}),
-                                    });
-                                }),
+                                .w(px(120.))
+                                .text_sm()
+                                .text_color(rgb(0xe8ecf4))
+                                .child(SharedString::from(label)),
                         )
                         .child(
                             div()
-                                .id("account-signout")
-                                .px(px(10.))
-                                .py(px(3.))
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .bg(rgb(0x20232b))
-                                .text_xs()
-                                .text_color(rgb(0x9ca3b0))
-                                .hover(|style| style.bg(rgb(0x23272f)))
-                                .child("sign out")
-                                .on_click(move |_ev, _win, _cx| {
-                                    let _ = cmds_out.send_blocking(Cmd::Call {
-                                        tag: "account/signout".to_string(),
-                                        endpoint: "account/signOut".to_string(),
-                                        args: json!({}),
-                                    });
-                                }),
+                                .flex_1()
+                                .min_w(px(0.))
+                                .rounded(px(6.))
+                                .bg(rgb(0x14171d))
+                                .border_1()
+                                .border_color(rgb(0x23272f))
+                                .px(px(8.))
+                                .py(px(4.))
+                                .child(
+                                    Input::new(handle)
+                                        .bordered(false)
+                                        .appearance(false)
+                                        .focus_bordered(false)
+                                        .text_xs(),
+                                ),
                         )
+                        .into_any_element()
+                };
+                browser_rows.push(text_field("Home URL", &self.browser_home_input));
+                browser_rows.push(text_field("CDP port", &self.browser_port_input));
+                browser_rows.push(
+                    div()
+                        .px(px(16.))
+                        .py(px(8.))
+                        .child(
+                            div()
+                                .id("browser-prefs-save")
+                                .px(px(14.))
+                                .py(px(5.))
+                                .rounded(px(6.))
+                                .bg(rgb(0x2f6fb5))
+                                .text_xs()
+                                .text_color(rgb(0xffffff))
+                                .cursor_pointer()
+                                .child("Save")
+                                .on_click(cx.listener(|this, _ev, _win, cx| {
+                                    let home = this
+                                        .browser_home_input
+                                        .read(cx)
+                                        .value()
+                                        .trim()
+                                        .to_string();
+                                    let port = this
+                                        .browser_port_input
+                                        .read(cx)
+                                        .value()
+                                        .trim()
+                                        .parse::<u16>()
+                                        .ok();
+                                    if !home.is_empty() {
+                                        this.browser_home = home;
+                                    }
+                                    if let Some(port) = port {
+                                        if port > 0 {
+                                            this.browser_cdp_port = port;
+                                        }
+                                    }
+                                    this.save_state();
+                                    cx.notify();
+                                })),
+                        )
+                        .into_any_element(),
+                );
+                browser_rows.push(info_row(
+                    "CDP endpoint",
+                    &format!("http://127.0.0.1:{}/json", self.browser_cdp_port),
+                ));
+            }
+            if self.settings_tab == SettingsTab::Git {
+                let signoff = self.git_signoff;
+                let knob = div()
+                    .w(px(14.))
+                    .h(px(14.))
+                    .mr(px(2.))
+                    .ml(px(2.))
+                    .rounded(px(7.))
+                    .bg(rgb(0xffffff));
+                let track = div()
+                    .w(px(34.))
+                    .h(px(18.))
+                    .rounded(px(9.))
+                    .bg(if signoff { rgb(0x2f6fb5) } else { rgb(0x2a3040) })
+                    .flex()
+                    .flex_row()
+                    .items_center();
+                let switch = div()
+                    .id("local-toggle-git-signoff")
+                    .cursor_pointer()
+                    .child(if signoff {
+                        track.justify_end().child(knob)
+                    } else {
+                        track.justify_start().child(knob)
+                    })
+                    .on_click(cx.listener(move |this, _ev, _win, cx| {
+                        this.git_signoff = !this.git_signoff;
+                        this.save_state();
+                        cx.notify();
+                    }));
+                git_rows.push(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(14.))
+                        .px(px(16.))
+                        .py(px(12.))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(0xe8ecf4))
+                                        .child("Add Signed-off-by when committing"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x6b7386))
+                                        .child("Append `Signed-off-by: <name> <email>` to commit messages"),
+                                ),
+                        )
+                        .child(switch)
+                        .into_any_element(),
+                );
+            }
+            if self.settings_tab == SettingsTab::File {
+                let show_hidden = self.files_show_hidden;
+                let knob = div()
+                    .w(px(14.))
+                    .h(px(14.))
+                    .mr(px(2.))
+                    .ml(px(2.))
+                    .rounded(px(7.))
+                    .bg(rgb(0xffffff));
+                let track = div()
+                    .w(px(34.))
+                    .h(px(18.))
+                    .rounded(px(9.))
+                    .bg(if show_hidden { rgb(0x2f6fb5) } else { rgb(0x2a3040) })
+                    .flex()
+                    .flex_row()
+                    .items_center();
+                let switch = div()
+                    .id("local-toggle-files-hidden")
+                    .cursor_pointer()
+                    .child(if show_hidden {
+                        track.justify_end().child(knob)
+                    } else {
+                        track.justify_start().child(knob)
+                    })
+                    .on_click(cx.listener(move |this, _ev, _win, cx| {
+                        this.files_show_hidden = !this.files_show_hidden;
+                        SHOW_HIDDEN.store(
+                            this.files_show_hidden,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        this.save_state();
+                        cx.notify();
+                    }));
+                file_rows.push(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(14.))
+                        .px(px(16.))
+                        .py(px(12.))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(0xe8ecf4))
+                                        .child("Show hidden files"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x6b7386))
+                                        .child("Include dotfiles in the file tree"),
+                                ),
+                        )
+                        .child(switch)
                         .into_any_element(),
                 );
             }
 
             let cmds_refresh = self.cmds.clone();
             let cmds_open = self.cmds.clone();
+            let version = self
+                .dsh_version
+                .clone()
+                .unwrap_or_else(|| "dsh".to_string());
+            let weak_nav = cx.entity().downgrade();
+            let nav_item = |page: SettingsTab, active: bool| -> AnyElement {
+                let weak = weak_nav.clone();
+                let mut item = div()
+                    .id(SharedString::from(format!("settings-nav-{}", page.label())))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.))
+                    .h(px(32.))
+                    .px(px(10.))
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .text_sm()
+                            .text_color(if active {
+                                rgb(0x7cc4f5)
+                            } else {
+                                rgb(0x8b93a7)
+                            })
+                            .child(SharedString::from(page.glyph())),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(if active {
+                                rgb(0xeef2f8)
+                            } else {
+                                rgb(0xb4bccb)
+                            })
+                            .child(SharedString::from(page.label())),
+                    )
+                    .on_click(move |_ev, win, cx| {
+                        let _ = weak.update(cx, |root, cx| {
+                            root.open_settings_tab(page, win, cx);
+                        });
+                    });
+                if active {
+                    item = item.bg(rgb(0x17303f));
+                } else {
+                    item = item.hover(|style| style.bg(rgb(0x141a23)));
+                }
+                item.into_any_element()
+            };
+
             Some(
                 div()
                     .absolute()
                     .inset_0()
+                    .occlude()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(rgba(0x000000cc))
+                    .bg(rgba(0x000000b8))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _ev, win, cx| {
@@ -12309,141 +16806,247 @@ impl Render for Root {
                     .child(
                         div()
                             .id("settings-card")
-                            .w(px(680.))
-                            .max_h(px(640.))
+                            .w(px(1080.))
+                            .h(px(730.))
                             .flex()
-                            .flex_col()
-                            .rounded_lg()
-                            .bg(rgb(0x1b1e26))
+                            .flex_row()
+                            .rounded(px(14.))
+                            .bg(rgb(0x0e141b))
                             .border_1()
-                            .border_color(rgb(0x23272f))
+                            .border_color(rgb(0x1f2430))
                             .overflow_hidden()
+                            .shadow_lg()
                             .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
                                 cx.stop_propagation();
                             })
+                            // ---- 左栏 ----
                             .child(
                                 div()
+                                    .w(px(252.))
+                                    .h_full()
                                     .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(10.))
-                                    .px(px(14.))
-                                    .py(px(10.))
-                                    .child(div().text_lg().child("Settings"))
+                                    .flex_col()
+                                    .bg(rgb(0x0b1017))
+                                    .border_r_1()
+                                    .border_color(rgb(0x1b202b))
                                     .child(
                                         div()
-                                            .text_xs()
-                                            .text_color(if editable {
-                                                rgb(0x00d98a)
-                                            } else {
-                                                rgb(0xc9a15a)
-                                            })
-                                            .child(if editable { "writable" } else { "read-only" }),
-                                    )
-                                    .child(div().flex_1())
-                                    .child(
-                                        div()
-                                            .id("settings-refresh")
-                                            .px(px(8.))
-                                            .py(px(2.))
-                                            .rounded_sm()
-                                            .cursor_pointer()
-                                            .text_xs()
-                                            .text_color(rgb(0x9ca3b0))
-                                            .hover(|style| style.bg(rgb(0x20232b)))
-                                            .child("reload")
-                                            .on_click(move |_ev, _win, _cx| {
-                                                let _ = cmds_refresh.send_blocking(Cmd::Call {
-                                                    tag: "settings/describe".to_string(),
-                                                    endpoint: "settings/describe".to_string(),
-                                                    args: json!({}),
-                                                });
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("settings-open-file")
-                                            .px(px(8.))
-                                            .py(px(2.))
-                                            .rounded_sm()
-                                            .cursor_pointer()
-                                            .text_xs()
-                                            .text_color(rgb(0x9ca3b0))
-                                            .hover(|style| style.bg(rgb(0x20232b)))
-                                            .child("open file")
-                                            .on_click(move |_ev, _win, _cx| {
-                                                let _ = cmds_open.send_blocking(Cmd::Call {
-                                                    tag: "settings/open-document".to_string(),
-                                                    endpoint: "settings/openSettingsDocument"
-                                                        .to_string(),
-                                                    args: json!({}),
-                                                });
-                                            }),
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(10.))
+                                            .px(px(16.))
+                                            .pt(px(18.))
+                                            .pb(px(14.))
+                                            .child(
+                                                div()
+                                                    .w(px(26.))
+                                                    .h(px(26.))
+                                                    .rounded(px(13.))
+                                                    .bg(rgb(0x1d4a6b))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .text_color(rgb(0x8fd0f5))
+                                                            .child("◆"),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_lg()
+                                                    .text_color(rgb(0xeef2f8))
+                                                    .child("Settings"),
+                                            ),
                                     )
                                     .child(
+                                        div().px(px(12.)).pb(px(12.)).child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(6.))
+                                                .px(px(8.))
+                                                .py(px(3.))
+                                                .rounded(px(8.))
+                                                .bg(rgb(0x101a23))
+                                                .border_1()
+                                                .border_color(rgb(0x1f3a4c))
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(0x5f7a8c))
+                                                        .child("⌕"),
+                                                )
+                                                .child(div().flex_1().min_w(px(0.)).child(
+                                                    Input::new(&self.settings_search)
+                                                        .bordered(false)
+                                                        .appearance(false)
+                                                        .focus_bordered(false)
+                                                        .text_sm(),
+                                                )),
+                                        ),
+                                    )
+                                    .child(
                                         div()
-                                            .id("settings-close")
-                                            .px(px(8.))
-                                            .py(px(2.))
-                                            .rounded_sm()
-                                            .cursor_pointer()
-                                            .text_xs()
-                                            .text_color(rgb(0xff5663))
-                                            .hover(|style| style.bg(rgb(0x3a1f24)))
-                                            .child("close")
-                                            .on_click(cx.listener(|this, _ev, win, cx| {
-                                                this.show_settings = false;
-                                                this.input.read(cx).focus_handle(cx).focus(win, cx);
-                                                cx.notify();
+                                            .id("settings-nav")
+                                            .flex()
+                                            .flex_col()
+                                            .flex_1()
+                                            .min_h(px(0.))
+                                            .overflow_y_scroll()
+                                            .px(px(10.))
+                                            .child(div().pt(px(6.)))
+                                            .children(SettingsTab::ALL.iter().map(|page| {
+                                                nav_item(*page, self.settings_tab == *page)
                                             })),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(8.))
+                                            .px(px(16.))
+                                            .py(px(12.))
+                                            .border_t_1()
+                                            .border_color(rgb(0x1b202b))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(0x5f6878))
+                                                    .child(SharedString::from(version)),
+                                            )
+                                            .child(div().flex_1())
+                                            .child(
+                                                div()
+                                                    .id("settings-open-file")
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(4.))
+                                                    .text_xs()
+                                                    .text_color(rgb(0x7d8695))
+                                                    .cursor_pointer()
+                                                    .hover(|style| {
+                                                        style.text_color(rgb(0xb4bccb))
+                                                    })
+                                                    .child("{} settings.json")
+                                                    .on_click(move |_ev, _win, _cx| {
+                                                        let _ = cmds_open.send_blocking(Cmd::Call {
+                                                            tag: "settings/open-document".to_string(),
+                                                            endpoint: "settings/openSettingsDocument"
+                                                                .to_string(),
+                                                            args: json!({}),
+                                                        });
+                                                    }),
+                                            ),
                                     ),
                             )
+                            // ---- 右栏 ----
                             .child(
                                 div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(2.))
-                                    .px(px(10.))
-                                    .pb(px(6.))
-                                    .children(SettingsTab::ALL.iter().map(|tab| {
-                                        let active = self.settings_tab == *tab;
-                                        let tab = *tab;
-                                        div()
-                                            .id(SharedString::from(format!("settings-tab-{}", tab.label())))
-                                            .px(px(10.))
-                                            .py(px(3.))
-                                            .rounded_sm()
-                                            .cursor_pointer()
-                                            .text_xs()
-                                            .bg(if active { rgb(0x20232b) } else { rgb(0x1b1e26) })
-                                            .text_color(if active { rgb(0xe8ecf4) } else { rgb(0x9ca3b0) })
-                                            .hover(|style| style.bg(rgb(0x20232b)))
-                                            .child(SharedString::from(tab.label()))
-                                            .on_click(cx.listener(move |this, _ev, win, cx| {
-                                                this.open_settings_tab(tab, win, cx);
-                                                cx.notify();
-                                            }))
-                                    })),
-                            )
-                            .child(div().h(px(1.)).w_full().bg(rgb(0x23272f)))
-                            .child(
-                                div()
-                                    .id("settings-body")
                                     .flex()
                                     .flex_col()
                                     .flex_1()
-                                    .min_h(px(0.))
-                                    .overflow_y_scroll()
-                                    .px(px(14.))
-                                    .py(px(6.))
-                                    .children(match self.settings_tab {
-                                        SettingsTab::General => sections,
-                                        SettingsTab::Plugins => plugins_rows,
-                                        SettingsTab::Account => account_rows,
-                                    }),
+                                    .min_w(px(0.))
+                                    .h_full()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(8.))
+                                            .px(px(28.))
+                                            .pt(px(22.))
+                                            .pb(px(10.))
+                                            .child(
+                                                div()
+                                                    .text_size(px(25.))
+                                                    .text_color(rgb(0xeef2f8))
+                                                    .child(SharedString::from(
+                                                        self.settings_tab.label(),
+                                                    )),
+                                            )
+                                            .child(div().flex_1())
+                                            .child(
+                                                div()
+                                                    .id("settings-refresh")
+                                                    .w(px(26.))
+                                                    .h(px(26.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded(px(6.))
+                                                    .text_sm()
+                                                    .text_color(rgb(0x8b93a7))
+                                                    .cursor_pointer()
+                                                    .hover(|style| style.bg(rgb(0x1a212b)))
+                                                    .child("⟳")
+                                                    .on_click(move |_ev, _win, _cx| {
+                                                        let _ = cmds_refresh.send_blocking(Cmd::Call {
+                                                            tag: "settings/describe".to_string(),
+                                                            endpoint: "settings/describe"
+                                                                .to_string(),
+                                                            args: json!({}),
+                                                        });
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("settings-close")
+                                                    .w(px(26.))
+                                                    .h(px(26.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded(px(6.))
+                                                    .text_sm()
+                                                    .text_color(rgb(0x8b93a7))
+                                                    .cursor_pointer()
+                                                    .hover(|style| style.bg(rgb(0x1a212b)))
+                                                    .child("✕")
+                                                    .on_click(cx.listener(|this, _ev, win, cx| {
+                                                        this.show_settings = false;
+                                                        this.input
+                                                            .read(cx)
+                                                            .focus_handle(cx)
+                                                            .focus(win, cx);
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("settings-body")
+                                            .flex()
+                                            .flex_col()
+                                            .flex_1()
+                                            .min_h(px(0.))
+                                            .overflow_y_scroll()
+                                            .px(px(28.))
+                                            .pb(px(24.))
+                                            .children(if !query.is_empty() {
+                                                sections
+                                            } else {
+                                                match self.settings_tab {
+                                                    // dsh 的 Models 页只有 provider 卡片，不追加通用 schema 行。
+                                                    SettingsTab::Models => models_rows,
+                                                    SettingsTab::Plugins => plugins_rows,
+                                                    SettingsTab::Account => account_rows,
+                                                    SettingsTab::General => general_rows,
+                                                    SettingsTab::Presets => preset_rows,
+                                                    SettingsTab::Browser => browser_rows,
+                                                    SettingsTab::Git => git_rows,
+                                                    SettingsTab::File => file_rows,
+                                                    _ => sections,
+                                                }
+                                            }),
+                                    ),
                             ),
-                    )
+                    ),
             )
         } else {
             None
@@ -12993,7 +17596,88 @@ impl Render for Root {
                     .find(|pane| pane.id == pane_id)
                     .map(|pane| pane.focus.clone());
                 if let Some(focus) = focus {
-                    leaf_elements.insert(pane_id, browser_pane_element(index, focus));
+                    if self.browser_needs_inject.contains(&index) {
+                        browser::inject_annotator(index);
+                        if browser::pick_on(index) {
+                            browser::set_pick(index, true);
+                            self.browser_pick_sent.insert(index, true);
+                        }
+                    }
+                    let input = self.ensure_browser_input(index, window, cx);
+                    // 地址栏跟随页面跳转：正在编辑时不要抢用户的光标。
+                    let current = browser::current_url(index).unwrap_or_default();
+                    if !current.is_empty()
+                        && !input.read(cx).focus_handle(cx).is_focused(window)
+                        && input.read(cx).value().as_ref() != current.as_str()
+                    {
+                        input.update(cx, |state, cx| state.set_value(current.clone(), window, cx));
+                    }
+                    let pick_on = browser::pick_on(index);
+                    let pin_count = self
+                        .browser_pins
+                        .get(&index)
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    let extra = {
+                        let toggle = div()
+                            .id(SharedString::from(format!("browser-pick-{index}")))
+                            .px(px(6.))
+                            .py(px(2.))
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x20232b)))
+                            .bg(if pick_on { rgb(0x2c3646) } else { rgb(0x161a22) })
+                            .child(div().text_xs()
+                                .text_color(if pick_on { rgb(0x7fb4ff) } else { rgb(0x8b93a7) })
+                                .child("✎"))
+                            .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                browser::toggle_pick(index);
+                                cx.notify();
+                            }));
+                        let send = div()
+                            .id(SharedString::from(format!("browser-send-{index}")))
+                            .px(px(6.))
+                            .py(px(2.))
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x20232b)))
+                            .child(div().text_xs().text_color(rgb(0x8b93a7))
+                                .child(SharedString::from(format!("⇪{pin_count}"))))
+                            .on_click(cx.listener(move |this, _ev, win, cx| {
+                                let pins = this.browser_pins.get(&index).cloned()
+                                    .and_then(|v| v.as_array().cloned());
+                                let Some(pins) = pins else { return };
+                                if pins.is_empty() { return; }
+                                let mut digest = String::from("[browser annotations]\n");
+                                for pin in pins.iter() {
+                                    let tag = pin.get("tag").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let selector = pin.get("selector").and_then(|v| v.as_str()).unwrap_or("");
+                                    let text = pin.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                                    let id = pin.get("id");
+                                    digest.push_str(&format!(
+                                        "- #{:?} <{tag}> {selector} | {}\n",
+                                        id, text,
+                                    ));
+                                }
+                                let existing = this.input.read(cx).value().to_string();
+                                let merged = if existing.trim().is_empty() {
+                                    digest
+                                } else {
+                                    format!("{existing}\n{digest}")
+                                };
+                                this.input.update(cx, |state, cx| state.set_value(merged, win, cx));
+                                cx.notify();
+                            }));
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(2.))
+                            .child(toggle)
+                            .child(send)
+                            .into_any_element()
+                    };
+                    leaf_elements.insert(pane_id, browser_pane_element(index, focus, input, extra));
                 }
                 continue;
             }
@@ -13411,6 +18095,7 @@ impl Render for Root {
                     .flex()
                     .items_center()
                     .justify_center()
+                    .occlude()
                     .bg(rgba(0x000000cc))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -13747,6 +18432,7 @@ impl Render for Root {
                                 let term_cmds = cmds.clone();
                                 let term_cwd = space_cwd.clone();
                                 let menu_cmds = cmds.clone();
+                                let weak_browser = cx.entity().downgrade();
                                 let trigger = div()
                                     .id("new-tab")
                                     .w(px(HEAD_BTN)).h(px(HEAD_BTN))
@@ -13828,6 +18514,29 @@ impl Render for Root {
                                                                 kind: BlockPlacement::Panel,
                                                                 cwd: Some(cwd.clone()),
                                                                 run: None,
+                                                            });
+                                                        }
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("new-tab-browser")
+                                                    .flex().flex_row().items_center().gap(px(8.))
+                                                    .px(px(8.)).py(px(5.))
+                                                    .rounded_sm()
+                                                    .cursor_pointer()
+                                                    .hover(|style| style.bg(rgb(0x20232b)))
+                                                    .child(
+                                                        div().text_sm().text_color(rgb(0xffa657)).child("◐"),
+                                                    )
+                                                    .child(div().text_sm().text_color(rgb(0xe8ecf4)).child("browser"))
+                                                    .child(div().flex_1())
+                                                    .child(div().text_xs().text_color(rgb(0x707786)).child("tab"))
+                                                    .on_click({
+                                                        let weak = weak_browser.clone();
+                                                        move |_ev, _win, cx| {
+                                                            let _ = weak.update(cx, |root, cx| {
+                                                                root.open_browser_tab(cx);
                                                             });
                                                         }
                                                     }),
@@ -14189,11 +18898,18 @@ impl Render for Root {
                             .child(layout_element),
                     ),
             )
-            .children(model_picker)
-            .children(settings_modal)
-            .children(jobs_modal)
-            .children(palette)
-            .child(browser_overlay());
+            .children(model_picker.map(|picker| {
+                gpui_kit::deferred(picker).with_priority(30).into_any_element()
+            }))
+            .children(settings_modal.map(|modal| {
+                gpui_kit::deferred(modal).with_priority(50).into_any_element()
+            }))
+            .children(jobs_modal.map(|modal| {
+                gpui_kit::deferred(modal).with_priority(40).into_any_element()
+            }))
+            .children(palette.map(|modal| {
+                gpui_kit::deferred(modal).with_priority(60).into_any_element()
+            }));
         let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
         if render_no <= 8 || render_ms >= 8.0 {
             stamp(format!(
@@ -14439,11 +19155,21 @@ struct UiState {
     files_expanded: Vec<String>,
     model_favorites: Vec<String>,
     panel_names: Vec<(String, String)>,
+    /// 本地偏好：工具调用细节展示（compact/standard/detailed/verbose）。
+    work_details: String,
+    /// 本地偏好：文件树显示点文件。
+    files_show_hidden: bool,
+    /// 本地偏好：提交时附加 Signed-off-by。
+    git_signoff: bool,
+    /// 本地偏好：浏览器块默认首页。
+    browser_home: String,
+    /// 本地偏好：浏览器 CDP 端口。
+    browser_cdp_port: u16,
 }
 
 fn layout_json_has_content(value: &Value) -> bool {
     if let Some(leaf) = value.get("leaf").and_then(|v| v.as_str()) {
-        return matches!(leaf, "media" | "editor" | "terminal");
+        return matches!(leaf, "media" | "editor" | "terminal" | "browser");
     }
     value
         .get("children")
@@ -14453,6 +19179,15 @@ fn layout_json_has_content(value: &Value) -> bool {
 }
 
 fn load_ui_state() -> UiState {
+    let state = load_ui_state_inner();
+    SHOW_HIDDEN.store(
+        state.files_show_hidden,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    state
+}
+
+fn load_ui_state_inner() -> UiState {
     let empty = || UiState {
         spaces: Vec::new(),
         current_space: None,
@@ -14466,6 +19201,11 @@ fn load_ui_state() -> UiState {
         files_expanded: Vec::new(),
         model_favorites: Vec::new(),
         panel_names: Vec::new(),
+        work_details: "standard".to_string(),
+        files_show_hidden: true,
+        git_signoff: false,
+        browser_home: "https://example.com".to_string(),
+        browser_cdp_port: 9222,
     };
     let Ok(text) = std::fs::read_to_string(ui_state_path()) else {
         return empty();
@@ -14678,6 +19418,29 @@ fn load_ui_state() -> UiState {
         files_expanded,
         model_favorites,
         panel_names,
+        work_details: value
+            .get("work_details")
+            .and_then(|v| v.as_str())
+            .unwrap_or("standard")
+            .to_string(),
+        files_show_hidden: value
+            .get("files_show_hidden")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+        git_signoff: value
+            .get("git_signoff")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        browser_home: value
+            .get("browser_home")
+            .and_then(|v| v.as_str())
+            .unwrap_or("https://example.com")
+            .to_string(),
+        browser_cdp_port: value
+            .get("browser_cdp_port")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u16)
+            .unwrap_or(9222),
     }
 }
 
@@ -15429,6 +20192,17 @@ fn main() {
     }
     // Ctrl-C 也走 Drop（杀整个 host 进程组）
     ctrlc_proxy();
+    // CEF/GTK 可能修改 WAYLAND_DISPLAY，GPUI 必须连接启动时选定的会话。
+    #[cfg(target_os = "linux")]
+    let graphical_environment = {
+        let mut environment = gpui_kit::GraphicalEnvironment::detect();
+        if std::env::var_os("OMD_BROWSER_CHILD").is_some()
+            || std::env::var_os("OMD_FORCE_X11").is_some()
+        {
+            environment.wayland_display = None;
+        }
+        environment
+    };
     if std::env::var("OMD_BROWSER").is_ok() {
         let cache = dsh_host::runtime_root().join("cef-cache");
         let _ = std::fs::create_dir_all(&cache);
@@ -15445,18 +20219,8 @@ fn main() {
         stamp(format!("cef init ok={ok} port={port}"));
     }
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
-    // 原生子窗口（零拷贝）需要 X11 父窗口：Wayland 没有子 surface 协议。
-    // 默认（OMD_BROWSER=1）仍走 Wayland + OSR，只有显式要求子窗口时才切 X11。
     #[cfg(target_os = "linux")]
-    let app = if std::env::var("OMD_BROWSER_CHILD").is_ok()
-        || std::env::var("OMD_FORCE_X11").is_ok()
-    {
-        let mut environment = gpui_kit::GraphicalEnvironment::detect();
-        environment.wayland_display = None;
-        app.with_windowing(gpui_kit::WindowingRequest::Windowed(environment))
-    } else {
-        app
-    };
+    let app = app.with_windowing(gpui_kit::WindowingRequest::Windowed(graphical_environment));
     stamp("platform + App::new done (fonts/text system loaded)");
     app.run(|cx| {
         stamp("app.run closure (platform run loop up)");

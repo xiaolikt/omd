@@ -1,9 +1,7 @@
-//! 浏览器块：CEF 以 windowless（OSR）方式渲染，帧经 `on_paint` 交给 GPUI，
-//! 同时开远程调试端口给 agent。
+//! 浏览器块：CEF 离屏渲染到 GPUI，CDP 端口供 agent 控制。
 //!
-//! 为什么不用子窗口：GPUI 的 X11 窗口是 32 位深 visual，CEF 的子窗口无法
-//! repaint/reparent 上去（实测创建即失败）；Wayland 下也没有子窗口协议。
-//! OSR 帧流三端一致，CDP 控制路径完全相同。
+//! Linux 原生 Wayland 使用 `on_paint` 像素上传；X11 可使用 DMA-BUF 共享纹理。
+//! 原生子窗口只用于 X11，Wayland 不支持嵌入另一个客户端的窗口。
 //!
 //! 这里只管：CEF 进程生命周期、离屏 browser、帧的存取、CDP 端口。
 //! 页面内的标注层由注入的 JS 提供；可信输入走 BrowserHost::send_*（比
@@ -11,20 +9,11 @@
 
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use cef::*;
 
-/// 一帧页面内容（BGRA，自顶向下）。
-#[derive(Clone)]
-pub struct Frame {
-    pub width: u32,
-    pub height: u32,
-    pub bgra: Vec<u8>,
-    pub seq: u64,
-}
-#[derive(Default)]
-/// 一帧 GPU 纹理（已注册到 gpui-wgpu 的外部纹理表）。
+/// 一帧 GPUI 纹理（来自 DMA-BUF 导入或像素上传）。
 #[derive(Clone, Copy)]
 pub struct AccelFrame {
     pub width: u32,
@@ -38,10 +27,14 @@ struct Slot {
     /// CEF browser id，回调里靠它找到对应 slot。
     id: Option<i32>,
     view: (i32, i32),
-    frame: Option<std::sync::Arc<Frame>>,
+    upload_texture: Option<wgpu::Texture>,
     accel: Option<AccelFrame>,
     /// 是否走 windowless（OSR）渲染。子窗口模式由 CEF 自己跟 vsync，不能再推 begin frame。
     windowless: bool,
+    /// 待裁剪的元素截图请求：(pin_id, x, y, w, h)，下一帧 on_paint 时兑现。
+    capture_req: Vec<(u64, u32, u32, u32, u32)>,
+    /// 已落盘的元素截图：(pin_id, png 路径)。
+    captured: Vec<(u64, String)>,
     /// 子窗口模式的 X11 宿主窗口（32 位 GPUI 窗口和 24 位 CEF 子窗口之间的桥）。
     host: Option<u32>,
 }
@@ -49,9 +42,17 @@ struct Slot {
 
 /// 每个 browser 一份；index 对应 UI 侧的 browser pane。
 static SLOTS: Mutex<Vec<Slot>> = Mutex::new(Vec::new());
+/// 标注层回传：on_console_message 收到 `[omd-pins]` 前缀的消息就排队。
+static PIN_QUEUE: Mutex<Vec<(i32, String)>> = Mutex::new(Vec::new());
+/// 标注层注入成功（页面里执行到末尾）的 browser id。
+static ANNOTATOR_READY: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+/// 页内标注层（hover 高亮 / 点击 pin）。
+const ANNOTATOR_JS: &str = include_str!("annotator.js");
 static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
 /// 当前进程是否 windowless。Chromium 的 Ozone 平台开关据此决定。
 static WINDOWLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 初始化前选定 Ozone 后端，避免 CEF 修改环境后改变 GPUI 的会话选择。
+static WAYLAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// UI 侧当前展示的浏览器槽位（None = 没有浏览器块）。
 static PRIMARY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
 
@@ -94,7 +95,10 @@ pub fn pump_channel() -> async_channel::Receiver<()> {
 /// 上一次同步给 X11 的矩形，避免每帧都发 ConfigureWindow。
 static LAST_RECT: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
 /// 外部纹理在 gpui-wgpu 注册表里的 key（单浏览器固定 0）。
-const EXTERNAL_KEY: u32 = 0;
+/// 外部纹理在 gpui-wgpu 表里的 key：每个 browser 一份，
+/// 否则多个浏览器 pane 会抢同一张纹理，全部显示最后画的那一个。
+/// `create` 时决定。为真时 CEF 只走 `on_accelerated_paint`，像素上传不能再盖掉导入的纹理。
+static SHARED_TEXTURE: AtomicBool = AtomicBool::new(false);
 
 fn slots() -> std::sync::MutexGuard<'static, Vec<Slot>> {
     SLOTS.lock().unwrap_or_else(|e| e.into_inner())
@@ -165,6 +169,12 @@ pub fn init(remote_port: i32, cache_dir: &std::path::Path, windowless: bool) -> 
     // 子窗口模式让 CEF 自己建窗口；OSR 模式画进内存缓冲。
     settings.windowless_rendering_enabled = i32::from(windowless);
     WINDOWLESS.store(windowless, std::sync::atomic::Ordering::Relaxed);
+    WAYLAND.store(
+        windowless
+            && std::env::var_os("OMD_FORCE_X11").is_none()
+            && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty()),
+        Ordering::Relaxed,
+    );
     settings.remote_debugging_port = remote_port;
     settings.log_severity = LogSeverity::INFO;
     settings.resources_dir_path = CefString::from(dir.join("Resources").to_string_lossy().as_ref());
@@ -191,9 +201,10 @@ pub fn init(remote_port: i32, cache_dir: &std::path::Path, windowless: bool) -> 
     true
 }
 
-/// 只有 GPUI 的 device 支持 DMA-BUF 导入时才走 GPU 路径，否则保持软件渲染。
+/// 当前 CEF 的 Wayland 后端无法分配共享捕获缓冲，使用像素上传而非 DMA-BUF。
 fn accel_available() -> bool {
-    std::env::var("OMD_BROWSER_ACCEL").is_ok()
+    !WAYLAND.load(Ordering::Relaxed)
+        && std::env::var_os("OMD_BROWSER_ACCEL").is_some()
         && gpui_wgpu::shared_gpu().is_some_and(|(device, _)| {
             device
                 .features()
@@ -411,10 +422,13 @@ pub fn create(width: u32, height: u32, url: &str) -> Option<usize> {
     // windowless 也需要一个父窗口句柄给弹窗/显示器定位；0 = 无。
     let mut window_info = window_info.set_as_windowless(0);
     // OSR 由我们推 begin frame（外部时钟），否则 CEF 内部定时器只在部分场景出帧。
-    window_info.external_begin_frame_enabled = 1;
-    // GPU 合成路径（DMA-BUF 共享纹理）已验证可用，但还没接 wgpu 导入，
-    // 打开会没有 on_paint 也就没有画面，所以默认关，用 OMD_BROWSER_ACCEL=1 探测。
-    window_info.shared_texture_enabled = if accel_available() { 1 } else { 0 };
+    // 实测：靠我们外部推 begin frame 时 CEF 从不出画（pump 在 GPUI 线程，
+    // CEF 认为不是它的 UI 线程）；改用 CEF 自己的合成时钟后首帧立刻到。
+    window_info.external_begin_frame_enabled = i32::from(std::env::var_os("OMD_EXT_BF").is_some());
+    // Wayland 使用 on_paint；X11 可显式启用 DMA-BUF 导入。
+    let shared = accel_available();
+    SHARED_TEXTURE.store(shared, Ordering::Relaxed);
+    window_info.shared_texture_enabled = i32::from(shared);
     if width == 0 || height == 0 {
         return None;
     }
@@ -456,10 +470,22 @@ pub fn create(width: u32, height: u32, url: &str) -> Option<usize> {
 
 /// pane 尺寸变化：改 view_rect 并通知 CEF 重新布局。
 pub fn resize(index: usize, width: u32, height: u32) {
+    if std::env::var("OMD_BROWSER_DEBUG").is_ok() {
+        static LAST: Mutex<(u32, u32)> = Mutex::new((0, 0));
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if *last != (width, height) {
+            *last = (width, height);
+            eprintln!("[resize] index={index} {width}x{height}");
+        }
+    }
     let host = {
         let mut slots = slots();
         let Some(slot) = slots.get_mut(index) else { return };
-        slot.view = (width as i32, height as i32);
+        let next = (width as i32, height as i32);
+        if slot.view == next {
+            return;
+        }
+        slot.view = next;
         slot.browser.as_ref().and_then(|b| b.host())
     };
     if let Some(host) = host {
@@ -473,9 +499,133 @@ pub fn latest_accel(index: usize) -> Option<AccelFrame> {
     slots().get(index).and_then(|slot| slot.accel)
 }
 
-/// 取最新一帧。Arc 只加引用计数，UI 每帧调用也不会拷贝像素。
-pub fn latest_frame(index: usize) -> Option<std::sync::Arc<Frame>> {
-    slots().get(index).and_then(|slot| slot.frame.clone())
+
+/// 某槽位的标注层是否已就绪（页面回过 ack）。
+pub fn annotator_ready(index: usize) -> bool {
+    let slots = slots();
+    let Some(id) = slots.get(index).and_then(|s| s.id) else {
+        return false;
+    };
+    ANNOTATOR_READY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&id)
+}
+
+/// 导航会换执行环境，就绪状态作废。
+pub fn annotator_reset(index: usize) {
+    let id = slots().get(index).and_then(|s| s.id);
+    if let Some(id) = id {
+        ANNOTATOR_READY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&other| other != id);
+    }
+}
+
+/// 注入标注层（幂等，页面里自带 __omdAnnotator 防重入）。
+pub fn inject_annotator(index: usize) -> bool {
+    execute_js(index, ANNOTATOR_JS)
+}
+
+/// 开/关拾取模式。
+pub fn set_pick(index: usize, on: bool) -> bool {
+    execute_js(
+        index,
+        &format!("window.__omdSetPick && window.__omdSetPick({on})"),
+    )
+}
+
+/// 取走标注层回传的 pin 列表（CEF browser id -> JSON 文本）。
+pub fn drain_pins() -> Vec<(i32, String)> {
+    std::mem::take(&mut *PIN_QUEUE.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// 请求对某个 pin 的元素截图：下一帧 on_paint 时从像素缓冲裁剪落盘。
+pub fn request_capture(index: usize, pin_id: u64, x: u32, y: u32, w: u32, h: u32) {
+    let host = {
+        let mut slots = slots();
+        match slots.get_mut(index) {
+            Some(slot) => {
+                slot.capture_req.push((pin_id, x, y, w, h));
+                slot.browser.as_ref().and_then(|b| b.host())
+            }
+            None => None,
+        }
+    };
+    // 静态页面不会自己重绘；推一次 invalidate 让下一帧带着像素来。
+    if let Some(host) = host {
+        host.invalidate(PaintElementType::VIEW);
+    }
+}
+
+/// 取走已落盘的元素截图（槽位, pin_id, 路径）。
+pub fn drain_captures() -> Vec<(usize, u64, String)> {
+    let mut slots = slots();
+    let mut out = Vec::new();
+    for (index, slot) in slots.iter_mut().enumerate() {
+        for (pin_id, path) in slot.captured.drain(..) {
+            out.push((index, pin_id, path));
+        }
+    }
+    out
+}
+
+/// 每个槽位的拾取模式开关（UI 与快捷键共享的唯一状态）。
+static PICK: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+
+/// 拾取模式是否开着。
+pub fn pick_on(index: usize) -> bool {
+    PICK.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(i, on)| *i == index && *on)
+}
+
+/// 切换拾取模式并同步进页面，返回新状态。
+pub fn toggle_pick(index: usize) -> bool {
+    let mut pick = PICK.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = pick.iter_mut().find(|(i, _)| *i == index);
+    let next = match entry {
+        Some((_, on)) => {
+            *on = !*on;
+            *on
+        }
+        None => {
+            pick.push((index, true));
+            true
+        }
+    };
+    drop(pick);
+    set_pick(index, next);
+    next
+}
+
+/// 最近一次回传的 pin 集合（槽位 -> JSON 文本），供控制 socket 读取。
+static PINS_LAST: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+
+/// 记录某槽位最新的 pin 集合（pump 循环里调用）。
+pub fn store_pins(index: usize, json: &str) {
+    let mut last = PINS_LAST.lock().unwrap_or_else(|e| e.into_inner());
+    match last.iter_mut().find(|(i, _)| *i == index) {
+        Some(entry) => entry.1 = json.to_string(),
+        None => last.push((index, json.to_string())),
+    }
+}
+
+/// 清空 pin 快照（随消息发出后调用）。
+pub fn clear_pins_snapshot() {
+    PINS_LAST.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// 全部槽位的 pin 快照。
+pub fn pins_snapshot() -> Vec<(usize, String)> {
+    PINS_LAST.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// CEF browser id -> 槽位号。
+pub fn slot_of_browser_id(id: i32) -> Option<usize> {
+    slots().iter().position(|s| s.id == Some(id))
 }
 
 /// 页面内执行的 JS（标注层、AI 读取 DOM 都走这条路）。
@@ -508,9 +658,9 @@ pub fn osr_mode() -> bool {
     WINDOWLESS.load(Ordering::Relaxed)
 }
 
-/// 外部纹理在 gpui-wgpu 表里的 key。
-pub fn external_key() -> u32 {
-    EXTERNAL_KEY
+/// 外部纹理在 gpui-wgpu 表里的 key（按浏览器槽位区分）。
+pub fn external_key(index: usize) -> u32 {
+    index as u32
 }
 
 /// 最新一帧的尺寸；没有帧时返回 None（此时不画）。
@@ -567,14 +717,48 @@ pub fn osr_mouse_wheel(index: usize, x: i32, y: i32, delta_x: i32, delta_y: i32,
 /// 页面当前是否该收键盘（鼠标最后点在里面）。
 static OSR_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-pub fn osr_set_focused(focused: bool) {
-    let was = OSR_FOCUSED.swap(focused, Ordering::Relaxed);
-    if was != focused {
-        if let Some(index) = primary() {
-            if let Some(host) = host_at(index) {
-                host.set_focus(i32::from(focused));
+/// 当前持有键盘焦点的浏览器槽位（usize::MAX = 无）。
+static FOCUSED_SLOT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// 点进某个浏览器 pane:它拿焦点,其它实例全部让出（多 pane 并存的关键）。
+pub fn osr_focus_slot(index: usize, focused: bool) {
+    if focused {
+        FOCUSED_SLOT.store(index, Ordering::Relaxed);
+        OSR_FOCUSED.store(true, Ordering::Relaxed);
+        let mut all = Vec::new();
+        {
+            let slots = slots();
+            for (i, slot) in slots.iter().enumerate() {
+                all.push((i == index, slot.browser.as_ref().and_then(|b| b.host())));
             }
         }
+        for (is_this, host) in all {
+            if let Some(host) = host {
+                host.set_focus(i32::from(is_this));
+            }
+        }
+    } else {
+        FOCUSED_SLOT.store(usize::MAX, Ordering::Relaxed);
+        OSR_FOCUSED.store(false, Ordering::Relaxed);
+        let mut all = Vec::new();
+        {
+            let slots = slots();
+            for slot in slots.iter() {
+                all.push(slot.browser.as_ref().and_then(|b| b.host()));
+            }
+        }
+        for host in all.into_iter().flatten() {
+            host.set_focus(0);
+        }
+    }
+}
+
+/// 键盘焦点当前落在哪个浏览器 pane。
+pub fn focused_slot() -> Option<usize> {
+    match FOCUSED_SLOT.load(Ordering::Relaxed) {
+        usize::MAX => None,
+        index => Some(index),
     }
 }
 
@@ -776,7 +960,7 @@ pub fn pump() {
             }
         }
     };
-    if due {
+    if due && std::env::var_os("OMD_EXT_BF").is_some() {
         let hosts: Vec<_> = slots()
             .iter()
             .filter(|s| s.windowless)
@@ -927,17 +1111,15 @@ cef::wrap_app! {
         ) {
             use cef::ImplCommandLine as _;
             let Some(cmd) = command_line else { return };
-            if !WINDOWLESS.load(Ordering::Relaxed) {
-                /*
-                子窗口模式必须把 Chromium 的 Ozone 也钉在 X11：父窗口是 X11 的，
-                它自己 auto 探测到 Wayland 就再也挂不上去。CEF 会把这个开关传给
-                所有子进程，所以只需要在这里加一次。
-                */
-                cmd.append_switch_with_value(
-                    Some(&CefString::from("ozone-platform")),
-                    Some(&CefString::from("x11")),
-                );
-            }
+            let platform = if WAYLAND.load(Ordering::Relaxed) {
+                "wayland"
+            } else {
+                "x11"
+            };
+            cmd.append_switch_with_value(
+                Some(&CefString::from("ozone-platform")),
+                Some(&CefString::from(platform)),
+            );
             // 没有 GPU 的环境（Xvfb、远程会话）跑 OSR：让 Chromium 退到软件合成，
             // 否则 GPU 进程反复崩掉。
             if std::env::var("OMD_BROWSER_CPU").is_ok() {
@@ -957,6 +1139,48 @@ cef::wrap_app! {
     }
 }
 
+/// 从 BGRA 帧里裁一块存成 PNG，返回路径（元素截图，附在 pin 上）。
+fn crop_png(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    index: usize,
+    pin_id: u64,
+) -> Option<String> {
+    let x = x.min(width.saturating_sub(1));
+    let y = y.min(height.saturating_sub(1));
+    let w = w.min(width - x).max(1);
+    let h = h.min(height - y).max(1);
+    // 拾取时元素带着 2px 高亮框，往里缩一圈截到干净内容。
+    let (x, y, w, h) = if w > 8 && h > 8 {
+        (x + 2, y + 2, w - 4, h - 4)
+    } else {
+        (x, y, w, h)
+    };
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for row in y..y + h {
+        let start = ((row * width + x) * 4) as usize;
+        let end = start + (w * 4) as usize;
+        let line = pixels.get(start..end)?;
+        for px in line.chunks_exact(4) {
+            rgba.extend_from_slice(&[px[2], px[1], px[0], 0xff]);
+        }
+    }
+    let img = image::RgbaImage::from_raw(w, h, rgba)?;
+    let dir = std::path::PathBuf::from(
+        std::env::var("HOME").ok()?,
+    )
+    .join(".local/share/omd/pins");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("pin-{index}-{pin_id}.png"));
+    img.save(&path).ok()?;
+    Some(path.display().to_string())
+}
+
 // ---------------------------------------------------------------------------
 // CEF 回调
 // ---------------------------------------------------------------------------
@@ -966,6 +1190,10 @@ cef::wrap_client! {
     impl Client {
         fn render_handler(&self) -> Option<RenderHandler> {
             Some(OmdRender::new())
+        }
+
+        fn display_handler(&self) -> Option<DisplayHandler> {
+            Some(OmdDisplay::new())
         }
 
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
@@ -990,6 +1218,47 @@ cef::wrap_life_span_handler! {
     }
 }
 
+cef::wrap_display_handler! {
+    struct OmdDisplay {}
+    impl DisplayHandler {
+        fn on_console_message(
+            &self,
+            browser: Option<&mut Browser>,
+            _level: LogSeverity,
+            message: Option<&CefString>,
+            _source: Option<&CefString>,
+            _line: std::os::raw::c_int,
+        ) -> std::os::raw::c_int {
+            let Some(message) = message else { return 0 };
+            let text = message.to_string();
+            let id = browser.as_ref().map(|b| b.identifier());
+            if std::env::var("OMD_BROWSER_DEBUG").is_ok() && !text.is_empty() {
+                eprintln!(
+                    "[console] id={id:?} {}",
+                    text.chars().take(80).collect::<String>()
+                );
+            }
+            if text == "[omd-ready]" {
+                if let Some(id) = id {
+                    let mut ready = ANNOTATOR_READY.lock().unwrap_or_else(|e| e.into_inner());
+                    if !ready.contains(&id) {
+                        ready.push(id);
+                    }
+                }
+            }
+            if let Some(payload) = text.strip_prefix("[omd-pins]") {
+                if let Some(id) = id {
+                    PIN_QUEUE
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((id, payload.to_string()));
+                }
+            }
+            0
+        }
+    }
+}
+
 cef::wrap_render_handler! {
     struct OmdRender {}
     impl RenderHandler {
@@ -1005,6 +1274,15 @@ cef::wrap_render_handler! {
                 .and_then(|id| slots.iter().find(|s| s.id == Some(id)))
                 .or_else(|| slots.last());
             let (w, h) = slot.map(|s| s.view).unwrap_or((1280, 800));
+            if std::env::var("OMD_BROWSER_DEBUG").is_ok() {
+                static LAST: Mutex<(i32, i32)> = Mutex::new((0, 0));
+                static N: AtomicU64 = AtomicU64::new(0);
+                let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+                if *last != (w, h) || N.fetch_add(1, Ordering::Relaxed) < 3 {
+                    *last = (w, h);
+                    eprintln!("[view_rect] id={:?} asked {w}x{h}", id);
+                }
+            }
             rect.width = w;
             rect.height = h;
         }
@@ -1028,26 +1306,22 @@ cef::wrap_render_handler! {
                 } {
                     Ok(texture) => {
                         let (width, height) = (texture.width(), texture.height());
-                        // 池化的目标纹理尺寸固定，view 只在尺寸变化时重建。
-                        {
-                            static VIEWS: std::sync::Mutex<
-                                Vec<((u32, u32), wgpu::TextureView)>,
-                            > = std::sync::Mutex::new(Vec::new());
-                            let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-                            if !views.iter().any(|(k, _)| *k == (width, height)) {
-                                let view = texture
-                                    .create_view(&wgpu::TextureViewDescriptor::default());
-                                gpui_wgpu::register_external_texture(EXTERNAL_KEY, view.clone());
-                                views.push(((width, height), view));
-                            }
-                        }
+                        // 每次导入都是一张新的自有纹理。只在尺寸变化时登记的话，
+                        // 画面会停在第一帧（通常还是空白）。
+                        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
                         let seq = FRAME_SEQ.fetch_add(1, Ordering::Relaxed);
                         let id = browser.map(|b| b.identifier());
                         let mut slots = slots();
-                        let slot = match id.and_then(|id| slots.iter_mut().find(|s| s.id == Some(id))) {
-                            Some(slot) => Some(slot),
-                            None => slots.last_mut(),
+                        let (key, slot) = match id.and_then(|id| {
+                            slots.iter_mut().enumerate().find(|(_, s)| s.id == Some(id))
+                        }) {
+                            Some((index, slot)) => (index as u32, Some(slot)),
+                            None => match slots.len().checked_sub(1) {
+                                Some(last) => (last as u32, Some(&mut slots[last])),
+                                None => (0, None),
+                            },
                         };
+                        gpui_wgpu::register_external_texture(key, view);
                         if let Some(slot) = slot {
                             slot.accel = Some(AccelFrame { width, height, seq });
                             if n <= 3 && std::env::var("OMD_BROWSER_DEBUG").is_ok() {
@@ -1097,35 +1371,110 @@ cef::wrap_render_handler! {
             width: i32,
             height: i32,
         ) {
-            if width <= 0 || height <= 0 || buffer.is_null() {
+            if width <= 0 || height <= 0 || buffer.is_null() || SHARED_TEXTURE.load(Ordering::Relaxed)
+            {
                 return;
             }
             if std::env::var("OMD_BROWSER_DEBUG").is_ok() {
                 static N: AtomicU64 = AtomicU64::new(0);
                 let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-                if n % 30 == 1 {
-                    eprintln!("[paint] n={n} {width}x{height} dirty={:?}", _dirty_rects.map(|d| d.len()));
+                if n <= 3 || n % 300 == 0 {
+                    eprintln!(
+                        "[paint] n={n} id={:?} {width}x{height}",
+                        browser.as_ref().map(|b| b.identifier())
+                    );
                 }
             }
-            let len = (width as usize) * (height as usize) * 4;
-            // CEF 的缓冲在这行返回后就会复用，必须拷走。
-            let bgra = unsafe { std::slice::from_raw_parts(buffer, len) }.to_vec();
-            let frame = Frame {
-                width: width as u32,
-                height: height as u32,
-                bgra,
-                seq: FRAME_SEQ.fetch_add(1, Ordering::Relaxed),
-            };
+            let Some((device, queue)) = gpui_wgpu::shared_gpu() else { return };
+            let (width, height) = (width as u32, height as u32);
             let id = browser.map(|b| b.identifier());
             let mut slots = slots();
-            let slot = match id.and_then(|id| slots.iter_mut().find(|s| s.id == Some(id))) {
-                Some(slot) => slot,
-                None => match slots.last_mut() {
-                    Some(slot) => slot,
+            let (key, slot) = match id.and_then(|id| {
+                slots.iter_mut().enumerate().find(|(_, s)| s.id == Some(id))
+            }) {
+                Some((index, slot)) => (index as u32, slot),
+                None => match slots.len().checked_sub(1) {
+                    Some(last) => (last as u32, &mut slots[last]),
                     None => return,
                 },
             };
-            slot.frame = Some(std::sync::Arc::new(frame));
+            // 纹理只在尺寸变化时重建。直接上传 CEF 借用的 BGRA 缓冲，不再复制一份 Vec。
+            if slot.upload_texture.as_ref().is_none_or(|texture| {
+                texture.width() != width || texture.height() != height
+            }) {
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("browser OSR pixels"),
+                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Bgra8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                gpui_wgpu::register_external_texture(
+                    key,
+                    texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                );
+                slot.upload_texture = Some(texture);
+            }
+            // SAFETY: CEF 保证回调内 buffer 包含 width * height 个紧密排列的 BGRA 像素。
+            // write_texture 在返回前复制数据；不保留 CEF 的缓冲指针。
+            let pixels = unsafe {
+                std::slice::from_raw_parts(buffer, width as usize * height as usize * 4)
+            };
+            // wgpu 要求每行字节数是 256 的倍数。直接传 width*4 时校验失败，
+            // 纹理保持未初始化（画面是一条白带加底部棋盘格）。
+            let unpadded = width * 4;
+            let padded = unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+                * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let texture = slot.upload_texture.as_ref().unwrap();
+            if padded == unpadded {
+                queue.write_texture(
+                    texture.as_image_copy(),
+                    pixels,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(unpadded),
+                        rows_per_image: Some(height),
+                    },
+                    wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                );
+            } else {
+                let mut staged = Vec::with_capacity(padded as usize * height as usize);
+                for row in pixels.chunks_exact(unpadded as usize) {
+                    staged.extend_from_slice(row);
+                    staged.resize(staged.len() + (padded - unpadded) as usize, 0);
+                }
+                queue.write_texture(
+                    texture.as_image_copy(),
+                    &staged,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded),
+                        rows_per_image: Some(height),
+                    },
+                    wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                );
+            }
+            for (pin_id, cx0, cy0, cw, ch) in std::mem::take(&mut slot.capture_req) {
+                if let Some(path) = crop_png(
+                    pixels, width, height, cx0, cy0, cw, ch, key as usize, pin_id,
+                ) {
+                    slot.captured.push((pin_id, path));
+                }
+            }
+            if std::env::var("OMD_BROWSER_DUMP").is_ok() {
+                static D: AtomicU64 = AtomicU64::new(0);
+                if D.fetch_add(1, Ordering::Relaxed) % 30 == 0 {
+                    dump_texture(&device, &queue, &texture, "/tmp/cef-osr-last.png");
+                }
+            }
+            slot.accel = Some(AccelFrame {
+                width,
+                height,
+                seq: FRAME_SEQ.fetch_add(1, Ordering::Relaxed),
+            });
         }
     }
 }
