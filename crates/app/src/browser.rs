@@ -35,6 +35,8 @@ struct Slot {
     capture_req: Vec<(u64, u32, u32, u32, u32)>,
     /// 已落盘的元素截图：(pin_id, png 路径)。
     captured: Vec<(u64, String)>,
+    /// 上传纹理的对齐暂存缓冲（按行补 256 对齐用，复用避免每帧 ~3MB 分配）。
+    staging: Vec<u8>,
     /// 子窗口模式的 X11 宿主窗口（32 位 GPUI 窗口和 24 位 CEF 子窗口之间的桥）。
     host: Option<u32>,
 }
@@ -579,6 +581,17 @@ pub fn request_capture(index: usize, pin_id: u64, x: u32, y: u32, w: u32, h: u32
     // 静态页面不会自己重绘；推一次 invalidate 让下一帧带着像素来。
     if let Some(host) = host {
         host.invalidate(PaintElementType::VIEW);
+    }
+}
+
+/// 关闭一个浏览器实例（pane 被关掉时调用；异步完成，槽位保留以稳定下标）。
+pub fn close(index: usize) {
+    let mut slots = slots();
+    if let Some(slot) = slots.get_mut(index) {
+        slot.capture_req.clear();
+        if let Some(host) = slot.browser.as_ref().and_then(|b| b.host()) {
+            host.close_browser(1);
+        }
     }
 }
 
@@ -1238,6 +1251,35 @@ cef::wrap_life_span_handler! {
                 host.invalidate(PaintElementType::VIEW);
             }
         }
+
+        fn on_before_close(&self, browser: Option<&mut Browser>) {
+            let Some(id) = browser.as_ref().map(|b| b.identifier()) else {
+                return;
+            };
+            let mut slots = slots();
+            let Some(index) = slots.iter().position(|s| s.id == Some(id)) else {
+                return;
+            };
+            let slot = &mut slots[index];
+            slot.browser = None;
+            slot.upload_texture = None;
+            slot.accel = None;
+            slot.capture_req.clear();
+            slot.captured.clear();
+            slot.staging.clear();
+            slot.staging.shrink_to_fit();
+            let next = slots.iter().position(|s| s.browser.is_some());
+            drop(slots);
+            gpui_wgpu::unregister_external_texture(index as u32);
+            PICK.lock().unwrap_or_else(|e| e.into_inner()).retain(|(i, _)| *i != index);
+            if FOCUSED_SLOT.load(Ordering::Relaxed) == index {
+                FOCUSED_SLOT.store(usize::MAX, Ordering::Relaxed);
+                OSR_FOCUSED.store(false, Ordering::Relaxed);
+            }
+            if primary() == Some(index) {
+                set_primary(next);
+            }
+        }
     }
 }
 
@@ -1464,14 +1506,17 @@ cef::wrap_render_handler! {
                     wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
                 );
             } else {
-                let mut staged = Vec::with_capacity(padded as usize * height as usize);
+                let need = padded as usize * height as usize;
+                let staged = &mut slot.staging;
+                staged.clear();
+                staged.reserve(need);
                 for row in pixels.chunks_exact(unpadded as usize) {
                     staged.extend_from_slice(row);
                     staged.resize(staged.len() + (padded - unpadded) as usize, 0);
                 }
                 queue.write_texture(
                     texture.as_image_copy(),
-                    &staged,
+                    staged,
                     wgpu::TexelCopyBufferLayout {
                         offset: 0,
                         bytes_per_row: Some(padded),

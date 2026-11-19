@@ -2581,6 +2581,8 @@ struct Root {
     browser_pick_sent: std::collections::HashMap<usize, bool>,
     /// 待注入标注层的槽位（render 里在 UI 线程兑现）。
     browser_needs_inject: std::collections::HashSet<usize>,
+    /// 每个槽位最近一次注入时间（重试限频）。
+    browser_last_inject: std::collections::HashMap<usize, std::time::Instant>,
     /// 地址栏的回车订阅（订阅必须留住，否则立刻失效）。
     browser_input_subs: Vec<Subscription>,
     /// credentials/describe 的结果：ref -> { configured, writable }。
@@ -3534,6 +3536,7 @@ impl Root {
             browser_history: state.browser_history,
             browser_pick_sent: std::collections::HashMap::new(),
             browser_needs_inject: std::collections::HashSet::new(),
+            browser_last_inject: std::collections::HashMap::new(),
             browser_input_subs: Vec::new(),
             credentials_doc: Value::Null,
             settings_secret_edit: None,
@@ -7390,7 +7393,16 @@ impl Root {
             }
         }
 
+        let closed_browsers: Vec<usize> = self
+            .panes
+            .iter()
+            .filter(|pane| pane.id == pane_id)
+            .filter_map(|pane| pane.browser)
+            .collect();
         self.panes.retain(|pane| pane.id != pane_id);
+        for index in closed_browsers {
+            browser::close(index);
+        }
         self.chat_scrolls.remove(&pane_id);
         self.release_block_input(session);
 
@@ -7896,7 +7908,16 @@ impl Root {
                 }
             }
         }
+        let closed_browsers: Vec<usize> = self
+            .panes
+            .iter()
+            .filter(|pane| pane.id == pane_id)
+            .filter_map(|pane| pane.browser)
+            .collect();
         self.panes.retain(|pane| pane.id != pane_id);
+        for index in closed_browsers {
+            browser::close(index);
+        }
         if let Some(session) = session.as_deref() {
             self.release_block_input(session);
         }
@@ -17608,7 +17629,17 @@ impl Render for Root {
                     .map(|pane| pane.focus.clone());
                 if let Some(focus) = focus {
                     if self.browser_needs_inject.contains(&index) {
-                        browser::inject_annotator(index);
+                        // 页面可能永远不 ack（file://、CSP 限制），限频避免每帧注入。
+                        let due = self
+                            .browser_last_inject
+                            .get(&index)
+                            .map(|t| t.elapsed() >= std::time::Duration::from_millis(500))
+                            .unwrap_or(true);
+                        if due {
+                            self.browser_last_inject
+                                .insert(index, std::time::Instant::now());
+                            browser::inject_annotator(index);
+                        }
                         if browser::pick_on(index) {
                             browser::set_pick(index, true);
                             self.browser_pick_sent.insert(index, true);
@@ -17616,7 +17647,12 @@ impl Render for Root {
                     }
                     let input = self.ensure_browser_input(index, window, cx);
                     // 地址栏跟随页面跳转：正在编辑时不要抢用户的光标。
-                    let current = browser::current_url(index).unwrap_or_default();
+                    // URL 用 pump 维护的缓存，避免每帧跨 FFI 查询。
+                    let current = self
+                        .browser_urls
+                        .get(&index)
+                        .cloned()
+                        .unwrap_or_default();
                     if !current.is_empty()
                         && !input.read(cx).focus_handle(cx).is_focused(window)
                         && input.read(cx).value().as_ref() != current.as_str()
@@ -17692,7 +17728,11 @@ impl Render for Root {
                         let focused = input.read(cx).focus_handle(cx).is_focused(window);
                         let value = input.read(cx).value().to_string();
                         if focused {
-                            let current = browser::current_url(index).unwrap_or_default();
+                            let current = self
+                                .browser_urls
+                                .get(&index)
+                                .cloned()
+                                .unwrap_or_default();
                             let filter = if value == current {
                                 String::new()
                             } else {
