@@ -51,6 +51,8 @@ static ANNOTATOR_READY: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 /// 页内标注层（hover 高亮 / 点击 pin）。
 const ANNOTATOR_JS: &str = include_str!("annotator.js");
 static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
+/// CEF 是否已在本进程初始化（shutdown 守卫）。
+static CEF_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 当前进程是否 windowless。Chromium 的 Ozone 平台开关据此决定。
 static WINDOWLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 初始化前选定 Ozone 后端，避免 CEF 修改环境后改变 GPUI 的会话选择。
@@ -200,6 +202,7 @@ pub fn init(remote_port: i32, cache_dir: &std::path::Path, windowless: bool) -> 
         return false;
     }
     *INITIALIZED.lock().unwrap() = true;
+    CEF_READY.store(true, Ordering::Relaxed);
     write_cdp_endpoint(remote_port);
     true
 }
@@ -1035,6 +1038,15 @@ pub fn pump() {
 }
 
 pub fn shutdown() {
+    if !CEF_READY.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    // 端点描述只在本进程存活期间有效。
+    if let Some(home) = std::env::var_os("HOME") {
+        let _ = std::fs::remove_file(
+            std::path::PathBuf::from(home).join(".local/share/omd/browser.cdp.json"),
+        );
+    }
     slots().clear();
     cef::shutdown();
 }
@@ -1215,6 +1227,106 @@ fn crop_png(
     let path = dir.join(format!("pin-{index}-{pin_id}.png"));
     img.save(&path).ok()?;
     Some(path.display().to_string())
+}
+
+/// 把 CEF 的帧写进纹理。脏区合计不足 80% 时按脏区分块上传（动画页
+/// 大多数帧只动一小块），否则整帧上传。暂存缓冲复用,行宽按 256 对齐。
+#[allow(clippy::too_many_arguments)]
+fn upload_frame(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    dirty: Option<&[Rect]>,
+    staging: &mut Vec<u8>,
+) {
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded_row = |row: u32| row.div_ceil(align) * align;
+    let rects: Vec<(u32, u32, u32, u32)> = dirty
+        .map(|list| {
+            list.iter()
+                .filter_map(|r| {
+                    let x = r.x.max(0) as u32;
+                    let y = r.y.max(0) as u32;
+                    let w = (r.width.max(0) as u32).min(width.saturating_sub(x));
+                    let h = (r.height.max(0) as u32).min(height.saturating_sub(y));
+                    (w > 0 && h > 0).then_some((x, y, w, h))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let dirty_area: u64 = rects
+        .iter()
+        .map(|&(_, _, w, h)| w as u64 * h as u64)
+        .sum();
+    let full_frame = rects.is_empty()
+        || dirty_area * 5 >= width as u64 * height as u64 * 4;
+    let target = |origin: wgpu::Origin3d| wgpu::TexelCopyTextureInfo {
+        texture,
+        mip_level: 0,
+        origin,
+        aspect: wgpu::TextureAspect::All,
+    };
+    if full_frame {
+        let unpadded = width * 4;
+        let padded = padded_row(unpadded);
+        if padded == unpadded {
+            queue.write_texture(
+                target(wgpu::Origin3d::ZERO),
+                pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(unpadded),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            );
+        } else {
+            staging.clear();
+            staging.reserve(padded as usize * height as usize);
+            for row in pixels.chunks_exact(unpadded as usize) {
+                staging.extend_from_slice(row);
+                staging.resize(staging.len() + (padded - unpadded) as usize, 0);
+            }
+            queue.write_texture(
+                target(wgpu::Origin3d::ZERO),
+                staging,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            );
+        }
+        return;
+    }
+    for (dx, dy, dw, dh) in rects {
+        let row = dw * 4;
+        let row_padded = padded_row(row);
+        staging.clear();
+        staging.reserve(row_padded as usize * dh as usize);
+        for r in dy..dy + dh {
+            let start = ((r * width + dx) * 4) as usize;
+            let end = start + row as usize;
+            let Some(line) = pixels.get(start..end) else { break };
+            staging.extend_from_slice(line);
+            if row_padded > row {
+                staging.resize(staging.len() + (row_padded - row) as usize, 0);
+            }
+        }
+        queue.write_texture(
+            target(wgpu::Origin3d { x: dx, y: dy, z: 0 }),
+            staging,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row_padded),
+                rows_per_image: Some(dh),
+            },
+            wgpu::Extent3d { width: dw, height: dh, depth_or_array_layers: 1 },
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1431,7 +1543,7 @@ cef::wrap_render_handler! {
             &self,
             browser: Option<&mut Browser>,
             _type_: PaintElementType,
-            _dirty_rects: Option<&[Rect]>,
+            dirty_rects: Option<&[Rect]>,
             buffer: *const u8,
             width: i32,
             height: i32,
@@ -1488,43 +1600,16 @@ cef::wrap_render_handler! {
             let pixels = unsafe {
                 std::slice::from_raw_parts(buffer, width as usize * height as usize * 4)
             };
-            // wgpu 要求每行字节数是 256 的倍数。直接传 width*4 时校验失败，
-            // 纹理保持未初始化（画面是一条白带加底部棋盘格）。
-            let unpadded = width * 4;
-            let padded = unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
-                * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
             let texture = slot.upload_texture.as_ref().unwrap();
-            if padded == unpadded {
-                queue.write_texture(
-                    texture.as_image_copy(),
-                    pixels,
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(unpadded),
-                        rows_per_image: Some(height),
-                    },
-                    wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                );
-            } else {
-                let need = padded as usize * height as usize;
-                let staged = &mut slot.staging;
-                staged.clear();
-                staged.reserve(need);
-                for row in pixels.chunks_exact(unpadded as usize) {
-                    staged.extend_from_slice(row);
-                    staged.resize(staged.len() + (padded - unpadded) as usize, 0);
-                }
-                queue.write_texture(
-                    texture.as_image_copy(),
-                    staged,
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(padded),
-                        rows_per_image: Some(height),
-                    },
-                    wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                );
-            }
+            upload_frame(
+                &queue,
+                texture,
+                pixels,
+                width,
+                height,
+                dirty_rects,
+                &mut slot.staging,
+            );
             for (pin_id, cx0, cy0, cw, ch) in std::mem::take(&mut slot.capture_req) {
                 if let Some(path) = crop_png(
                     pixels, width, height, cx0, cy0, cw, ch, key as usize, pin_id,

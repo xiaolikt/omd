@@ -3533,7 +3533,7 @@ impl Root {
             browser_inputs: std::collections::HashMap::new(),
             browser_pins: std::collections::HashMap::new(),
             browser_urls: std::collections::HashMap::new(),
-            browser_history: state.browser_history,
+            browser_history: load_browser_history(),
             browser_pick_sent: std::collections::HashMap::new(),
             browser_needs_inject: std::collections::HashSet::new(),
             browser_last_inject: std::collections::HashMap::new(),
@@ -4922,7 +4922,6 @@ impl Root {
             "git_signoff": self.git_signoff,
             "browser_home": self.browser_home,
             "browser_cdp_port": self.browser_cdp_port,
-            "browser_history": self.browser_history,
             "spaces": spaces,
             "current_space": self.current_space,
             "selected": self.selected,
@@ -7570,7 +7569,7 @@ impl Root {
                                 root.browser_history.retain(|u| *u != url);
                                 root.browser_history.insert(0, url.clone());
                                 root.browser_history.truncate(200);
-                                root.save_state();
+                                save_browser_history(&root.browser_history);
                                 root.browser_pins.remove(&index);
                                 root.browser_pick_sent.remove(&index);
                                 browser::annotator_reset(index);
@@ -19267,6 +19266,24 @@ fn write_cache_json(path: &std::path::Path, value: &Value) {
     }
 }
 
+fn browser_history_path() -> PathBuf {
+    data_dir().join("browser-history.json")
+}
+
+fn load_browser_history() -> Vec<String> {
+    std::fs::read_to_string(browser_history_path())
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_browser_history(list: &[String]) {
+    let Ok(text) = serde_json::to_string(list) else {
+        return;
+    };
+    let _ = std::fs::write(browser_history_path(), text);
+}
+
 fn ui_state_path() -> PathBuf {
     data_dir().join("ui-state.json")
 }
@@ -19294,8 +19311,6 @@ struct UiState {
     browser_home: String,
     /// 本地偏好：浏览器 CDP 端口。
     browser_cdp_port: u16,
-    /// 浏览器地址历史（最近访问在前，去重，上限 200）。
-    browser_history: Vec<String>,
 }
 
 fn layout_json_has_content(value: &Value) -> bool {
@@ -19337,7 +19352,6 @@ fn load_ui_state_inner() -> UiState {
         git_signoff: false,
         browser_home: "https://example.com".to_string(),
         browser_cdp_port: 9222,
-        browser_history: Vec::new(),
     };
     let Ok(text) = std::fs::read_to_string(ui_state_path()) else {
         return empty();
@@ -19573,17 +19587,6 @@ fn load_ui_state_inner() -> UiState {
             .and_then(|v| v.as_u64())
             .map(|v| v as u16)
             .unwrap_or(9222),
-        browser_history: value
-            .get("browser_history")
-            .and_then(|v| v.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(str::to_string))
-                    .take(200)
-                    .collect()
-            })
-            .unwrap_or_default(),
     }
 }
 
@@ -20425,6 +20428,7 @@ fn main() {
         stamp(format!("window opened (handle {handle:?})"));
     });
     stamp("app.run returned");
+    browser::shutdown();
 }
 
 /// 直接写文件，绕过 stdout 缓冲（worker 线程的 eprintln 不可靠）
