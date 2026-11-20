@@ -2734,6 +2734,8 @@ struct Root {
     drag_split: Option<(u64, usize, f32, Vec<f32>)>,
     /// 拖动 panel 头：(leaf, 起点 x, 起点 y)
     drag_leaf: Option<(u64, f32, f32)>,
+    /// 点开中的 block 头菜单（pane id；⠿ 抓手点击）
+    block_menu: Option<u64>,
     /// 哪些 session 是终端 tab（渲染成整块终端而不是聊天）
     term_tabs: std::collections::HashSet<String>,
     /// 命令面板（Ctrl+K）：搜索 + 命令 / 会话 / 空间。
@@ -4065,7 +4067,12 @@ impl Root {
             split_dsh_pending: std::env::var("OMD_SPLIT_DSH").is_ok(),
     split_hover: None,
     pending_split: None,
-    focused_pane: None,
+    focused_pane: std::env::var("OMD_BLOCK_ACTIVE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok()),
+    block_menu: std::env::var("OMD_BLOCK_MENU")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok()),
     focus_pending: None,
     pending_term_meta: std::collections::HashMap::new(),
             chat_snapshots: std::collections::HashMap::new(),
@@ -9104,15 +9111,6 @@ impl Root {
 
     /// 新建一个终端 pane（下 / 右 / 标签页）。可以重复加，互不影响。
     /// 从指定 panel 分出一个新的 terminal panel（布局树里一分为二）。
-    /// 悬停到分屏按钮：立刻展开菜单（同一时刻只开一个）。
-    fn open_split_menu(&mut self, leaf: u64, dir: SplitDir, cx: &mut Context<Self>) {
-        self.split_hover_gen = self.split_hover_gen.wrapping_add(1);
-        if self.split_hover != Some((leaf, dir)) {
-            self.split_hover = Some((leaf, dir));
-            cx.notify();
-        }
-    }
-
     /// 离开按钮/菜单：延迟 240ms 关，期间进菜单会把代计数作废。
     fn close_split_menu_soon(&mut self, cx: &mut Context<Self>) {
         self.split_hover_gen = self.split_hover_gen.wrapping_add(1);
@@ -10197,6 +10195,12 @@ impl Root {
         // 大纲开着时：Esc 关掉
         if self.show_outline && key == "escape" {
             self.show_outline = false;
+            cx.notify();
+            return true;
+        }
+        // block 头菜单开着时：Esc 关掉
+        if self.block_menu.is_some() && key == "escape" {
+            self.block_menu = None;
             cx.notify();
             return true;
         }
@@ -13019,8 +13023,20 @@ fn pane_element(
     find: Option<(Entity<InputState>, usize, usize)>,
     // 大纲（当前编辑器；Some 时 body 里画浮层）
     outline_items: Option<Vec<lsp::OutlineItem>>,
+    // 是否是当前活动 block（头部高亮 + 左边色条）
+    active: bool,
+    // ⠿ 抓手菜单是否展开
+    menu_open: bool,
     cx: &mut Context<Root>,
 ) -> AnyElement {
+    let accent = if editor.is_some() {
+        rgb(0x00b4ff)
+    } else if media.is_some() {
+        rgb(0xffa657)
+    } else {
+        rgb(0x00d98a)
+    };
+    let is_editor = editor.is_some();
     let el = div()
         .flex()
         .flex_col()
@@ -13028,7 +13044,12 @@ fn pane_element(
         .min_h(px(0.))
         .min_w(px(0.))
         .size_full()
-        .bg(rgb(0x101319));
+        .relative()
+        .bg(if active {
+            rgb(0x101319)
+        } else {
+            rgb(0x0d1015)
+        });
     let focus_click = focus.clone();
     // 格式化/大纲按钮用
     let format_pane_id = pane_id;
@@ -13060,9 +13081,25 @@ fn pane_element(
             .gap(px(6.))
             .px(px(10.))
             .h(px(24.))
-            .bg(rgb(0x15181f))
+            .bg(if active {
+                rgb(0x1b2029)
+            } else {
+                rgb(0x15181f)
+            })
             .border_b_1()
-            .border_color(rgb(0x23272f))
+            .border_color(if active {
+                rgb(0x2f3846)
+            } else {
+                rgb(0x23272f)
+            })
+            // 左侧色条：活动 block 亮起，非活动压暗
+            .child(
+                div()
+                    .w(px(2.))
+                    .h(px(12.))
+                    .rounded(px(1.))
+                    .bg(if active { accent } else { rgb(0x2a3038) }),
+            )
             .child(if editor.is_some() {
                 Icon::new(gpui_kit::assets::IconName::FileText)
                     .with_size(px(12.))
@@ -13077,7 +13114,11 @@ fn pane_element(
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0xced3dd))
+                    .text_color(if active {
+                        rgb(0xe2e7f0)
+                    } else {
+                        rgb(0x9ca3b0)
+                    })
                     .child(SharedString::from(title)),
             )
             .children(diag.and_then(|(errors, warnings)| {
@@ -13143,6 +13184,7 @@ fn pane_element(
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
+                    this.block_menu = None;
                     this.drag_leaf = Some((
                         pane_id,
                         f32::from(ev.position.x),
@@ -13151,48 +13193,52 @@ fn pane_element(
                     cx.notify();
                 }),
             )
-            .child(panel_split_buttons(pane_id, cx))
+            // ⠿ 抓手下拉菜单：按住拖动 = 换位；点击 = 菜单
             .child(
                 div()
-                    .id(SharedString::from(format!("pane-max-{pane_id}")))
-                    .w(px(20.))
+                    .id(SharedString::from(format!("pane-grip-{pane_id}")))
+                    .w(px(22.))
                     .h(px(18.))
                     .flex()
                     .items_center()
                     .justify_center()
                     .rounded_sm()
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x20232b)))
-                    .child(
-                        Icon::new(if is_maximized {
-                            gpui_kit::assets::IconName::Minimize
-                        } else {
-                            gpui_kit::assets::IconName::Maximize
-                        })
-                        .with_size(px(12.))
-                        .text_color(rgb(0x707786)),
+                    .text_sm()
+                    .text_color(if menu_open {
+                        rgb(0xe2e7f0)
+                    } else {
+                        rgb(0x707786)
+                    })
+                    .bg(if menu_open {
+                        rgba(0x283140ff)
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .hover(|style| style.bg(rgb(0x232a36)).text_color(rgb(0xe2e7f0)))
+                    .child("⠿")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
+                            // 抓手自己处理按下：不要再冒泡到头部（那里会清菜单）
+                            cx.stop_propagation();
+                            this.drag_leaf = Some((
+                                pane_id,
+                                f32::from(ev.position.x),
+                                f32::from(ev.position.y),
+                            ));
+                            cx.notify();
+                        }),
                     )
                     .on_click(cx.listener(move |this, _ev, _win, cx| {
-                        this.toggle_maximize(pane_id, cx);
+                        this.focused_pane = Some(pane_id);
+                        this.block_menu = if this.block_menu == Some(pane_id) {
+                            None
+                        } else {
+                            Some(pane_id)
+                        };
+                        cx.notify();
                     })),
-            )
-            .child(
-                div()
-                    .id(SharedString::from(format!("pane-close-{pane_id}")))
-                    .w(px(18.))
-                    .h(px(16.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_xs()
-                    .text_color(rgb(0x707786))
-                    .hover(|style| style.bg(rgb(0x23272f)))
-                    .child("×")
-                    .on_click(
-                        cx.listener(move |this, _ev, win, cx| this.close_pane(pane_id, win, cx)),
-                    ),
             ),
     )
     .child(if let Some((path, kind, image)) = media {
@@ -13399,6 +13445,7 @@ fn pane_element(
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseDownEvent, win, cx| {
                     this.focused_pane = Some(pane_id);
+                    this.block_menu = None;
                     focus_click.focus(win, cx);
                     // 终端：按下即锚定选区（拖动 = 选择，单击 = 清空）
                     if term_id_select.is_some() {
@@ -13574,7 +13621,214 @@ fn pane_element(
             .into_any_element()
     })
     .children(split_menu.map(|dir| split_hover_menu(pane_id, dir, cx)))
+    .children(menu_open.then(|| {
+        block_menu_overlay(
+            pane_id,
+            is_editor,
+            is_maximized,
+            Some(BlockMenuClose::Pane),
+            cx,
+        )
+    }))
     .into_any_element()
+}
+
+/// block 头菜单的关闭动作类型：普通 pane 走 close_pane，聊天 pane 走 close_chat_pane。
+#[derive(Clone)]
+enum BlockMenuClose {
+    Pane,
+    Chat(String),
+}
+
+/// block 头 ⠿ 抓手的下拉菜单：分屏、格式化/大纲、最大化、关闭。
+fn block_menu_overlay(
+    pane_id: u64,
+    is_editor: bool,
+    is_maximized: bool,
+    close: Option<BlockMenuClose>,
+    cx: &mut Context<Root>,
+) -> AnyElement {
+    let row = |id: String, glyph: &'static str, color: u32, label: String| {
+        div()
+            .id(SharedString::from(id))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.))
+            .px(px(8.))
+            .py(px(4.))
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(0x20232b)))
+            .child(
+                div()
+                    .w(px(13.))
+                    .text_sm()
+                    .text_color(rgb(color))
+                    .child(SharedString::from(glyph)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xd7dce6))
+                    .child(SharedString::from(label)),
+            )
+    };
+    let section = |label: &'static str| {
+        div()
+            .px(px(8.))
+            .pt(px(5.))
+            .pb(px(1.))
+            .text_xs()
+            .text_color(rgb(0x51637e))
+            .child(SharedString::from(label))
+    };
+
+    let mut menu = div()
+        .id(SharedString::from(format!("block-menu-{pane_id}")))
+        .absolute()
+        .top(px(27.))
+        .right(px(6.))
+        .w(px(198.))
+        .flex()
+        .flex_col()
+        .gap(px(1.))
+        .p(px(4.))
+        .rounded(px(8.))
+        .bg(rgb(0x1b1e26))
+        .border_1()
+        .border_color(rgb(0x2c3340))
+        .shadow_lg()
+        .occlude()
+        .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
+            cx.stop_propagation();
+        })
+        .child(section("split right"));
+
+    for (i, (glyph, color, label)) in [
+        ("◆", 0x00b4ff, "chat block"),
+        (">", 0x00d98a, "terminal block"),
+        ("◐", 0xffa657, "browser block"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = match i {
+            0 => format!("block-menu-right-chat-{pane_id}"),
+            1 => format!("block-menu-right-term-{pane_id}"),
+            _ => format!("block-menu-right-browser-{pane_id}"),
+        };
+        menu = menu.child(row(id, glyph, color, label.to_string()).on_click(
+            cx.listener(move |this, _ev, _win, cx| {
+                this.block_menu = None;
+                match i {
+                    0 => this.split_with_dsh(pane_id, SplitDir::Row, cx),
+                    1 => this.split_pane(pane_id, SplitDir::Row, cx),
+                    _ => this.split_with_browser(pane_id, SplitDir::Row, cx),
+                }
+                cx.notify();
+            }),
+        ));
+    }
+
+    menu = menu.child(section("split down"));
+    for (i, (glyph, color, label)) in [
+        ("◆", 0x00b4ff, "chat block"),
+        (">", 0x00d98a, "terminal block"),
+        ("◐", 0xffa657, "browser block"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = match i {
+            0 => format!("block-menu-down-chat-{pane_id}"),
+            1 => format!("block-menu-down-term-{pane_id}"),
+            _ => format!("block-menu-down-browser-{pane_id}"),
+        };
+        menu = menu.child(row(id, glyph, color, label.to_string()).on_click(
+            cx.listener(move |this, _ev, _win, cx| {
+                this.block_menu = None;
+                match i {
+                    0 => this.split_with_dsh(pane_id, SplitDir::Col, cx),
+                    1 => this.split_pane(pane_id, SplitDir::Col, cx),
+                    _ => this.split_with_browser(pane_id, SplitDir::Col, cx),
+                }
+                cx.notify();
+            }),
+        ));
+    }
+
+    if is_editor {
+        menu = menu
+            .child(div().my(px(3.)).h(px(1.)).w_full().bg(rgb(0x2a3038)))
+            .child(
+                row(
+                    format!("block-menu-format-{pane_id}"),
+                    "❏",
+                    0x00b4ff,
+                    "format document".to_string(),
+                )
+                .on_click(cx.listener(move |this, _ev, _win, cx| {
+                    this.block_menu = None;
+                    this.focused_pane = Some(pane_id);
+                    this.format_current_editor(cx);
+                    cx.notify();
+                })),
+            )
+            .child(
+                row(
+                    format!("block-menu-outline-{pane_id}"),
+                    "☰",
+                    0x9ca3b0,
+                    "outline".to_string(),
+                )
+                .on_click(cx.listener(move |this, _ev, _win, cx| {
+                    this.block_menu = None;
+                    this.focused_pane = Some(pane_id);
+                    this.open_outline(cx);
+                    cx.notify();
+                })),
+            );
+    }
+
+    menu = menu
+        .child(div().my(px(3.)).h(px(1.)).w_full().bg(rgb(0x2a3038)))
+        .child(
+            row(
+                format!("block-menu-max-{pane_id}"),
+                if is_maximized { "⤡" } else { "⤢" },
+                0x9ca3b0,
+                if is_maximized { "restore block" } else { "maximize block" }.to_string(),
+            )
+            .on_click(cx.listener(move |this, _ev, _win, cx| {
+                this.block_menu = None;
+                this.toggle_maximize(pane_id, cx);
+                cx.notify();
+            })),
+        );
+
+    if let Some(close) = close {
+        menu = menu.child(
+            row(
+                format!("block-menu-close-{pane_id}"),
+                "×",
+                0xff5663,
+                "close block".to_string(),
+            )
+            .on_click(cx.listener(move |this, _ev, win, cx| {
+                this.block_menu = None;
+                match &close {
+                    BlockMenuClose::Pane => this.close_pane(pane_id, win, cx),
+                    BlockMenuClose::Chat(session) => {
+                        this.close_chat_pane(pane_id, session, cx)
+                    }
+                }
+                cx.notify();
+            })),
+        );
+    }
+
+    menu.into_any_element()
 }
 
 /// pane 之间的分隔条（拖拽改尺寸）。
@@ -14035,147 +14289,6 @@ fn split_divider(split_id: u64, index: usize, dir: SplitDir, cx: &mut Context<Ro
     .into_any_element()
 }
 
-/// 分屏菜单的三行（chat / terminal / browser）。HoverCard 和旧的悬浮层共用。
-fn split_menu_rows(
-    leaf: u64,
-    dir: SplitDir,
-    weak_dsh: WeakEntity<Root>,
-    weak_term: WeakEntity<Root>,
-    weak_browser: WeakEntity<Root>,
-) -> Stateful<Div> {
-    let row = |id: String, glyph: &str, glyph_color: u32, label: &str| {
-        div()
-            .id(SharedString::from(id))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.))
-            .px(px(8.))
-            .py(px(5.))
-            .rounded_sm()
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(0x20232b)))
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(glyph_color))
-                    .child(SharedString::from(glyph)),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(0xe8ecf4))
-                    .child(SharedString::from(label)),
-            )
-    };
-
-    div()
-        .id(SharedString::from(format!("split-menu-{leaf}")))
-        .flex()
-        .flex_col()
-        .gap(px(1.))
-        .w(px(148.))
-        .p(px(4.))
-        .rounded(px(8.))
-        .bg(rgb(0x1b1e26))
-        .border_1()
-        .border_color(rgb(0x2c3340))
-        .shadow_lg()
-        .child(
-            row(
-                format!("split-row-dsh-{leaf}"),
-                "◆",
-                0x00b4ff,
-                "chat block",
-            )
-            .on_click(move |_ev, _win, cx| {
-                let _ = weak_dsh.update(cx, |root, cx| {
-                    root.split_with_dsh(leaf, dir, cx);
-                });
-            }),
-        )
-        .child(
-            row(
-                format!("split-row-term-{leaf}"),
-                ">",
-                0x00d98a,
-                "terminal block",
-            )
-            .on_click(move |_ev, _win, cx| {
-                let _ = weak_term.update(cx, |root, cx| {
-                    root.split_pane(leaf, dir, cx);
-                });
-            }),
-        )
-        .child(
-            row(
-                format!("split-row-browser-{leaf}"),
-                "◐",
-                0xffa657,
-                "browser block",
-            )
-            .on_click(move |_ev, _win, cx| {
-                let _ = weak_browser.update(cx, |root, cx| {
-                    root.split_with_browser(leaf, dir, cx);
-                });
-            }),
-        )
-}
-
-/// panel 头右上角的分屏按钮（Herdr 那种：▯ 右分屏 / ⊟ 下分屏）。
-fn panel_split_buttons(leaf: u64, cx: &mut Context<Root>) -> AnyElement {
-    // 只有 ▯ / ⊟ 两个按钮：
-    // - 直接点 = 该方向分屏，新面板是 dsh（见 split_with_dsh）
-    // - 悬停 = 弹出小菜单（chat / terminal / browser）
-    let mut row = div().flex().flex_row().items_center().gap(px(2.)).flex_shrink_0();
-
-    for (vertical, dir, name) in [
-        (true, SplitDir::Row, gpui_kit::assets::IconName::PanelRight),
-        (false, SplitDir::Col, gpui_kit::assets::IconName::PanelBottom),
-    ] {
-        let weak = cx.entity().downgrade();
-        let trigger = div()
-            .id(SharedString::from(format!(
-                "panel-split-{}-{leaf}",
-                if vertical { "right" } else { "bottom" }
-            )))
-            .w(px(20.))
-            .h(px(18.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_sm()
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(0x20232b)))
-            .child(Icon::new(name).with_size(px(12.)).text_color(rgb(0x707786)))
-            .on_click(move |_ev, _win, cx| {
-                // 直接点 = dsh（按需求：split 出来的是 dsh 面板）
-                let _ = weak.update(cx, |root, cx| {
-                    root.split_with_dsh(leaf, dir, cx);
-                });
-            });
-        let (weak_dsh, weak_term, weak_browser) = (
-            cx.entity().downgrade(),
-            cx.entity().downgrade(),
-            cx.entity().downgrade(),
-        );
-        row = row.child(
-            gpui_kit::base::HoverCard::new(SharedString::from(format!(
-                "panel-split-card-{}-{leaf}",
-                if vertical { "right" } else { "bottom" }
-            )))
-            .anchor(gpui_kit::Anchor::TopRight)
-            .open_delay(std::time::Duration::from_millis(120))
-            .close_delay(std::time::Duration::from_millis(180))
-            .trigger(trigger)
-            .content(move |_state, _window, _cx| {
-                split_menu_rows(leaf, dir, weak_dsh, weak_term, weak_browser)
-            }),
-        );
-    }
-
-    row.into_any_element()
-}
 
 /// Composer for a split dsh block. It owns its InputState, so two blocks
 /// can be edited independently at the same time.
@@ -14425,12 +14538,12 @@ fn chat_pane_element(
     stream: Option<StreamState>,
     composer: Option<AnyElement>,
     split_menu: Option<SplitDir>,
+    active: bool,
+    menu_open: bool,
     cx: &mut Context<Root>,
 ) -> AnyElement {
     let weak_body = cx.entity().downgrade();
-    let weak_close = cx.entity().downgrade();
     let switch_id = session_id.clone();
-    let close_id = session_id.clone();
 
     let mut rows: Vec<AnyElement> = Vec::new();
     for block in blocks.iter().rev().take(200).rev() {
@@ -14493,7 +14606,11 @@ fn chat_pane_element(
         .size_full()
         .min_h(px(0.))
         .min_w(px(0.))
-        .bg(rgb(0x101319))
+        .bg(if active {
+            rgb(0x101319)
+        } else {
+            rgb(0x0d1015)
+        })
         .child(
             div()
                 .flex()
@@ -14503,9 +14620,24 @@ fn chat_pane_element(
                 .px(px(10.))
                 .h(px(24.))
                 .flex_shrink_0()
-                .bg(rgb(0x15181f))
+                .bg(if active {
+                    rgb(0x1b2029)
+                } else {
+                    rgb(0x15181f)
+                })
                 .border_b_1()
-                .border_color(rgb(0x23272f))
+                .border_color(if active {
+                    rgb(0x2f3846)
+                } else {
+                    rgb(0x23272f)
+                })
+                .child(
+                    div()
+                        .w(px(2.))
+                        .h(px(12.))
+                        .rounded(px(1.))
+                        .bg(if active { rgb(0x00b8ff) } else { rgb(0x2a3038) }),
+                )
                 .child(
                     Icon::new(gpui_kit::assets::IconName::Bot)
                         .with_size(px(12.))
@@ -14516,43 +14648,69 @@ fn chat_pane_element(
                         .flex_1()
                         .min_w(px(0.))
                         .text_xs()
-                        .text_color(rgb(0xced3dd))
+                        .text_color(if active {
+                            rgb(0xe2e7f0)
+                        } else {
+                            rgb(0x9ca3b0)
+                        })
                         .whitespace_nowrap()
                         .text_ellipsis()
                         .child(SharedString::from(title)),
                 )
-                .child(panel_split_buttons(pane_id, cx))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
+                        this.block_menu = None;
                         this.drag_leaf = Some((pane_id, f32::from(ev.position.x), f32::from(ev.position.y)));
                         cx.notify();
                     }),
                 )
-                .children(if show_close {
-                    Some(
-                        div()
-                            .id(SharedString::from(format!("chat-pane-close-{pane_id}")))
-                            .w(px(18.))
-                            .h(px(18.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_sm()
-                            .text_xs()
-                            .text_color(rgb(0x707786))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x3a1f24)).text_color(rgb(0xff5663)))
-                            .child("×")
-                            .on_click(move |_ev, _win, cx| {
-                                let _ = weak_close.update(cx, |root, cx| {
-                                    root.close_chat_pane(pane_id, &close_id, cx)
-                                });
+                // ⠿ 抓手：拖动换位，点击下拉菜单
+                .child(
+                    div()
+                        .id(SharedString::from(format!("chat-pane-grip-{pane_id}")))
+                        .w(px(22.))
+                        .h(px(18.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_sm()
+                        .text_color(if menu_open {
+                            rgb(0xe2e7f0)
+                        } else {
+                            rgb(0x707786)
+                        })
+                        .bg(if menu_open {
+                            rgba(0x283140ff)
+                        } else {
+                            rgba(0x00000000)
+                        })
+                        .hover(|style| style.bg(rgb(0x232a36)).text_color(rgb(0xe2e7f0)))
+                        .child("⠿")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
+                                cx.stop_propagation();
+                                this.drag_leaf = Some((
+                                    pane_id,
+                                    f32::from(ev.position.x),
+                                    f32::from(ev.position.y),
+                                ));
+                                cx.notify();
                             }),
-                    )
-                } else {
-                    None
-                }),
+                        )
+                        .on_click(cx.listener(move |this, _ev, _win, cx| {
+                            this.focused_pane = Some(pane_id);
+                            this.block_menu = if this.block_menu == Some(pane_id) {
+                                None
+                            } else {
+                                Some(pane_id)
+                            };
+                            cx.notify();
+                        })),
+                ),
         )
         .child(
             div()
@@ -14597,12 +14755,22 @@ fn chat_pane_element(
                 }))
                 .on_mouse_down(MouseButton::Left, move |_ev, _win, cx| {
                     let _ = weak_body.update(cx, |root, cx| {
+                        root.block_menu = None;
                         root.switch_to_chat(switch_id.clone(), cx);
                     });
                 }),
         )
         .children(composer)
         .children(split_menu.map(|dir| split_hover_menu(pane_id, dir, cx)))
+        .children(menu_open.then(|| {
+            block_menu_overlay(
+                pane_id,
+                false,
+                is_maximized,
+                show_close.then(|| BlockMenuClose::Chat(session_id.clone())),
+                cx,
+            )
+        }))
         .into_any_element()
 }
 
@@ -16369,6 +16537,8 @@ impl Render for Root {
                     .cloned()
             })
             .or_else(|| selected.clone());
+        let chat_active = self.focused_pane == Some(0);
+        let chat_menu_open = self.block_menu == Some(0);
         // 聊天 panel 自己的头（和 terminal / editor panel 一个样式）
         let chat_panel_head = {
             let title = selected
@@ -16383,9 +16553,24 @@ impl Render for Root {
                 .px(px(10.))
                 .h(px(24.))
                 .flex_shrink_0()
-                .bg(rgb(0x15181f))
+                .bg(if chat_active {
+                    rgb(0x1b2029)
+                } else {
+                    rgb(0x15181f)
+                })
                 .border_b_1()
-                .border_color(rgb(0x23272f))
+                .border_color(if chat_active {
+                    rgb(0x2f3846)
+                } else {
+                    rgb(0x23272f)
+                })
+                .child(
+                    div()
+                        .w(px(2.))
+                        .h(px(12.))
+                        .rounded(px(1.))
+                        .bg(if chat_active { rgb(0x00b8ff) } else { rgb(0x2a3038) }),
+                )
                 .child(
                     Icon::new(gpui_kit::assets::IconName::Bot)
                         .with_size(px(12.))
@@ -16396,7 +16581,11 @@ impl Render for Root {
                         .flex_shrink_1()
                         .min_w(px(0.))
                         .text_xs()
-                        .text_color(rgb(0xced3dd))
+                        .text_color(if chat_active {
+                            rgb(0xe2e7f0)
+                        } else {
+                            rgb(0x9ca3b0)
+                        })
                         .whitespace_nowrap()
                         .text_ellipsis()
                         .child(SharedString::from(title)),
@@ -16411,29 +16600,11 @@ impl Render for Root {
                         .text_ellipsis()
                         .child(SharedString::from(short_path(&space_cwd))),
                 )
-                .child(panel_split_buttons(0, cx))
-                .children(primary_session.as_ref().map(|session| {
-                    let sid = session.clone();
-                    div()
-                        .id("primary-chat-close")
-                        .w(px(18.))
-                        .h(px(18.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .text_xs()
-                        .text_color(rgb(0x707786))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(rgb(0x3a1f24)).text_color(rgb(0xff5663)))
-                        .child("×")
-                        .on_click(cx.listener(move |this, _ev, _win, cx| {
-                            this.close_chat_pane(0, &sid, cx);
-                        }))
-                }))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, ev: &MouseDownEvent, _win, cx| {
+                        this.focused_pane = Some(0);
+                        this.block_menu = None;
                         this.drag_leaf = Some((
                             0,
                             f32::from(ev.position.x),
@@ -16441,6 +16612,52 @@ impl Render for Root {
                         ));
                         cx.notify();
                     }),
+                )
+                // ⠿ 抓手：拖动换位，点击下拉菜单
+                .child(
+                    div()
+                        .id("primary-chat-grip")
+                        .w(px(22.))
+                        .h(px(18.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_sm()
+                        .text_color(if chat_menu_open {
+                            rgb(0xe2e7f0)
+                        } else {
+                            rgb(0x707786)
+                        })
+                        .bg(if chat_menu_open {
+                            rgba(0x283140ff)
+                        } else {
+                            rgba(0x00000000)
+                        })
+                        .hover(|style| style.bg(rgb(0x232a36)).text_color(rgb(0xe2e7f0)))
+                        .child("⠿")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, ev: &MouseDownEvent, _win, cx| {
+                                cx.stop_propagation();
+                                this.drag_leaf = Some((
+                                    0,
+                                    f32::from(ev.position.x),
+                                    f32::from(ev.position.y),
+                                ));
+                                cx.notify();
+                            }),
+                        )
+                        .on_click(cx.listener(|this, _ev, _win, cx| {
+                            this.focused_pane = Some(0);
+                            this.block_menu = if this.block_menu == Some(0) {
+                                None
+                            } else {
+                                Some(0)
+                            };
+                            cx.notify();
+                        })),
                 )
         };
 
@@ -16724,7 +16941,19 @@ impl Render for Root {
             .size_full()
             .min_h(px(0.))
             .min_w(px(0.))
-            .bg(rgb(0x101319))
+            .bg(if chat_active {
+                rgb(0x101319)
+            } else {
+                rgb(0x0d1015)
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _win, cx| {
+                    this.focused_pane = Some(0);
+                    this.block_menu = None;
+                    cx.notify();
+                }),
+            )
             .child(chat_panel_head)
             .child(goal_banner)
             .child(transcript)
@@ -16733,7 +16962,16 @@ impl Render for Root {
                 self.split_hover
                     .filter(|(leaf, _)| *leaf == 0)
                     .map(|(_, dir)| split_hover_menu(0, dir, cx)),
-            );
+            )
+            .children(chat_menu_open.then(|| {
+                block_menu_overlay(
+                    0,
+                    false,
+                    false,
+                    primary_session.clone().map(BlockMenuClose::Chat),
+                    cx,
+                )
+            }));
 
         let settings_modal = if self.show_settings {
             let editable = self
@@ -21337,6 +21575,8 @@ impl Render for Root {
                                 .into_any_element()
                         }),
                         self.split_hover.filter(|(leaf, _)| *leaf == 0).map(|(_, dir)| dir),
+                        self.focused_pane == Some(0),
+                        self.block_menu == Some(0),
                         cx,
                     ),
                 );
@@ -21469,6 +21709,8 @@ impl Render for Root {
                         block_stream,
                         pane_composer,
                         self.split_hover.filter(|(leaf, _)| *leaf == pane_id).map(|(_, dir)| dir),
+                        self.focused_pane == Some(pane_id),
+                        self.block_menu == Some(pane_id),
                         cx,
                     ),
                 );
@@ -21715,6 +21957,8 @@ impl Render for Root {
                     images,
                     term_find_info,
                     outline_items,
+                    self.focused_pane == Some(pane_id),
+                    self.block_menu == Some(pane_id),
                     cx,
                 ),
             );
