@@ -328,7 +328,11 @@ async fn main() -> Result<()> {
         match rpc.call(&endpoint, args).await {
             Ok(v) => {
                 let text = serde_json::to_string_pretty(&v)?;
-                println!("{}", text.chars().take(4000).collect::<String>());
+                let cap = std::env::var("DSH_SPIKE_RAW")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(200_000);
+                println!("{}", text.chars().take(cap).collect::<String>());
             }
             Err(e) => println!("ERR: {e}"),
         }

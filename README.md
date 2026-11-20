@@ -69,6 +69,7 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 | **workpace 状态**：`workspace/follow` baseline + `pinned`/`archived` 增量；置顶/归档跨重启 | ✅（baseline 实测：2 archived） |
 | **子代理**：⇄ 面板列出 `parentSessionId` 子会话，可打断（`subagents/interruptByParent`）、追问（`subagents/prompt`） | ✅（参数实测） |
 | **终端搜索/回滚**：Ctrl+F 搜 scrollback（Enter 下一个 / Shift+Enter 上一个 / k·n 计数），滚轮与 Shift+PageUp·Down 滚动视口 | ✅（单测：30 行回滚定位 + 视口滚动） |
+| **长会话分页**：follow snapshot 的 `hasMore` → 「load older messages」按 `session/page`（throughSeq/beforeSeq）补页 | ✅（分页参数实测：seq 0–24 按序返回） |
 
 **dsh 的单写者模型**（踩到的坑）：一个会话同时只能有一个写句柄。
 浏览器里开着这个会话时，GUI 发 `session/prompt` 会得到
@@ -182,7 +183,7 @@ strings ~/.local/bin/herdr-app  | grep gpui           # GPUI 自绘
 
 M0–M2 完成，M3 进行中（文件/编辑器、插件管理与市场、消息反馈、会话 fork/置顶/归档、
 slash 命令面板、附件上传、目标横幅、日程面板、workspace 状态流、子代理面板、终端
-搜索/回滚已接）。剩余：长会话分页、终端粘贴图片。
+搜索/回滚、长会话分页已接）。剩余：终端粘贴图片。
 
 ### 插件页与 tab 菜单
 

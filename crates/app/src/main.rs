@@ -3044,6 +3044,13 @@ struct Root {
     _subagent_sub: Subscription,
     /// 终端回滚搜索（Ctrl+F 打开）
     term_find: Option<TermFind>,
+    /// 长会话分页（session/page）：follow snapshot 的 cursor / 是否还有更早 / 已显示的最旧 seq
+    history_cursor: Option<u64>,
+    history_oldest: Option<u64>,
+    history_has_more: bool,
+    history_loading: bool,
+    /// 正在把一页旧记录插到转写开头（push_block 用）
+    prepend_at: Option<usize>,
 }
 
 async fn serve_control(
@@ -4108,6 +4115,11 @@ impl Root {
             subagent_input,
             subagent_clear: false,
             term_find: None,
+            history_cursor: None,
+            history_oldest: None,
+            history_has_more: false,
+            history_loading: false,
+            prepend_at: None,
             _subagent_sub: subagent_sub,
             plugin_spec_input,
             inspect_pending: None,
@@ -4882,6 +4894,41 @@ impl Root {
                         "goals/mutate" => {
                             self.reload_goal();
                         }
+                        "session/page" => {
+                            self.history_loading = false;
+                            let mut records = value
+                                .get("records")
+                                .and_then(|v| v.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            records.sort_by_key(|record| {
+                                record
+                                    .pointer("/event/seq")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0)
+                            });
+                            let count = records.len();
+                            if count > 0 {
+                                self.prepend_at = Some(0);
+                                for record in &records {
+                                    self.handle_event(record);
+                                }
+                                self.prepend_at = None;
+                                // 这页现在是最旧的内容
+                                self.history_oldest = records
+                                    .first()
+                                    .and_then(|record| {
+                                        record.pointer("/event/seq").and_then(|v| v.as_u64())
+                                    })
+                                    .or(self.history_oldest);
+                                // 可见窗口同步扩大，别让补的那页藏在 reveal 外
+                                self.reveal_limit = self.reveal_limit.saturating_add(count);
+                            }
+                            self.history_has_more = value
+                                .get("hasMore")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                        }
                         "schedule/catalog" => {
                             self.schedule_doc = value;
                         }
@@ -5022,6 +5069,10 @@ impl Root {
                         }
                         if tag.starts_with("schedule/") || tag.starts_with("goals/") {
                             self.error = Some(format!("{endpoint}: {}", err.chars().take(160).collect::<String>()));
+                        }
+                        if tag == "session/page" {
+                            self.history_loading = false;
+                            self.history_has_more = false;
                         }
                         if tag == "session/search" {
                             self.search_error = Some(if err.contains("search is disabled") {
@@ -7457,6 +7508,34 @@ impl Root {
             find.index = index;
             find.total = total;
         }
+        cx.notify();
+    }
+
+    /// 往前翻一页旧消息（session/page）。
+    fn load_older_messages(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.selected.clone() else {
+            return;
+        };
+        let (Some(cursor), Some(before)) = (self.history_cursor, self.history_oldest) else {
+            self.history_has_more = false;
+            return;
+        };
+        if self.history_loading {
+            return;
+        }
+        self.history_loading = true;
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "session/page".to_string(),
+            endpoint: "session/page".to_string(),
+            args: json!({
+                "request": {
+                    "address": { "kind": "session", "sessionId": session_id },
+                    "throughSeq": cursor,
+                    "beforeSeq": before,
+                    "maxMessages": 60,
+                }
+            }),
+        });
         cx.notify();
     }
 
@@ -9962,8 +10041,8 @@ impl Root {
     }
 
     fn push_block(&mut self, block: TranscriptBlock) {
-        // 自己刚发的消息引出的完整回复：逐字打出来（dsh 不一定推 text-delta）
-        if self.awaiting_reply {
+        // 补旧页时不要触发"逐字打出"那条路径
+        if self.prepend_at.is_none() && self.awaiting_reply {
             if let TranscriptBlock::Assistant { uid, text, .. } = &block {
                 let total = text.chars().count();
                 if total > 0 {
@@ -9977,10 +10056,15 @@ impl Root {
                 }
             }
         }
-        self.items.push(block);
-        if self.items.len() > 800 {
-            let drop = self.items.len() - 800;
-            self.items.drain(0..drop);
+        if let Some(at) = self.prepend_at {
+            self.items.insert(at.min(self.items.len()), block);
+            self.prepend_at = Some(at + 1);
+        } else {
+            self.items.push(block);
+            if self.items.len() > 800 {
+                let drop = self.items.len() - 800;
+                self.items.drain(0..drop);
+            }
         }
     }
 
@@ -10079,6 +10163,18 @@ impl Root {
         if let Some(records) = frame.get("records").and_then(|v| v.as_array()) {
             for record in records {
                 self.handle_event(record);
+            }
+            // session/follow 的 opening snapshot：记录分页要用的 cursor / hasMore / 最旧 seq
+            if frame.get("type").and_then(|v| v.as_str()) == Some("snapshot") {
+                self.history_cursor = frame.get("cursor").and_then(|v| v.as_u64());
+                self.history_has_more = frame
+                    .get("hasMore")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                self.history_oldest = records
+                    .iter()
+                    .filter_map(|record| record.pointer("/event/seq").and_then(|v| v.as_u64()))
+                    .min();
             }
             return;
         }
@@ -14933,6 +15029,37 @@ impl Render for Root {
             .max_w(px(CONTENT_MAX_W))
             .mx_auto()
             .gap(px(12.))
+            .children(if self.history_has_more {
+                Some(
+                    div()
+                        .id("load-older")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(6.))
+                        .mx_auto()
+                        .px(px(14.))
+                        .py(px(5.))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(rgb(0x2c3340))
+                        .text_xs()
+                        .text_color(rgb(0x9ca3b0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0x1b1e26)))
+                        .child(if self.history_loading {
+                            "loading…"
+                        } else {
+                            "load older messages"
+                        })
+                        .on_click(cx.listener(|this, _ev, _win, cx| {
+                            this.load_older_messages(cx);
+                        })),
+                )
+            } else {
+                None
+            })
             .children(
                 blocks
                     .into_iter()
