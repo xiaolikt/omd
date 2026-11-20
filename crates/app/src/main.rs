@@ -3051,6 +3051,10 @@ struct Root {
     history_loading: bool,
     /// 正在把一页旧记录插到转写开头（push_block 用）
     prepend_at: Option<usize>,
+    /// 当前会话的权限预设（permission/preset 事件回填；None = 未知）
+    permission_preset: Option<String>,
+    /// 权限预设菜单（点状态 pill 弹出）
+    permission_menu: Option<Point<Pixels>>,
 }
 
 async fn serve_control(
@@ -4120,6 +4124,8 @@ impl Root {
             history_has_more: false,
             history_loading: false,
             prepend_at: None,
+            permission_preset: None,
+            permission_menu: None,
             _subagent_sub: subagent_sub,
             plugin_spec_input,
             inspect_pending: None,
@@ -5067,7 +5073,7 @@ impl Root {
                             self.market_loading = false;
                             self.market_error = Some(err.chars().take(160).collect::<String>());
                         }
-                        if tag.starts_with("schedule/") || tag.starts_with("goals/") {
+                        if tag.starts_with("schedule/") || tag.starts_with("goals/") || tag == "permission/set" || tag == "commands/execute" {
                             self.error = Some(format!("{endpoint}: {}", err.chars().take(160).collect::<String>()));
                         }
                         if tag == "session/page" {
@@ -7511,8 +7517,26 @@ impl Root {
         cx.notify();
     }
 
-    /// 终端粘贴（Ctrl+Shift+V）：剪贴板里有图就贴图（kitty 协议，本地显示），
-    /// 有文本就按 bracketed 模式编码后写 PTY。返回是否处理了。
+    /// 终端粘贴（Ctrl+Shift+V）：剪贴板里有图就贴图（kitty 协议，本地显示），    /// 有文本就按 bracketed 模式编码后写 PTY。返回是否处理了。
+    /// 切换当前会话的权限预设（走 /permission 命令，事件回填 pill）。
+    fn set_permission_preset(&mut self, preset: &str) {
+        let Some(agent_id) = self.selected.clone() else {
+            return;
+        };
+        if is_file_panel(&agent_id) || self.term_tabs.contains(&agent_id) {
+            return;
+        }
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "permission/set".to_string(),
+            endpoint: "commands/execute".to_string(),
+            args: json!({
+                "agentId": agent_id,
+                "line": format!("/permission {preset}"),
+                "submittedAttachments": [],
+            }),
+        });
+    }
+
     fn term_paste(&mut self, pane_id: u64, cx: &mut Context<Self>) -> bool {
         let Some(item) = cx.read_from_clipboard() else {
             return false;
@@ -10181,6 +10205,16 @@ impl Root {
         }
         if kind == Some("schedule/changed") && self.show_schedules {
             self.reload_schedules();
+        }
+        // 权限预设：permission/preset 事件（baseline 里也有一条）
+        if kind == Some("permission/preset") {
+            if let Some(preset) = frame
+                .pointer("/event/data/preset")
+                .or_else(|| frame.pointer("/data/preset"))
+                .and_then(|v| v.as_str())
+            {
+                self.permission_preset = Some(preset.to_string());
+            }
         }
         if let Some(config) = frame.pointer("/data/header/config") {
             if let Some(provider) = config.get("provider").and_then(|v| v.as_str()) {
@@ -15066,6 +15100,47 @@ impl Render for Root {
                             }),
                     ),
                 )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x8a7a55))
+                        .child("引擎按单次审批裁决；要减少审批，切换权限预设 →"),
+                )
+                .child(
+                    div().flex().flex_row().gap(px(8.)).children(
+                        [
+                            ("always: read-only", "read-only"),
+                            ("always: workspace-write", "workspace-write"),
+                            ("always: danger-full-access", "danger-full-access"),
+                        ]
+                        .into_iter()
+                        .map(|(label, preset)| {
+                            let preset = preset.to_string();
+                            let id_preset = event_id.clone();
+                            div()
+                                .id(SharedString::from(format!("approval-preset-{preset}")))
+                                .px(px(8.))
+                                .py(px(3.))
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(rgb(0x513f1e))
+                                .text_xs()
+                                .text_color(rgb(0xc9a15a))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(0x2a2216)))
+                                .child(label)
+                                .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                    // 先放行当前这一次，再切预设（之后同类操作不再问）
+                                    let _ = this.cmds.send_blocking(Cmd::Decide {
+                                        event_id: id_preset.clone(),
+                                        allow: true,
+                                    });
+                                    this.set_permission_preset(&preset);
+                                    cx.notify();
+                                }))
+                        }),
+                    ),
+                )
         });
 
         let question_card = self
@@ -15461,6 +15536,50 @@ impl Render for Root {
                                                     .child(SharedString::from(path_label)),
                                             ),
                                     )
+                                    .child(if self.term_tabs.contains(
+                                        self.selected.as_deref().unwrap_or(""),
+                                    ) || self.selected.as_deref().is_some_and(is_file_panel) {
+                                        // 终端/文件面板没有权限预设
+                                        div().into_any_element()
+                                    } else {
+                                        let preset = self
+                                            .permission_preset
+                                            .clone()
+                                            .unwrap_or_else(|| "…".to_string());
+                                        div()
+                                            .id("permission-pill")
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(4.))
+                                            .px(px(8.))
+                                            .py(px(4.))
+                                            .rounded_full()
+                                            .bg(rgb(0x20232b))
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgb(0x23272f)))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(0xc9a15a))
+                                                    .child("🛡"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(0x9ca3b0))
+                                                    .child(SharedString::from(preset)),
+                                            )
+                                            .on_click(cx.listener(|this, ev: &ClickEvent, _win, cx| {
+                                                let position = match ev {
+                                                    ClickEvent::Mouse(mouse) => mouse.up.position,
+                                                    _ => Point { x: px(200.), y: px(200.) },
+                                                };
+                                                this.permission_menu = Some(position);
+                                                cx.notify();
+                                            }))
+                                            .into_any_element()
+                                    })
                                     .children(if git_text.is_empty() {
                                         None
                                     } else {
@@ -20913,6 +21032,105 @@ impl Render for Root {
             build_layout(&layout, &mut leaf_elements, cx)
         };
 
+        // 权限预设菜单（composer 的 🛡 pill）
+        let permission_menu_overlay = self.permission_menu.map(|pos| {
+            let current = self.permission_preset.clone().unwrap_or_default();
+            let presets = [
+                ("read-only", "read-only", "no writes, no commands"),
+                ("workspace-write", "workspace-write", "write inside the workspace"),
+                ("danger-full-access", "danger-full-access", "no sandbox, rare approvals"),
+            ];
+            let menu = div()
+                .absolute()
+                .left(pos.x)
+                .top(pos.y)
+                .w(px(300.))
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .p(px(4.))
+                .rounded(px(8.))
+                .bg(rgb(0x1b1e26))
+                .border_1()
+                .border_color(rgb(0x2c3340))
+                .shadow_lg()
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
+                    cx.stop_propagation();
+                })
+                .child(
+                    div()
+                        .px(px(10.))
+                        .py(px(6.))
+                        .text_xs()
+                        .text_color(rgb(0x51637e))
+                        .child("permission preset (sandbox + approval policy)"),
+                );
+            let menu = presets.into_iter().fold(menu, |menu, (value, label, sub)| {
+                let active = current == value;
+                menu.child(
+                    div()
+                        .id(SharedString::from(format!("preset-{value}")))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        .px(px(10.))
+                        .py(px(6.))
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0x20232b)))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(if active {
+                                    rgb(0x00b4ff)
+                                } else {
+                                    rgb(0xe8ecf4)
+                                })
+                                .child(if active { "●" } else { "○" }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(if active {
+                                            rgb(0x00b4ff)
+                                        } else {
+                                            rgb(0xe8ecf4)
+                                        })
+                                        .child(SharedString::from(label)),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x6b7386))
+                                        .child(SharedString::from(sub)),
+                                ),
+                        )
+                        .on_click({
+                            let value = value.to_string();
+                            cx.listener(move |this, _ev, _win, cx| {
+                                this.permission_menu = None;
+                                this.set_permission_preset(&value);
+                                cx.notify();
+                            })
+                        }),
+                )
+            });
+            div()
+                .absolute()
+                .inset_0()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _win, cx| {
+                    this.permission_menu = None;
+                    cx.notify();
+                }))
+                .child(menu)
+        });
+
         // tab 右键菜单：改名 / Fork / 置顶 / 归档
         let tab_menu_overlay = self.tab_menu.clone().map(|(tab_id, pos)| {
             let session_id = self
@@ -22844,6 +23062,9 @@ impl Render for Root {
             }))
             .children(tab_menu_overlay.map(|overlay| {
                 gpui_kit::deferred(overlay).with_priority(70).into_any_element()
+            }))
+            .children(permission_menu_overlay.map(|overlay| {
+                gpui_kit::deferred(overlay).with_priority(71).into_any_element()
             }));
         let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
         if render_no <= 8 || render_ms >= 8.0 {

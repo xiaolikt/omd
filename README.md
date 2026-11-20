@@ -71,6 +71,7 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 | **终端搜索/回滚**：Ctrl+F 搜 scrollback（Enter 下一个 / Shift+Enter 上一个 / k·n 计数），滚轮与 Shift+PageUp·Down 滚动视口 | ✅（单测：30 行回滚定位 + 视口滚动） |
 | **长会话分页**：follow snapshot 的 `hasMore` → 「load older messages」按 `session/page`（throughSeq/beforeSeq）补页 | ✅（分页参数实测：seq 0–24 按序返回） |
 | **终端粘贴**：Ctrl+Shift+V——剪贴板有图走 kitty 图形协议本地显示（不进 PTY），文本按 bracketed paste 编码（`ghostty_paste_encode`） | ✅（单测：分块传输 + 200~ 包裹） |
+| **权限预设**：composer 的 🛡 pill 显示/切换 read-only·workspace-write·danger-full-access（`/permission` 命令）；审批卡提供「always: <preset>」一键放行+切换 | ✅（`permission/preset`+`sandbox/mode` 事件实测） |
 
 **dsh 的单写者模型**（踩到的坑）：一个会话同时只能有一个写句柄。
 浏览器里开着这个会话时，GUI 发 `session/prompt` 会得到
