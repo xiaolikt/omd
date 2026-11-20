@@ -128,6 +128,10 @@ CEF_PATH="$PWD/vendor/cef" cargo build --release -p omd
 OMD_BROWSER=1 LD_LIBRARY_PATH="$PWD/vendor/libghostty-vt/lib" ./target/release/omd
 ```
 
+release 冒烟（2026-11-20）：无浏览器路径首帧 8.2ms、engine ready 无 panic；
+`OMD_BROWSER=1` 下 CEF init ok、浏览器 pane 创建成功（浏览器块的鼠标监听已移到
+paint 阶段注册，debug/release 均不再触发 paint-only 断言）。
+
 - GPUI 与 CEF 在初始化前选择会话；有 `WAYLAND_DISPLAY` 时使用原生 Wayland，不需要 `DISPLAY`。
 - Wayland 使用 CEF OSR 的 BGRA 像素回读，再上传到复用的 GPUI 纹理；这不是零拷贝。
   当前 CEF 156 在 Wayland 下共享纹理捕获分配失败，因此不启用 DMA-BUF 导出，也不关闭 Chromium GPU 渲染。
