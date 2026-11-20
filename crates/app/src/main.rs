@@ -2928,7 +2928,12 @@ struct Root {
     goal_doc: Value,
     /// goal 目标编辑框 + 是否在编辑
     goal_input: Entity<InputState>,
-    goal_editing: bool,    /// 附件 id 计数器
+    goal_editing: bool,
+    /// 日程（schedule/*）面板
+    show_schedules: bool,
+    schedule_doc: Value,
+    schedule_history: std::collections::HashMap<String, Value>,
+    schedule_expanded: Option<String>,    /// 附件 id 计数器
     attach_seq: u64,
     /// 消息反馈的本地状态：messageId → 反馈项
     feedback: std::collections::HashMap<String, FeedbackState>,
@@ -4030,6 +4035,10 @@ impl Root {
             goal_doc: Value::Null,
             goal_input,
             goal_editing: false,
+            show_schedules: false,
+            schedule_doc: Value::Null,
+            schedule_history: std::collections::HashMap::new(),
+            schedule_expanded: None,
             plugin_spec_input,
             inspect_pending: None,
         };
@@ -4803,6 +4812,19 @@ impl Root {
                         "goals/mutate" => {
                             self.reload_goal();
                         }
+                        "schedule/catalog" => {
+                            self.schedule_doc = value;
+                        }
+                        "schedule/delete" => {
+                            self.schedule_expanded = None;
+                            self.reload_schedules();
+                        }
+                        tag if tag.starts_with("schedule/history:") => {
+                            let task_id = tag
+                                .trim_start_matches("schedule/history:")
+                                .to_string();
+                            self.schedule_history.insert(task_id, value);
+                        }
                         "session/search" => {
                             self.search_error = None;
                             self.search_hits = value
@@ -4927,6 +4949,9 @@ impl Root {
                         if tag == "plugins/market" {
                             self.market_loading = false;
                             self.market_error = Some(err.chars().take(160).collect::<String>());
+                        }
+                        if tag.starts_with("schedule/") || tag.starts_with("goals/") {
+                            self.error = Some(format!("{endpoint}: {}", err.chars().take(160).collect::<String>()));
                         }
                         if tag == "session/search" {
                             self.search_error = Some(if err.contains("search is disabled") {
@@ -7187,6 +7212,41 @@ impl Root {
             tag: "goals/get".to_string(),
             endpoint: "goals/get".to_string(),
             args: json!({ "agentId": agent_id }),
+        });
+    }
+
+    /// 拉 Host 上全部日程（catalog 是全量的，按会话过滤）。
+    fn reload_schedules(&mut self) {
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "schedule/catalog".to_string(),
+            endpoint: "schedule/catalog".to_string(),
+            args: json!({}),
+        });
+    }
+
+    /// 展开某个任务的投递历史。
+    fn load_schedule_history(&mut self, task_id: &str) {
+        let Some(session_id) = self.selected.clone() else {
+            return;
+        };
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: format!("schedule/history:{task_id}"),
+            endpoint: "schedule/history".to_string(),
+            args: json!({
+                "request": { "sessionId": session_id, "id": task_id, "limit": 8 }
+            }),
+        });
+    }
+
+    /// 删除一个日程。
+    fn delete_schedule(&mut self, task_id: &str) {
+        let Some(session_id) = self.selected.clone() else {
+            return;
+        };
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "schedule/delete".to_string(),
+            endpoint: "schedule/delete".to_string(),
+            args: json!({ "request": { "sessionId": session_id, "id": task_id } }),
         });
     }
 
@@ -9707,6 +9767,9 @@ impl Root {
             .and_then(|v| v.as_str());
         if kind == Some("goal/change") {
             self.reload_goal();
+        }
+        if kind == Some("schedule/changed") && self.show_schedules {
+            self.reload_schedules();
         }
         if let Some(config) = frame.pointer("/data/header/config") {
             if let Some(provider) = config.get("provider").and_then(|v| v.as_str()) {
@@ -20802,6 +20865,331 @@ impl Render for Root {
             None
         };
 
+        // 日程面板：列当前会话的 reminder（catalog 全量，按 sessionId 过滤）
+        let schedules_modal = if self.show_schedules {
+            let session_id = self.selected.clone().unwrap_or_default();
+            let tasks: Vec<Value> = self
+                .schedule_doc
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|task| {
+                    task.get("sessionId").and_then(|v| v.as_str()) == Some(session_id.as_str())
+                })
+                .collect();
+            let mut rows: Vec<AnyElement> = Vec::new();
+            if tasks.is_empty() {
+                rows.push(
+                    div()
+                        .px(px(4.))
+                        .py(px(12.))
+                        .text_xs()
+                        .text_color(rgb(0x707786))
+                        .child("No scheduled reminders for this session")
+                        .into_any_element(),
+                );
+                rows.push(
+                    div()
+                        .px(px(4.))
+                        .pb(px(10.))
+                        .text_xs()
+                        .text_color(rgb(0x51637e))
+                        .child("Ask the agent to schedule one, e.g. “remind me every day at 9:00”.")
+                        .into_any_element(),
+                );
+            }
+            for task in tasks {
+                let id = task
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let title = task
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let prompt = task
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let kind = task
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("task")
+                    .to_string();
+                let status = task
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let scheduled = task
+                    .get("scheduledAt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // RFC3339 → "MM-DD HH:MM"（UTC；不做时区换算）
+                let when = if scheduled.len() >= 16 {
+                    format!("{} {}", &scheduled[5..10], &scheduled[11..16])
+                } else {
+                    scheduled.clone()
+                };
+                let active = status == "active";
+                let color = if active { 0x00d98a } else { 0x707786 };
+                let expanded = self.schedule_expanded.as_deref() == Some(id.as_str());
+                let history = self.schedule_history.get(&id).cloned();
+                let delete_id = id.clone();
+                let history_id = id.clone();
+                rows.push(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        .px(px(4.))
+                        .py(px(6.))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family("monospace")
+                                .text_color(rgb(0x5a6070))
+                                .w(px(74.))
+                                .child(SharedString::from(kind)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(0xe8ecf4))
+                                        .child(SharedString::from(title)),
+                                )
+                                .children(if prompt.is_empty() {
+                                    None
+                                } else {
+                                    Some(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x707786))
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .child(SharedString::from(prompt)),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x9ca3b0))
+                                .child(SharedString::from(format!("{when} UTC"))),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(color))
+                                .child(SharedString::from(status)),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("schedule-history-{id}")))
+                                .px(px(6.))
+                                .py(px(2.))
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(rgb(0x9ca3b0))
+                                .hover(|style| style.bg(rgb(0x20232b)))
+                                .child("history")
+                                .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                    if this.schedule_expanded.as_deref()
+                                        == Some(history_id.as_str())
+                                    {
+                                        this.schedule_expanded = None;
+                                    } else {
+                                        this.schedule_expanded = Some(history_id.clone());
+                                        this.load_schedule_history(&history_id);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("schedule-delete-{id}")))
+                                .px(px(6.))
+                                .py(px(2.))
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(rgb(0xff5663))
+                                .hover(|style| style.bg(rgb(0x3a1f24)))
+                                .child("delete")
+                                .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                    this.delete_schedule(&delete_id);
+                                    cx.notify();
+                                })),
+                        )
+                        .into_any_element(),
+                );
+                if expanded {
+                    let entries = history
+                        .as_ref()
+                        .and_then(|value| {
+                            value
+                                .get("entries")
+                                .and_then(|v| v.as_array())
+                                .or_else(|| value.as_array())
+                        })
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut lines: Vec<AnyElement> = Vec::new();
+                    if entries.is_empty() {
+                        lines.push(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x51637e))
+                                .child("No deliveries yet")
+                                .into_any_element(),
+                        );
+                    }
+                    for entry in entries {
+                        let at = entry
+                            .get("deliveredAt")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let at = if at.len() >= 16 {
+                            format!("{} {}", &at[5..10], &at[11..16])
+                        } else {
+                            at.to_string()
+                        };
+                        let summary = entry
+                            .get("messageId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        lines.push(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap(px(8.))
+                                .text_xs()
+                                .text_color(rgb(0x6b7386))
+                                .child(SharedString::from(at))
+                                .child(SharedString::from(summary))
+                                .into_any_element(),
+                        );
+                    }
+                    rows.push(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .pl(px(82.))
+                            .pb(px(6.))
+                            .children(lines)
+                            .into_any_element(),
+                    );
+                }
+            }
+            Some(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .occlude()
+                    .bg(rgba(0x000000cc))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, _win, cx| {
+                            this.show_schedules = false;
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id("schedules-card")
+                            .w(px(680.))
+                            .max_h(px(460.))
+                            .flex()
+                            .flex_col()
+                            .rounded_lg()
+                            .bg(rgb(0x1b1e26))
+                            .border_1()
+                            .border_color(rgb(0x23272f))
+                            .overflow_hidden()
+                            .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .px(px(14.))
+                                    .py(px(10.))
+                                    .child(div().text_sm().child("Scheduled reminders"))
+                                    .child(div().flex_1())
+                                    .child(
+                                        div()
+                                            .id("schedules-refresh")
+                                            .px(px(8.))
+                                            .py(px(2.))
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .text_color(rgb(0x9ca3b0))
+                                            .hover(|style| style.bg(rgb(0x20232b)))
+                                            .child("↻")
+                                            .on_click(cx.listener(|this, _ev, _win, cx| {
+                                                this.reload_schedules();
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("schedules-close")
+                                            .px(px(8.))
+                                            .py(px(2.))
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .text_color(rgb(0x9ca3b0))
+                                            .hover(|style| style.bg(rgb(0x20232b)))
+                                            .child("close")
+                                            .on_click(cx.listener(|this, _ev, _win, cx| {
+                                                this.show_schedules = false;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(div().h(px(1.)).w_full().bg(rgb(0x23272f)))
+                            .child(
+                                div()
+                                    .id("schedules-body")
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_h(px(0.))
+                                    .overflow_y_scroll()
+                                    .px(px(10.))
+                                    .py(px(4.))
+                                    .children(rows),
+                            ),
+                    ),
+            )
+        } else {
+            None
+        };
+
         // tab 条溢出状态：决定左右箭头是否显示 / 是否还能滚
         let tab_overflow = tab_strip_viewport > 0. && tab_content_w > tab_strip_viewport + 4.;
         let tab_offset_x = -f32::from(self.tab_scroll.offset().x);
@@ -21515,6 +21903,24 @@ impl Render for Root {
                             })
                             .child(
                                 div()
+                                    .id("schedules")
+                                    .w(px(HEAD_BTN)).h(px(HEAD_BTN))
+                                    .flex().items_center().justify_center()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_size(px(HEAD_GLYPH))
+                                    .text_color(rgb(0xd0d4dc))
+                                    .hover(|style| style.bg(rgb(0x23272f)))
+                                    .child("⏱")
+                                    .on_click(cx.listener(|this, _ev, _win, cx| {
+                                        this.show_schedules = true;
+                                        this.schedule_expanded = None;
+                                        this.reload_schedules();
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
                                     .id("settings")
                                     .w(px(HEAD_BTN)).h(px(HEAD_BTN))
                                     .flex().items_center().justify_center()
@@ -21568,6 +21974,9 @@ impl Render for Root {
             }))
             .children(jobs_modal.map(|modal| {
                 gpui_kit::deferred(modal).with_priority(40).into_any_element()
+            }))
+            .children(schedules_modal.map(|modal| {
+                gpui_kit::deferred(modal).with_priority(45).into_any_element()
             }))
             .children(palette.map(|modal| {
                 gpui_kit::deferred(modal).with_priority(60).into_any_element()
