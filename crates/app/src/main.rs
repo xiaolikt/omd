@@ -954,7 +954,14 @@ enum Cmd {
         session_id: String,
         term_id: String,
     },
-    Prompt { session_id: String, text: String, request_id: String },
+    Prompt { session_id: String, text: String, request_id: String, extra: Vec<Value> },
+    /// 附件 staging：把字节交给 fileUploads/upload 换 receipt
+    UploadFile {
+        attach_id: u64,
+        agent_id: String,
+        name: String,
+        data: Arc<Vec<u8>>,
+    },
     TerminalInput { term_id: String, data: String },
     /// 订阅某个 session 的后台任务清单（job/list 是流）
     JobsWatch { session_id: Option<String> },
@@ -979,6 +986,8 @@ enum Cmd {
     },
     /// 取消一个进行中的安装
     CancelInstall { request_id: String },
+    /// 打开系统文件选择框（zenity/kdialog），结果走 Ev::FilesPicked
+    PickFiles,
     Cancel,
     Decide { event_id: String, allow: bool },
     AnswerQuestion { event_id: String, answer: Value },
@@ -1073,6 +1082,13 @@ enum Ev {
         name: String,
         result: std::result::Result<Value, String>,
     },
+    /// 附件 staging 结束
+    FileStaged {
+        attach_id: u64,
+        result: std::result::Result<Value, String>,
+    },
+    /// 文件选择框返回的路径
+    FilesPicked(Vec<String>),
     DshInfo { version: String, bundled: bool },
     DshUpdate { done: bool, message: String },
     Error(String),
@@ -1111,6 +1127,8 @@ fn ev_name(ev: &Ev) -> &'static str {
         Ev::Question { .. } => "Question",
         Ev::QuestionGone => "QuestionGone",
         Ev::InstallSettled { .. } => "InstallSettled",
+        Ev::FileStaged { .. } => "FileStaged",
+        Ev::FilesPicked(_) => "FilesPicked",
         Ev::DshInfo { .. } => "DshInfo",
         Ev::DshUpdate { .. } => "DshUpdate",
         Ev::Error(_) => "Error",
@@ -2042,6 +2060,49 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             }
                         }
                     }
+                    Cmd::PickFiles => {
+                        let evs = evs.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let mut picked: Vec<String> = Vec::new();
+                            let zenity = std::process::Command::new("zenity")
+                                .args([
+                                    "--file-selection",
+                                    "--multiple",
+                                    "--separator=|",
+                                    "--title=Attach files",
+                                ])
+                                .output();
+                            match zenity {
+                                Ok(output) if output.status.success() => {
+                                    let text = String::from_utf8_lossy(&output.stdout);
+                                    picked.extend(
+                                        text.split('|')
+                                            .map(str::trim)
+                                            .filter(|p| !p.is_empty())
+                                            .map(str::to_string),
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(_) => {
+                                    // 没有 zenity 就试 kdialog（只支持单文件）
+                                    if let Ok(output) = std::process::Command::new("kdialog")
+                                        .args(["--getopenfilename", ".", "*"])
+                                        .output()
+                                    {
+                                        if output.status.success() {
+                                            let text = String::from_utf8_lossy(&output.stdout)
+                                                .trim()
+                                                .to_string();
+                                            if !text.is_empty() {
+                                                picked.push(text);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = evs.send_blocking(Ev::FilesPicked(picked));
+                        });
+                    }
                     Cmd::TerminalInput { term_id, data } => {
                         let found = terminal_up.lock().await.get(&term_id).is_some();
                         eprintln!("[worker] TerminalInput term={term_id} found={found} bytes={}", data.len());
@@ -2147,7 +2208,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             }
                         }
                     }
-                    Cmd::Prompt { session_id, text, request_id } => {
+                    Cmd::Prompt { session_id, text, request_id, extra } => {
                         eprintln!("[worker] Prompt cmd, session={session_id}");
                         // follow 回放这条消息时带同一个 source.rpcId，用它压掉本地回显。
                         pending_echoes.push_back(request_id.clone());
@@ -2155,13 +2216,18 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             pending_echoes.pop_front();
                         }
                         prompt_started = Some(std::time::Instant::now());
+                        let mut content: Vec<Value> = Vec::new();
+                        if !text.trim().is_empty() {
+                            content.push(json!({ "type": "text", "text": text }));
+                        }
+                        content.extend(extra);
                         let result = rpc
                             .call("session/prompt", json!({
                                 "request": {
                                     "requestId": request_id,
                                     "sessionId": session_id,
                                     "mode": "queue",
-                                    "content": [ { "type": "text", "text": text } ],
+                                    "content": content,
                                 }
                             }))
                             .await;
@@ -2174,6 +2240,26 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                                 let _ = evs.send(Ev::Error(format!("prompt failed: {err}"))).await;
                             }
                         }
+                    }
+                    Cmd::UploadFile {
+                        attach_id,
+                        agent_id,
+                        name,
+                        data,
+                    } => {
+                        use base64::Engine as _;
+                        let encoded =
+                            base64::engine::general_purpose::STANDARD.encode(data.as_slice());
+                        let result = rpc
+                            .call("fileUploads/upload", json!({
+                                "agentId": agent_id,
+                                "request": { "data": encoded, "name": name },
+                            }))
+                            .await
+                            .map_err(|e| e.to_string());
+                        let _ = evs
+                            .send(Ev::FileStaged { attach_id, result })
+                            .await;
                     }
                 }
             }
@@ -2567,6 +2653,27 @@ struct FeedbackState {
     version: String,
 }
 
+/// 待发送的附件（图片内联、其他文件先 staging 成 receipt）。
+#[derive(Clone, Debug)]
+struct PendingAttachment {
+    id: u64,
+    name: String,
+    /// 原始字节（图片直接 base64 进 prompt）
+    data: Arc<Vec<u8>>,
+    /// Some = 内联图片（media type）
+    media_type: Option<String>,
+    /// 上传完成后拿到的 staging receipt
+    receipt_id: Option<String>,
+    state: AttachmentState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum AttachmentState {
+    Uploading,
+    Ready,
+    Failed(String),
+}
+
 struct Root {
     cmds: Sender<Cmd>,
     evs: Receiver<Ev>,
@@ -2815,6 +2922,10 @@ struct Root {
     slash_commands: Vec<Value>,
     /// 发起了归档的 panel：归档成功后关掉它
     archive_pending: Option<String>,
+    /// 待发送的附件（输入框上方 chips）
+    attachments: Vec<PendingAttachment>,
+    /// 附件 id 计数器
+    attach_seq: u64,
     /// 消息反馈的本地状态：messageId → 反馈项
     feedback: std::collections::HashMap<String, FeedbackState>,
     /// tab 右键菜单：panel id + 菜单弹出的位置
@@ -3859,6 +3970,8 @@ impl Root {
             slash_commands: Vec::new(),
             feedback: std::collections::HashMap::new(),
             archive_pending: None,
+            attachments: Vec::new(),
+            attach_seq: 1,
             tab_menu: None,
             browser_home_input,
             browser_port_input,
@@ -4961,8 +5074,7 @@ impl Root {
             Ev::QuestionGone => {
                 self.question = None;
             }
-            Ev::InstallSettled { name, result } => {
-                let summary = match &result {
+            Ev::InstallSettled { name, result } => {                let summary = match &result {
                     Ok(value) => {
                         let application = value
                             .get("application")
@@ -5030,6 +5142,40 @@ impl Root {
                     self.market_search(None, false);
                 }
                 cx.notify();
+            }
+            Ev::FileStaged { attach_id, result } => {
+                if let Some(attachment) = self
+                    .attachments
+                    .iter_mut()
+                    .find(|attachment| attachment.id == attach_id)
+                {
+                    match result {
+                        Ok(value) => {
+                            match value.get("receiptId").and_then(|v| v.as_str()) {
+                                Some(receipt) if !receipt.is_empty() => {
+                                    attachment.receipt_id = Some(receipt.to_string());
+                                    attachment.state = AttachmentState::Ready;
+                                }
+                                _ => {
+                                    attachment.state = AttachmentState::Failed(
+                                        "upload returned no receipt".to_string(),
+                                    );
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            attachment.state =
+                                AttachmentState::Failed(err.chars().take(120).collect());
+                        }
+                    }
+                }
+                cx.notify();
+            }
+            Ev::FilesPicked(paths) => {
+                if !paths.is_empty() {
+                    self.attach_paths(paths);
+                    cx.notify();
+                }
             }
             Ev::DshInfo { version, bundled } => {
                 self.dsh_version = Some(version);
@@ -6992,6 +7138,106 @@ impl Root {
             endpoint: "workspace/archiveSession".to_string(),
             args: json!({ "request": { "sessionId": session_id, "stopActivity": true } }),
         });
+    }
+
+    /// 打开系统文件选择框（结果异步回到 Ev::FilesPicked）。
+    fn pick_attachments(&mut self) {
+        let _ = self.cmds.send_blocking(Cmd::PickFiles);
+    }
+
+    /// 把一批路径变成待发送附件：图片内联，其它先上传换 receipt。
+    fn attach_paths(&mut self, paths: Vec<String>) {
+        let Some(agent_id) = self.selected.clone() else {
+            return;
+        };
+        const MAX_BYTES: u64 = 64 * 1024 * 1024;
+        for path in paths {
+            let p = PathBuf::from(&path);
+            let Some(name) = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .filter(|n| !n.is_empty())
+            else {
+                continue;
+            };
+            let Ok(meta) = std::fs::metadata(&p) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            if meta.len() > MAX_BYTES {
+                self.error = Some(format!("{name}: file is larger than 64 MiB"));
+                continue;
+            }
+            let Ok(data) = std::fs::read(&p) else {
+                self.error = Some(format!("{name}: cannot read file"));
+                continue;
+            };
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default();
+            let media = match ext.as_str() {
+                "png" => Some("image/png"),
+                "jpg" | "jpeg" => Some("image/jpeg"),
+                "webp" => Some("image/webp"),
+                "gif" => Some("image/gif"),
+                _ => None,
+            };
+            let id = self.attach_seq;
+            self.attach_seq += 1;
+            let data = Arc::new(data);
+            if let Some(media) = media {
+                // 图片直接内联进 prompt，不需要 staging
+                self.attachments.push(PendingAttachment {
+                    id,
+                    name,
+                    data,
+                    media_type: Some(media.to_string()),
+                    receipt_id: None,
+                    state: AttachmentState::Ready,
+                });
+            } else {
+                self.attachments.push(PendingAttachment {
+                    id,
+                    name: name.clone(),
+                    data: data.clone(),
+                    media_type: None,
+                    receipt_id: None,
+                    state: AttachmentState::Uploading,
+                });
+                let _ = self.cmds.send_blocking(Cmd::UploadFile {
+                    attach_id: id,
+                    agent_id: agent_id.clone(),
+                    name,
+                    data,
+                });
+            }
+        }
+    }
+
+    /// 已就绪附件 → session/prompt 的 content 片段。
+    fn attachments_content(&self) -> Vec<Value> {
+        use base64::Engine as _;
+        let mut out = Vec::new();
+        for attachment in &self.attachments {
+            if attachment.state != AttachmentState::Ready {
+                continue;
+            }
+            if let Some(media) = &attachment.media_type {
+                out.push(json!({
+                    "type": "image",
+                    "mediaType": media,
+                    "data": base64::engine::general_purpose::STANDARD.encode(attachment.data.as_slice()),
+                    "name": attachment.name,
+                }));
+            } else if let Some(receipt) = &attachment.receipt_id {
+                out.push(json!({ "type": "file", "receiptId": receipt }));
+            }
+        }
+        out
     }
 
     /// 某一页的 revision（写回时带上，避免覆盖别人的并发修改）。
@@ -9028,6 +9274,35 @@ impl Root {
                 return true;
             }
         }
+        // Ctrl/Cmd+V：剪贴板里是图片就当附件；文本粘贴照常交给输入框
+        if ctrl && key == "v" && !self.show_palette && self.renaming.is_none() {
+            if let Some(item) = cx.read_from_clipboard() {
+                for entry in item.entries() {
+                    let ClipboardEntry::Image(image) = entry else {
+                        continue;
+                    };
+                    let (media, ext) = match image.format {
+                        ImageFormat::Png => ("image/png", "png"),
+                        ImageFormat::Jpeg => ("image/jpeg", "jpg"),
+                        ImageFormat::Webp => ("image/webp", "webp"),
+                        ImageFormat::Gif => ("image/gif", "gif"),
+                        _ => continue,
+                    };
+                    let id = self.attach_seq;
+                    self.attach_seq += 1;
+                    self.attachments.push(PendingAttachment {
+                        id,
+                        name: format!("clipboard-{id}.{ext}"),
+                        data: Arc::new(image.bytes.clone()),
+                        media_type: Some(media.to_string()),
+                        receipt_id: None,
+                        state: AttachmentState::Ready,
+                    });
+                    cx.notify();
+                    return true;
+                }
+            }
+        }
         if self.files_sidebar && key == "f2" {
             if let Some(path) = self.files_selected.clone() {
                 if std::path::Path::new(&path).is_file() && !self.editors.contains_key(&file_panel_id(&path)) {
@@ -9562,7 +9837,7 @@ impl Root {
     fn send_prompt(&mut self, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().trim().to_string();
         trace(format_args!("[ui] send_prompt text={text:?}"));
-        if text.is_empty() {
+        if text.is_empty() && self.attachments.is_empty() {
             return;
         }
         // 浏览器标注攒批:发出消息时自动附带当前所有 pin,随后清空。
@@ -9712,6 +9987,12 @@ impl Root {
                 });
             if known {
                 let line = text.trim().to_string();
+                // slash 命令也允许带附件（协议里是 submittedAttachments）
+                let submitted: Vec<Value> = self
+                    .attachments_content()
+                    .into_iter()
+                    .filter(|part| part.get("type").and_then(|v| v.as_str()) == Some("image"))
+                    .collect();
                 if self.selected.as_deref() == Some(session_id.as_str()) {
                     self.push_block(TranscriptBlock::Notice(format!("› {line}")));
                     self.scroll.scroll_to_bottom();
@@ -9719,19 +10000,69 @@ impl Root {
                         self.pending_clear = true;
                     }
                 }
+                self.attachments.clear();
                 let _ = self.cmds.send_blocking(Cmd::Call {
                     tag: "commands/execute".to_string(),
                     endpoint: "commands/execute".to_string(),
                     args: json!({
                         "agentId": session_id,
                         "line": line,
-                        "submittedAttachments": [],
+                        "submittedAttachments": submitted,
                     }),
                 });
                 cx.notify();
                 return;
             }
         }
+        // 还有附件在上传：先别发，避免丢附件
+        if self
+            .attachments
+            .iter()
+            .any(|attachment| attachment.state == AttachmentState::Uploading)
+        {
+            self.error = Some("attachments are still uploading…".to_string());
+            return;
+        }
+        let extra = self.attachments_content();
+        let attachment_names: Vec<String> = self
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.state == AttachmentState::Ready)
+            .map(|attachment| attachment.name.clone())
+            .collect();
+        let attachment_failed: Vec<String> = self
+            .attachments
+            .iter()
+            .filter(|attachment| matches!(attachment.state, AttachmentState::Failed(_)))
+            .map(|attachment| attachment.name.clone())
+            .collect();
+        if extra.is_empty() && text.trim().is_empty() {
+            // 只有失败的附件：别发空消息
+            if !attachment_failed.is_empty() {
+                self.error = Some(format!(
+                    "could not attach: {}",
+                    attachment_failed.join(", ")
+                ));
+            }
+            self.attachments.clear();
+            cx.notify();
+            return;
+        }
+        self.attachments.clear();
+        if !attachment_failed.is_empty() {
+            self.error = Some(format!(
+                "could not attach: {}",
+                attachment_failed.join(", ")
+            ));
+        }
+        let mut display_text = text.clone();
+        if !attachment_names.is_empty() {
+            if !display_text.trim().is_empty() {
+                display_text.push_str("\n\n");
+            }
+            display_text.push_str(&format!("📎 {}", attachment_names.join(", ")));
+        }
+        let text = display_text;
         if self.selected.as_deref() == Some(session_id.as_str()) {
             self.push_block(TranscriptBlock::User {
                 uid: block_uid(),
@@ -9758,6 +10089,7 @@ impl Root {
             session_id,
             text,
             request_id,
+            extra,
         });
         cx.notify();
     }
@@ -14074,7 +14406,11 @@ impl Render for Root {
             .child(transcript_body);
 
 
-        let can_send = !self.input.read(cx).value().trim().is_empty();
+        let can_send = !self.input.read(cx).value().trim().is_empty()
+            || self
+                .attachments
+                .iter()
+                .any(|attachment| attachment.state == AttachmentState::Ready);
         if self.git_cache_cwd != space_cwd {
             self.git_cache = git_summary(&space_cwd).unwrap_or_default();
             self.git_cache_cwd = space_cwd.clone();
@@ -14150,6 +14486,86 @@ impl Render for Root {
                                             ),
                                     ),
                             )
+                            .children(if self.attachments.is_empty() {
+                                None
+                            } else {
+                                // 待发送附件：文件名 + 状态 + ×
+                                let chips: Vec<AnyElement> = self
+                                    .attachments
+                                    .iter()
+                                    .map(|attachment| {
+                                        let (dot, color) = match &attachment.state {
+                                            AttachmentState::Ready => ("●", 0x3f8f5f),
+                                            AttachmentState::Uploading => ("◌", 0xb5812f),
+                                            AttachmentState::Failed(_) => ("!", 0xff5663),
+                                        };
+                                        let remove_id = attachment.id;
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(6.))
+                                            .px(px(8.))
+                                            .py(px(3.))
+                                            .rounded(px(6.))
+                                            .bg(rgb(0x20232b))
+                                            .border_1()
+                                            .border_color(rgb(0x2c3340))
+                                            .child(div().text_xs().text_color(rgb(color)).child(dot))
+                                            .child(
+                                                div()
+                                                    .max_w(px(200.))
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .text_xs()
+                                                    .text_color(rgb(0xc9d1de))
+                                                    .child(SharedString::from(attachment.name.clone())),
+                                            )
+                                            .children(match &attachment.state {
+                                                AttachmentState::Failed(err) => Some(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(0xff8a97))
+                                                        .max_w(px(160.))
+                                                        .overflow_hidden()
+                                                        .whitespace_nowrap()
+                                                        .text_ellipsis()
+                                                        .child(SharedString::from(err.clone())),
+                                                ),
+                                                _ => None,
+                                            })
+                                            .child(
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "attach-remove-{remove_id}"
+                                                    )))
+                                                    .text_xs()
+                                                    .text_color(rgb(0x707786))
+                                                    .cursor_pointer()
+                                                    .hover(|style| style.text_color(rgb(0xd0d4dc)))
+                                                    .child("×")
+                                                    .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                                        this.attachments
+                                                            .retain(|attachment| attachment.id != remove_id);
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                            .into_any_element()
+                                    })
+                                    .collect();
+                                Some(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .flex_wrap()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .px(px(20.))
+                                        .pb(px(4.))
+                                        .children(chips),
+                                )
+                            })
                             .child(
                                 div()
                                     .flex()
@@ -14160,6 +14576,26 @@ impl Render for Root {
                                     .pb(px(10.))
                                     .min_w(px(0.))
                                     .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .id("attach")
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .justify_center()
+                                            .w(px(26.))
+                                            .h(px(26.))
+                                            .rounded_full()
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgb(0x23272f)))
+                                            .text_sm()
+                                            .text_color(rgb(0x9ca3b0))
+                                            .child("📎")
+                                            .on_click(cx.listener(|this, _ev, _win, cx| {
+                                                this.pick_attachments();
+                                                cx.notify();
+                                            })),
+                                    )
                                     .child(
                                         div()
                                             .id("model-pill")
@@ -20008,7 +20444,20 @@ impl Render for Root {
                         cx.notify();
                     }
                 }),
-            );
+            )
+            // 文件拖进窗口：OS 的 file drop 会被 GPUI 转成 ExternalPaths 的内部拖拽
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _win, cx| {
+                if paths.0.is_empty() {
+                    return;
+                }
+                let paths: Vec<String> = paths
+                    .0
+                    .iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect();
+                this.attach_paths(paths);
+                cx.notify();
+            }));
         let element = root
             .child(
                 div().flex().flex_col().w_full()

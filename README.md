@@ -63,6 +63,7 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 | **消息反馈**：`messageFeedback/list` + `put`/`delete`，assistant 块下的 👍/👎（再点撤回） | ✅ |
 | **会话管理**：tab 右键 → Fork（`session/fork`）/ 置顶（`workspace/pinSession·unpinSession`）/ 归档（`workspace/archiveSession`） | ✅ |
 | **Slash 命令**：`commands/list` 进命令面板；输入框以已知 `/命令` 开头发送时走 `commands/execute` | ✅ |
+| **附件**：📎 选择文件 / 拖进窗口 / Ctrl+V 粘贴图片；图片内联，其它文件走 `fileUploads/upload` 换 receipt | ✅（上传 + prompt content 实测通过） |
 
 **dsh 的单写者模型**（踩到的坑）：一个会话同时只能有一个写句柄。
 浏览器里开着这个会话时，GUI 发 `session/prompt` 会得到
@@ -71,7 +72,6 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 
 **已知缺口**：
 
-- 附件上传（`fileUploads/upload`）尚未接到输入框（图片走内联 prompt）
 - 计划/目标、日程、子代理面板（`goals/*`、`schedule/*`、`subagents/*`）尚未做 UI
 - 插件市场分页（`nextOffset`）只加载第一页；索引切换放在设置里改
 - 置顶状态只在本次运行内保留（`workspace/follow` 未接）
@@ -177,7 +177,7 @@ strings ~/.local/bin/herdr-app  | grep gpui           # GPUI 自绘
 ## 状态
 
 M0–M2 完成，M3 进行中（文件/编辑器、插件管理与市场、消息反馈、会话 fork/置顶/归档、
-slash 命令面板已接）。剩余：附件上传、目标/日程/子代理面板、终端搜索/Kitty 图形、
+slash 命令面板、附件上传已接）。剩余：目标/日程/子代理面板、终端搜索/Kitty 图形、
 跨重启的置顶状态（`workspace/follow`）。
 
 ### 插件页与 tab 菜单
@@ -189,3 +189,6 @@ slash 命令面板已接）。剩余：附件上传、目标/日程/子代理面
 - assistant 消息下方有 👍/👎（再点撤回），走 `messageFeedback/*`。
 - `Ctrl+K` 命令面板里会列出 `commands/list` 的 slash 命令；输入框里以已知
   `/命令` 开头发送时直接走 `commands/execute`，不再当普通 prompt 发给模型。
+- 附件：输入框左下 📎 打开系统文件框（zenity / kdialog），也可以把文件拖进窗口、
+  或用 Ctrl+V 粘贴剪贴板里的图片。图片以 base64 内联；其它文件先 `fileUploads/upload`
+  换 receipt，再以 `{type:"file",receiptId}` 进 prompt。上传未完成的附件会阻止发送。
