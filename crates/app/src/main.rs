@@ -1057,6 +1057,8 @@ enum Ev {
     /// 终端建好了：把 term 绑到 pane 上（tab 形态的 pane 还会被打开成标签页）
     /// job/list 的一帧（整份清单替换）
     Jobs(Value),
+    /// workspace/follow 的一帧（baseline / pinned / archived / …）
+    Workspace(Value),
     Called {
         tag: String,
         endpoint: String,
@@ -1127,6 +1129,7 @@ fn ev_name(ev: &Ev) -> &'static str {
         Ev::Question { .. } => "Question",
         Ev::QuestionGone => "QuestionGone",
         Ev::InstallSettled { .. } => "InstallSettled",
+        Ev::Workspace(_) => "Workspace",
         Ev::FileStaged { .. } => "FileStaged",
         Ev::FilesPicked(_) => "FilesPicked",
         Ev::DshInfo { .. } => "DshInfo",
@@ -1399,6 +1402,25 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
     let base = host.base().clone();
     let _ = evs.send(Ev::Line("engine ready".into())).await;
     let _ = refresh_sessions(&rpc, &evs).await;
+
+    // workspace/follow：置顶/归档状态的唯一来源（baseline + pinned/archived 增量）
+    {
+        let mux = mux.clone();
+        let evs_ws = evs.clone();
+        tokio::spawn(async move {
+            let Ok(mut stream) = mux.open("workspace/follow", json!({})).await else {
+                return;
+            };
+            loop {
+                match stream.recv().await {
+                    Some(Frame::Item(value)) => {
+                        let _ = evs_ws.send(Ev::Workspace(value)).await;
+                    }
+                    _ => break,
+                }
+            }
+        });
+    }
 
     loop {
         tokio::select! {
@@ -2918,6 +2940,8 @@ struct Root {
     inspect_pending: Option<Value>,
     /// 置顶的会话（workspace/pinSession 返回的集合）
     pinned_sessions: Vec<String>,
+    /// 归档的会话（workspace/follow 的 archivedSessionIds；列表里过滤掉）
+    archived_sessions: Vec<String>,
     /// commands/list 的结果（当前 agent 的 slash 命令）
     slash_commands: Vec<Value>,
     /// 发起了归档的 panel：归档成功后关掉它
@@ -3987,6 +4011,7 @@ impl Root {
             market_query: String::new(),
             install_state: std::collections::HashMap::new(),
             pinned_sessions: Vec::new(),
+            archived_sessions: Vec::new(),
             slash_commands: Vec::new(),
             feedback: std::collections::HashMap::new(),
             archive_pending: None,
@@ -5193,6 +5218,45 @@ impl Root {
                 self.reload_plugins();
                 if self.market_url.is_some() {
                     self.market_search(None, false);
+                }
+                cx.notify();
+            }
+            Ev::Workspace(value) => {
+                let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let parse_ids = |container: &Value, key: &str| -> Vec<String> {
+                    container
+                        .get(key)
+                        .and_then(|v| v.as_array())
+                        .map(|ids| {
+                            ids.iter()
+                                .filter_map(|id| id.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                match kind {
+                    "baseline" | "replace" => {
+                        if let Some(state) = value.get("value") {
+                            self.pinned_sessions = parse_ids(state, "pinnedSessionIds");
+                            self.archived_sessions = parse_ids(state, "archivedSessionIds");
+                        }
+                        eprintln!(
+                            "[ui] workspace {kind}: {} pinned, {} archived",
+                            self.pinned_sessions.len(),
+                            self.archived_sessions.len()
+                        );
+                    }
+                    "pinned" => {
+                        self.pinned_sessions = parse_ids(&value, "pinnedSessionIds");
+                        eprintln!(
+                            "[ui] workspace pinned: {}",
+                            self.pinned_sessions.len()
+                        );
+                    }
+                    "archived" => {
+                        self.archived_sessions = parse_ids(&value, "archivedSessionIds");
+                    }
+                    _ => {}
                 }
                 cx.notify();
             }
@@ -14315,7 +14379,13 @@ impl Render for Root {
                 .update(cx, |state, cx| state.set_value("", window, cx));
         }
         let selected = self.selected.clone();
-        let sessions = self.sessions.clone();
+        let archived = self.archived_sessions.clone();
+        let sessions: Vec<SessionRow> = self
+            .sessions
+            .iter()
+            .filter(|row| !archived.iter().any(|id| id == &row.id))
+            .cloned()
+            .collect();
         let blocks = self.items.clone();
         // 只渲染尾部窗口：首帧不等整段历史，剩下的靠 start_reveal() 按帧补。
         let hidden_blocks = blocks

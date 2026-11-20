@@ -66,6 +66,7 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 | **附件**：📎 选择文件 / 拖进窗口 / Ctrl+V 粘贴图片；图片内联，其它文件走 `fileUploads/upload` 换 receipt | ✅（上传 + prompt content 实测通过） |
 | **目标（goal）**：`goals/get` 横幅 + create/edit/pause/resume/complete/clear | ✅（回填、CAS revision 实测） |
 | **日程**：⏱ 面板（`schedule/catalog` 按会话过滤）+ 投递历史 + 删除 | ✅（catalog/list 实测；创建由 agent 的 schedule 工具完成） |
+| **workpace 状态**：`workspace/follow` baseline + `pinned`/`archived` 增量；置顶/归档跨重启 | ✅（baseline 实测：2 archived） |
 
 **dsh 的单写者模型**（踩到的坑）：一个会话同时只能有一个写句柄。
 浏览器里开着这个会话时，GUI 发 `session/prompt` 会得到
@@ -76,7 +77,6 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 
 - 计划/目标、日程、子代理面板（`goals/*`、`schedule/*`、`subagents/*`）尚未做 UI
 - 插件市场分页（`nextOffset`）只加载第一页；索引切换放在设置里改
-- 置顶状态只在本次运行内保留（`workspace/follow` 未接）
 
 ### 构建依赖（Linux）
 
@@ -179,8 +179,8 @@ strings ~/.local/bin/herdr-app  | grep gpui           # GPUI 自绘
 ## 状态
 
 M0–M2 完成，M3 进行中（文件/编辑器、插件管理与市场、消息反馈、会话 fork/置顶/归档、
-slash 命令面板、附件上传、目标横幅、日程面板已接）。剩余：子代理面板、终端搜索/Kitty 图形、
-跨重启的置顶状态（`workspace/follow`）。
+slash 命令面板、附件上传、目标横幅、日程面板、workspace 状态流已接）。剩余：子代理面板、
+终端搜索/Kitty 图形。
 
 ### 插件页与 tab 菜单
 
