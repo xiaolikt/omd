@@ -75,6 +75,7 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 | **终端选区**：鼠标拖选（高亮），松开自动复制；Ctrl+Shift+C 复制；单击清空。取文本走 `ghostty_formatter`（plain + unwrap + trim） | ✅（单测：行内/跨行提取，两端包含语义） |
 | **Fork 到指定消息**：转写里带 seq 的消息下方「⎇ fork here」（`session/fork` 的 `atSeq`）；tab 右键仍是最近完成 turn | ✅（atSeq=5 实测返回新会话） |
 | **子代理树**：⇄ 面板按 `parentSessionId` DFS 到第 4 层，孙代缩进 + L 层标 | ✅ |
+| **goal/schedule 编辑表单**：goal 目标 + 轮次上限（`maxGoalRounds`）；日程 title/prompt 行内编辑（`schedule/update` 带 `expected`） | ✅（create 7 → edit 9 → clear 实测） |
 
 **dsh 的单写者模型**（踩到的坑）：一个会话同时只能有一个写句柄。
 浏览器里开着这个会话时，GUI 发 `session/prompt` 会得到
@@ -207,11 +208,11 @@ slash 命令面板、附件上传、目标横幅、日程面板、workspace 状�
   或用 Ctrl+V 粘贴剪贴板里的图片。图片以 base64 内联；其它文件先 `fileUploads/upload`
   换 receipt，再以 `{type:"file",receiptId}` 进 prompt。上传未完成的附件会阻止发送。
 - 目标：消息区顶部一条 goal 横幅（目标、阶段、已用轮次/上限、阻塞原因），可直接
-  暂停/继续/完成/清除/改目标；没有 goal 时显示「◎ goal」入口。变更事件（`goal/change`）
+  暂停/继续/完成/清除/改目标（含轮次上限）；没有 goal 时显示「◎ goal」入口。变更事件（`goal/change`）
   会自动重新拉取，所有写操作都带 revision 做 CAS。
 - 日程：标题栏 ⏱ 打开当前会话的提醒列表（`schedule/catalog` 全量按 sessionId 过滤），
-  可看投递历史、删除；`schedule/changed` 时自动刷新。创建提醒由 agent 的
-  `schedule_create` 工具完成（协议没有给客户端的创建端点）。
+  可看投递历史、行内编辑 title/prompt、删除；`schedule/changed` 时自动刷新。
+  创建提醒由 agent 的 `schedule_create` 工具完成（协议没有给客户端的创建端点）。
 - 子代理：标题栏 ⇄ 列出当前会话派生的后代树（`session/list` 的 `parentSessionId`，
   DFS 到第 4 层，孙代缩进 + L 层标），选中后可发消息（queue）/ 打断。
 - 终端：Ctrl+F 打开回滚搜索条（ghostty 的 search API，覆盖主/副屏与 scrollback；

@@ -2980,11 +2980,17 @@ struct Root {
     /// goal 目标编辑框 + 是否在编辑
     goal_input: Entity<InputState>,
     goal_editing: bool,
+    /// goal 轮次上限（编辑时可改；空 = 不改/默认）
+    goal_rounds_input: Entity<InputState>,
     /// 日程（schedule/*）面板
     show_schedules: bool,
     schedule_doc: Value,
     schedule_history: std::collections::HashMap<String, Value>,
     schedule_expanded: Option<String>,
+    /// 正在编辑的日程（task id）+ 标题/内容输入
+    schedule_edit: Option<String>,
+    schedule_title_input: Entity<InputState>,
+    schedule_prompt_input: Entity<InputState>,
     /// 子代理面板：列出 parentSessionId == 当前会话的子会话
     show_subagents: bool,
     subagent_target: Option<String>,
@@ -3781,6 +3787,9 @@ impl Root {
         });
         let goal_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("What should this session achieve?"));
+        let goal_rounds_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("rounds cap (optional)")
+        });
         let goal_sub = cx.subscribe(&goal_input, |this, _entity, ev: &InputEvent, cx| {
             if let InputEvent::PressEnter { shift, .. } = ev {
                 if !*shift {
@@ -3791,6 +3800,8 @@ impl Root {
         let subagent_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Message the selected subagent…")
         });
+        let schedule_title_input = cx.new(|cx| InputState::new(window, cx).placeholder("Title"));
+        let schedule_prompt_input = cx.new(|cx| InputState::new(window, cx).placeholder("Prompt"));
         let subagent_sub = cx.subscribe(&subagent_input, |this, _entity, ev: &InputEvent, cx| {
             if let InputEvent::PressEnter { shift, .. } = ev {
                 if !*shift {
@@ -4126,10 +4137,14 @@ impl Root {
             goal_doc: Value::Null,
             goal_input,
             goal_editing: false,
+            goal_rounds_input,
             show_schedules: false,
             schedule_doc: Value::Null,
             schedule_history: std::collections::HashMap::new(),
             schedule_expanded: None,
+            schedule_edit: None,
+            schedule_title_input,
+            schedule_prompt_input,
             show_subagents: false,
             subagent_target: None,
             subagent_input,
@@ -4985,6 +5000,10 @@ impl Root {
                         }
                         "schedule/delete" => {
                             self.schedule_expanded = None;
+                            self.schedule_edit = None;
+                            self.reload_schedules();
+                        }
+                        "schedule/update" => {
                             self.reload_schedules();
                         }
                         tag if tag.starts_with("schedule/history:") => {
@@ -7835,8 +7854,16 @@ impl Root {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let rounds = self
+            .goal_doc
+            .get("maxGoalRounds")
+            .and_then(|v| v.as_u64())
+            .map(|rounds| rounds.to_string())
+            .unwrap_or_default();
         self.goal_input
             .update(cx, |state, cx| state.set_value(current, window, cx));
+        self.goal_rounds_input
+            .update(cx, |state, cx| state.set_value(rounds, window, cx));
         self.goal_input
             .read(cx)
             .focus_handle(cx)
@@ -7846,8 +7873,17 @@ impl Root {
     }
 
     /// 提交 goal 编辑：已有 goal → goals/edit，没有 → goals/create。
+    /// rounds 输入是合法正整数时一并带 maxGoalRounds。
     fn commit_goal_edit(&mut self, cx: &mut Context<Self>) {
         let objective = self.goal_input.read(cx).value().trim().to_string();
+        let rounds = self
+            .goal_rounds_input
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|rounds| *rounds > 0);
         if objective.is_empty() {
             self.goal_editing = false;
             cx.notify();
@@ -7870,17 +7906,88 @@ impl Root {
                 args: json!({
                     "agentId": agent_id,
                     "ref": { "id": id, "revision": revision },
-                    "request": { "objective": objective },
+                    "request": {
+                        "objective": objective,
+                        "maxGoalRounds": rounds,
+                    }
                 }),
             },
-            _ => Cmd::Call {
-                tag: "goals/mutate".to_string(),
-                endpoint: "goals/create".to_string(),
-                args: json!({ "agentId": agent_id, "request": { "objective": objective } }),
-            },
+            _ => {
+                let mut request = json!({ "objective": objective });
+                if let Some(rounds) = rounds {
+                    request["maxGoalRounds"] = json!(rounds);
+                }
+                Cmd::Call {
+                    tag: "goals/mutate".to_string(),
+                    endpoint: "goals/create".to_string(),
+                    args: json!({ "agentId": agent_id, "request": request }),
+                }
+            }
         };
         self.goal_editing = false;
         let _ = self.cmds.send_blocking(call);
+        cx.notify();
+    }
+
+    /// 开始编辑一个日程（title/prompt）。
+    fn open_schedule_edit(&mut self, task: &Value, window: &mut Window, cx: &mut Context<Self>) {
+        let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let prompt = task.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+        self.schedule_title_input
+            .update(cx, |state, cx| state.set_value(title, window, cx));
+        self.schedule_prompt_input
+            .update(cx, |state, cx| state.set_value(prompt, window, cx));
+        self.schedule_edit = task
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        cx.notify();
+    }
+
+    /// 提交日程编辑（schedule/update：expected 完整记录 + title/prompt）。
+    fn commit_schedule_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(task_id) = self.schedule_edit.clone() else {
+            return;
+        };
+        let Some(session_id) = self.selected.clone() else {
+            return;
+        };
+        let Some(task) = self
+            .schedule_doc
+            .as_array()
+            .and_then(|tasks| {
+                tasks
+                    .iter()
+                    .find(|task| task.get("id").and_then(|v| v.as_str()) == Some(task_id.as_str()))
+            })
+            .cloned()
+        else {
+            return;
+        };
+        let title = self.schedule_title_input.read(cx).value().trim().to_string();
+        let prompt = self.schedule_prompt_input.read(cx).value().trim().to_string();
+        if title.is_empty() || prompt.is_empty() {
+            return;
+        }
+        // expected 需要完整观测记录（把 sessionId 字段去掉再放进去——它是 catalog 的外层字段）
+        let mut expected = task.clone();
+        if let Some(obj) = expected.as_object_mut() {
+            obj.remove("sessionId");
+        }
+        self.schedule_edit = None;
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "schedule/update".to_string(),
+            endpoint: "schedule/update".to_string(),
+            args: json!({
+                "request": {
+                    "sessionId": session_id,
+                    "id": task_id,
+                    "expected": expected,
+                    "title": title,
+                    "prompt": prompt,
+                }
+            }),
+        });
         cx.notify();
     }
 
@@ -16091,6 +16198,17 @@ impl Render for Root {
                     )
                     .child(
                         div()
+                            .w(px(150.))
+                            .child(
+                                Input::new(&self.goal_rounds_input)
+                                    .bordered(false)
+                                    .appearance(false)
+                                    .focus_bordered(false)
+                                    .text_xs(),
+                            ),
+                    )
+                    .child(
+                        div()
                             .id("goal-edit-cancel")
                             .px(px(8.))
                             .py(px(3.))
@@ -22119,6 +22237,31 @@ impl Render for Root {
                         )
                         .child(
                             div()
+                                .id(SharedString::from(format!("schedule-edit-{id}")))
+                                .px(px(6.))
+                                .py(px(2.))
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(rgb(0x9ca3b0))
+                                .hover(|style| style.bg(rgb(0x20232b)))
+                                .child("edit")
+                                .on_click({
+                                    let edit_task = task.clone();
+                                    cx.listener(move |this, _ev, win, cx| {
+                                        if this.schedule_edit.as_deref()
+                                            == Some(edit_task.get("id").and_then(|v| v.as_str()).unwrap_or(""))
+                                        {
+                                            this.schedule_edit = None;
+                                        } else {
+                                            this.open_schedule_edit(&edit_task, win, cx);
+                                        }
+                                        cx.notify();
+                                    })
+                                }),
+                        )
+                        .child(
+                            div()
                                 .id(SharedString::from(format!("schedule-delete-{id}")))
                                 .px(px(6.))
                                 .py(px(2.))
@@ -22191,6 +22334,93 @@ impl Render for Root {
                             .pl(px(82.))
                             .pb(px(6.))
                             .children(lines)
+                            .into_any_element(),
+                    );
+                }
+                // 编辑展开：改标题/内容（schedule/update）
+                if self.schedule_edit.as_deref() == Some(id.as_str()) {
+                    rows.push(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .pl(px(82.))
+                            .pb(px(8.))
+                            .child(
+                                div()
+                                    .rounded(px(6.))
+                                    .bg(rgb(0x14171d))
+                                    .border_1()
+                                    .border_color(rgb(0x23272f))
+                                    .px(px(8.))
+                                    .py(px(3.))
+                                    .child(
+                                        Input::new(&self.schedule_title_input)
+                                            .bordered(false)
+                                            .appearance(false)
+                                            .focus_bordered(false)
+                                            .text_xs(),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .rounded(px(6.))
+                                    .bg(rgb(0x14171d))
+                                    .border_1()
+                                    .border_color(rgb(0x23272f))
+                                    .px(px(8.))
+                                    .py(px(3.))
+                                    .child(
+                                        Input::new(&self.schedule_prompt_input)
+                                            .bordered(false)
+                                            .appearance(false)
+                                            .focus_bordered(false)
+                                            .text_xs(),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "schedule-edit-cancel-{id}"
+                                            )))
+                                            .px(px(8.))
+                                            .py(px(3.))
+                                            .rounded(px(6.))
+                                            .text_xs()
+                                            .text_color(rgb(0x9ca3b0))
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgb(0x20232b)))
+                                            .child("Cancel")
+                                            .on_click(cx.listener(|this, _ev, _win, cx| {
+                                                this.schedule_edit = None;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "schedule-edit-save-{id}"
+                                            )))
+                                            .px(px(10.))
+                                            .py(px(3.))
+                                            .rounded(px(6.))
+                                            .border_1()
+                                            .border_color(rgb(0x2f6fb5))
+                                            .text_xs()
+                                            .text_color(rgb(0x7fb5e8))
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgb(0x16222f)))
+                                            .child("Save")
+                                            .on_click(cx.listener(|this, _ev, _win, cx| {
+                                                this.commit_schedule_edit(cx);
+                                            })),
+                                    ),
+                            )
                             .into_any_element(),
                     );
                 }
