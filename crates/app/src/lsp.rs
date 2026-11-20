@@ -60,6 +60,11 @@ pub enum Event {
     ApplyWorkspaceEdit {
         edits: Vec<(String, Vec<lsp_types::TextEdit>)>,
     },
+    /// textDocument/formatting 的结果（UI 侧应用到 open buffer）
+    Formatted {
+        path: String,
+        edits: Vec<lsp_types::TextEdit>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +126,12 @@ pub enum Cmd {
     SemanticTokens {
         path: String,
         reply: async_channel::Sender<Value>,
+    },
+    /// 格式化整篇（textDocument/formatting）；结果走 Event::Formatted
+    Formatting {
+        path: String,
+        tab_size: u32,
+        insert_spaces: bool,
     },
     Shutdown,
 }
@@ -828,6 +839,11 @@ fn worker(cmd_rx: Receiver<Cmd>, ev_tx: async_channel::Sender<Event>) {
                 arguments,
             } => manager.execute_command(&path, &command, arguments),
             Cmd::SemanticTokens { path, reply } => manager.semantic_tokens(path, reply),
+            Cmd::Formatting {
+                path,
+                tab_size,
+                insert_spaces,
+            } => manager.format(&path, tab_size, insert_spaces),
             Cmd::Save { path, text } => {
                 if let Some(key) = manager.routed.get(&path) {
                     if let Some(server) = manager.servers.get(key) {
@@ -968,6 +984,26 @@ impl Manager {
             params,
             Duration::from_secs(10),
         );
+    }
+
+    /// textDocument/formatting → Event::Formatted（编辑列表；空 = 已是格式或 server 不支持）
+    fn format(&mut self, path: &str, tab_size: u32, insert_spaces: bool) {
+        let Some(server) = self.routed.get(path).and_then(|key| self.servers.get(key)) else {
+            eprintln!("[lsp] formatting 没有路由：{path}");
+            return;
+        };
+        let params = json!({
+            "textDocument": { "uri": path_to_uri(path) },
+            "options": { "tabSize": tab_size, "insertSpaces": insert_spaces },
+        });
+        let result = server
+            .request("textDocument/formatting", params, Duration::from_secs(10))
+            .unwrap_or(Value::Null);
+        let edits: Vec<lsp_types::TextEdit> = serde_json::from_value(result).unwrap_or_default();
+        eprintln!("[lsp] formatting {path}: {} edits", edits.len());
+        let _ = self
+            .ev_tx
+            .try_send(Event::Formatted { path: path.to_string(), edits });
     }
 
     fn query(
@@ -1511,4 +1547,61 @@ fn completion_insert_text(item: &lsp_types::CompletionItem) -> String {
     item.insert_text
         .clone()
         .unwrap_or_else(|| item.label.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 真实 rust-analyzer 的 textDocument/formatting 冒烟：
+    /// 打开一段没格式化的 Rust，格式化后应收到非空 edits，应用后带换行/空格。
+    #[test]
+    fn formatting_returns_edits_from_rust_analyzer() {
+        if which(&"rust-analyzer".to_string()).is_none() {
+            eprintln!("[test] rust-analyzer 不在 PATH，跳过");
+            return;
+        }
+        let (tx, _ev_tx, rx) = spawn();
+        let dir = std::env::temp_dir().join("omd-lsp-fmt-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fmt_test.rs");
+        std::fs::write(&path, "fn main(){let x=1;println!(\"{}\",x);}\n").unwrap();
+        let _ = tx.send(Cmd::Open {
+            path: path.to_string_lossy().to_string(),
+            text: "fn main(){let x=1;println!(\"{}\",x);}\n".to_string(),
+        });
+        let _ = tx.send(Cmd::Formatting {
+            path: path.to_string_lossy().to_string(),
+            tab_size: 4,
+            insert_spaces: true,
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while let Ok(event) = rx.recv_blocking() {
+            match event {
+                Event::Formatted { path, edits } => {
+                    assert!(!edits.is_empty(), "rust-analyzer 应返回格式化编辑");
+                    let text = "fn main(){let x=1;println!(\"{}\",x);}\n";
+                    let formatted = apply_text_edits(text, &edits);
+                    eprintln!("[test] formatted: {formatted}");
+                    assert!(formatted.contains("fn main() {"), "{formatted}");
+                    assert_ne!(formatted, text, "必须发生变化");
+                    let _ = tx.send(Cmd::Shutdown);
+                    let _ = std::fs::remove_file(&path);
+                    return;
+                }
+                _ => {}
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("等 Event::Formatted 超时");
+            }
+        }
+        panic!("事件流提前关闭");
+    }
+
+    fn which(bin: &str) -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(bin))
+            .find(|candidate| candidate.is_file())
+    }
 }

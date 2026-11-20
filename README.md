@@ -76,6 +76,7 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 | **Fork 到指定消息**：转写里带 seq 的消息下方「⎇ fork here」（`session/fork` 的 `atSeq`）；tab 右键仍是最近完成 turn | ✅（atSeq=5 实测返回新会话） |
 | **子代理树**：⇄ 面板按 `parentSessionId` DFS 到第 4 层，孙代缩进 + L 层标 | ✅ |
 | **goal/schedule 编辑表单**：goal 目标 + 轮次上限（`maxGoalRounds`）；日程 title/prompt 行内编辑（`schedule/update` 带 `expected`） | ✅（create 7 → edit 9 → clear 实测） |
+| **编辑器格式化**：❏ format 按钮 / Ctrl+Shift+F → `textDocument/formatting`（缩进按文件嗅探），结果经事件回应用到 open buffer | ✅（rust-analyzer 实测：3 edits → 正确格式化） |
 
 **dsh 的单写者模型**（踩到的坑）：一个会话同时只能有一个写句柄。
 浏览器里开着这个会话时，GUI 发 `session/prompt` 会得到
@@ -156,6 +157,13 @@ crates/
 ├── spike/      # M0 验证工具：--list-only / --events N / --follow N / --prompt "..."
 └── app/        # GPUI 窗口：会话列表 + 消息流 + 输入框
 ```
+
+## 编辑器（文件面板）
+
+- LSP：补全（含 `additionalTextEdits` 自动 import）、hover、定义跳转、code actions、
+  语义高亮、诊断装饰（`crates/app/src/lsp.rs`；`OMD_LSP_<EXT>` 可覆盖 server 命令）。
+- 格式化：编辑器 pane 头部「❏ format」或 Ctrl+Shift+F；缩进从文件前导空白嗅探，
+  结果通过 `Event::Formatted` 回来后在 render 阶段应用到 open buffer（标记 dirty）。
 
 ## 文档索引
 

@@ -3072,6 +3072,8 @@ struct Root {
     permission_menu: Option<Point<Pixels>>,
     /// 终端拖拽选区：pane id + 是否已拖动（区分点击=清空）
     term_select: Option<(u64, bool)>,
+    /// 格式化结果待应用（编辑器 panel id → edits；render 里有 window 才 set_value）
+    pending_format_edits: Vec<(String, Vec<lsp_types::TextEdit>)>,
     /// 终端 pane body 的窗口坐标边界（canvas paint 时更新，选区换算用）
     pane_bounds: std::collections::HashMap<u64, Bounds<Pixels>>,
 }
@@ -4158,6 +4160,7 @@ impl Root {
             permission_preset: None,
             permission_menu: None,
             term_select: None,
+            pending_format_edits: Vec::new(),
             pane_bounds: std::collections::HashMap::new(),
             _subagent_sub: subagent_sub,
             plugin_spec_input,
@@ -6834,9 +6837,18 @@ impl Root {
                 }
                 cx.notify();
             }
+            lsp::Event::Formatted { path, edits } => {
+                // 应用到 open buffer（render 里有 window，set_value 需要）
+                if !edits.is_empty() {
+                    let panel = file_panel_id(&path);
+                    if self.editors.contains_key(&panel) {
+                        self.pending_format_edits.push((panel, edits));
+                        cx.notify();
+                    }
+                }
+            }
             lsp::Event::Diagnostics { path, items } => {
-                self.apply_diagnostics(path, items, cx);
-                if self.type_test_pending && !self.editors.is_empty() {
+                self.apply_diagnostics(path, items, cx);                if self.type_test_pending && !self.editors.is_empty() {
                     self.type_test_pending = false;
                     let state = self.editors.values().next().map(|e| e.state.clone());
                     // 必须放到异步任务里：在 Root::update 内部 dispatch 按键会让
@@ -7253,6 +7265,46 @@ impl Root {
     }
 
     /// Ctrl+S：把所有改过的编辑器写回磁盘。
+    /// 格式化当前编辑器（textDocument/formatting，缩进按文件嗅探）。
+    fn format_current_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(selected) = self.selected.clone() else {
+            return;
+        };
+        if !is_file_panel(&selected) {
+            return;
+        }
+        let Some(editor) = self.editors.get(&selected) else {
+            return;
+        };
+        let path = editor.path.clone();
+        if !self.lsp_active.contains(&path) {
+            self.error = Some("no language server for this file".to_string());
+            cx.notify();
+            return;
+        }
+        let text = editor.state.read(cx).value().to_string();
+        // 缩进嗅探：首个缩进行的前导空白
+        let mut tab_size = 4u32;
+        let mut insert_spaces = true;
+        for line in text.lines() {
+            if line.starts_with('\t') {
+                insert_spaces = false;
+                break;
+            }
+            let spaces = line.len() - line.trim_start_matches(' ').len();
+            if spaces > 0 {
+                tab_size = spaces as u32;
+                insert_spaces = true;
+                break;
+            }
+        }
+        let _ = self.lsp_tx.send(lsp::Cmd::Formatting {
+            path,
+            tab_size,
+            insert_spaces,
+        });
+    }
+
     fn save_file_editor(&mut self, cx: &mut Context<Self>) {
         let ids: Vec<String> = self
             .editors
@@ -10099,7 +10151,7 @@ impl Root {
                 self.search_hits.clear();
             }
         }
-        // 编辑器打开时：Ctrl+S 存盘 / Esc 关闭
+        // 编辑器打开时：Ctrl+S 存盘 / Ctrl+Shift+F 格式化 / Esc 关闭
         if self
             .selected
             .as_deref()
@@ -10107,6 +10159,10 @@ impl Root {
         {
             if ctrl && key == "s" {
                 self.save_file_editor(cx);
+                return true;
+            }
+            if ctrl && keystroke.modifiers.shift && key == "f" {
+                self.format_current_editor(cx);
                 return true;
             }
             if key == "escape" {
@@ -12906,6 +12962,8 @@ fn pane_element(
         .size_full()
         .bg(rgb(0x101319));
     let focus_click = focus.clone();
+    // 格式化按钮用
+    let format_pane_id = pane_id;
     // 滚轮回滚用：wheel 监听需要自己的 term_id 拷贝
     let term_id_wheel = term_id.clone();
     let wheel_pane_id = pane_id;
@@ -12975,6 +13033,24 @@ fn pane_element(
                     );
                 }
                 Some(row)
+            }))
+            .children(editor.as_ref().map(|_| {
+                // 格式化按钮（有 LSP 的文件才有效；点了没 server 会提示）
+                div()
+                    .id(SharedString::from(format!("pane-format-{pane_id}")))
+                    .px(px(5.))
+                    .py(px(1.))
+                    .rounded_sm()
+                    .text_xs()
+                    .text_color(rgb(0x707786))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x23272f)).text_color(rgb(0xd0d4dc)))
+                    .child("❏ format")
+                    .on_click(cx.listener(move |this, _ev, _win, cx| {
+                        this.focused_pane = Some(format_pane_id);
+                        this.format_current_editor(cx);
+                    }))
+                    .into_any_element()
             }))
             .child(div().flex_1())
             .on_mouse_down(
@@ -15151,6 +15227,24 @@ impl Render for Root {
                 .update(cx, |state, cx| state.set_value("", window, cx));
         }
         // 跨文件 WorkspaceEdit 里"文件已经开着"的那部分（这里才有 window）
+        // 格式化结果应用（set_value 需要 window）
+        for (panel, edits) in std::mem::take(&mut self.pending_format_edits) {
+            let Some(editor) = self.editors.get(&panel) else {
+                continue;
+            };
+            let state = editor.state.clone();
+            let text = state.read(cx).value().to_string();
+            let formatted = lsp::apply_text_edits(&text, &edits);
+            if formatted != text {
+                state.update(cx, |state, cx| {
+                    state.set_value(formatted, window, cx);
+                });
+                if let Some(editor) = self.editors.get_mut(&panel) {
+                    editor.dirty = true;
+                }
+                eprintln!("[lsp] format applied: {}（{} edits）", panel, edits.len());
+            }
+        }
         if !self.pending_workspace_edits.is_empty() {
             for (path, edits) in std::mem::take(&mut self.pending_workspace_edits) {
                 let Some(editor) = self.editors.get(&file_panel_id(&path)) else {
