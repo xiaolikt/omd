@@ -22291,14 +22291,28 @@ impl Render for Root {
         // 子代理面板：session/list 里 parentSessionId == 当前会话的子会话
         let subagents_modal = if self.show_subagents {
             let parent = self.selected.clone().unwrap_or_default();
-            let children: Vec<SessionRow> = self
-                .sessions
-                .iter()
-                .filter(|row| {
-                    row.parent.as_deref() == Some(parent.as_str())
-                })
-                .cloned()
-                .collect();
+            // 后代树（DFS，深度上限 4）：直接子会话 + 孙代，按深度缩进
+            let mut children: Vec<(SessionRow, usize)> = Vec::new();
+            {
+                let mut frontier = vec![(parent.clone(), 0usize)];
+                while let Some((node, depth)) = frontier.pop() {
+                    if depth >= 4 {
+                        continue;
+                    }
+                    let mut direct: Vec<SessionRow> = self
+                        .sessions
+                        .iter()
+                        .filter(|row| row.parent.as_deref() == Some(node.as_str()))
+                        .cloned()
+                        .collect();
+                    direct.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                    for child in direct {
+                        frontier.push((child.id.clone(), depth + 1));
+                        children.push((child, depth));
+                    }
+                }
+                children.sort_by_key(|(_, depth)| *depth);
+            }
             let mut rows: Vec<AnyElement> = Vec::new();
             if children.is_empty() {
                 rows.push(
@@ -22311,7 +22325,7 @@ impl Render for Root {
                         .into_any_element(),
                 );
             }
-            for child in children {
+            for (child, depth) in children {
                 let id = child.id.clone();
                 let selected_child = self.subagent_target.as_deref() == Some(id.as_str());
                 let short = if id.len() > 24 { format!("…{}", &id[id.len() - 20..]) } else { id.clone() };
@@ -22322,6 +22336,12 @@ impl Render for Root {
                 };
                 let choose_id = id.clone();
                 let interrupt_id = id.clone();
+                let indent = depth as f32 * 16.;
+                let depth_label = if depth == 0 {
+                    String::new()
+                } else {
+                    format!("L{depth} ")
+                };
                 rows.push(
                     div()
                         .id(SharedString::from(format!("subagent-row-{id}")))
@@ -22329,6 +22349,7 @@ impl Render for Root {
                         .flex_row()
                         .items_center()
                         .gap(px(8.))
+                        .ml(px(indent))
                         .px(px(6.))
                         .py(px(6.))
                         .rounded_sm()
@@ -22349,8 +22370,8 @@ impl Render for Root {
                                     div()
                                         .text_xs()
                                         .font_family("monospace")
-                                        .text_color(rgb(0xd7dce6))
-                                        .child(SharedString::from(short)),
+                                        .text_color(if depth == 0 { rgb(0xd7dce6) } else { rgb(0x9ca3b0) })
+                                        .child(SharedString::from(format!("{depth_label}{short}"))),
                                 )
                                 .child(
                                     div()

@@ -74,6 +74,7 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 | **权限预设**：composer 的 🛡 pill 显示/切换 read-only·workspace-write·danger-full-access（`/permission` 命令）；审批卡提供「always: <preset>」一键放行+切换 | ✅（`permission/preset`+`sandbox/mode` 事件实测） |
 | **终端选区**：鼠标拖选（高亮），松开自动复制；Ctrl+Shift+C 复制；单击清空。取文本走 `ghostty_formatter`（plain + unwrap + trim） | ✅（单测：行内/跨行提取，两端包含语义） |
 | **Fork 到指定消息**：转写里带 seq 的消息下方「⎇ fork here」（`session/fork` 的 `atSeq`）；tab 右键仍是最近完成 turn | ✅（atSeq=5 实测返回新会话） |
+| **子代理树**：⇄ 面板按 `parentSessionId` DFS 到第 4 层，孙代缩进 + L 层标 | ✅ |
 
 **dsh 的单写者模型**（踩到的坑）：一个会话同时只能有一个写句柄。
 浏览器里开着这个会话时，GUI 发 `session/prompt` 会得到
@@ -211,8 +212,8 @@ slash 命令面板、附件上传、目标横幅、日程面板、workspace 状�
 - 日程：标题栏 ⏱ 打开当前会话的提醒列表（`schedule/catalog` 全量按 sessionId 过滤），
   可看投递历史、删除；`schedule/changed` 时自动刷新。创建提醒由 agent 的
   `schedule_create` 工具完成（协议没有给客户端的创建端点）。
-- 子代理：标题栏 ⇄ 列出当前会话派生的子会话（`session/list` 的 `parentSessionId`），
-  选中后可发消息（queue）/ 打断；不显示孙代理。
+- 子代理：标题栏 ⇄ 列出当前会话派生的后代树（`session/list` 的 `parentSessionId`，
+  DFS 到第 4 层，孙代缩进 + L 层标），选中后可发消息（queue）/ 打断。
 - 终端：Ctrl+F 打开回滚搜索条（ghostty 的 search API，覆盖主/副屏与 scrollback；
   Enter 向旧、Shift+Enter 向新、显示 k/n，Esc 关闭并回底部）；滚轮和
   Shift+PageUp/PageDown 滚动视口；Ctrl+Shift+V 粘贴——图片用 kitty 图形协议
