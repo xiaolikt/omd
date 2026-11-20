@@ -2924,7 +2924,11 @@ struct Root {
     archive_pending: Option<String>,
     /// 待发送的附件（输入框上方 chips）
     attachments: Vec<PendingAttachment>,
-    /// 附件 id 计数器
+    /// 当前会话的 goal（goals/get 的结果；Null = 没有）
+    goal_doc: Value,
+    /// goal 目标编辑框 + 是否在编辑
+    goal_input: Entity<InputState>,
+    goal_editing: bool,    /// 附件 id 计数器
     attach_seq: u64,
     /// 消息反馈的本地状态：messageId → 反馈项
     feedback: std::collections::HashMap<String, FeedbackState>,
@@ -2980,6 +2984,8 @@ struct Root {
     _market_sub: Subscription,
     /// 手动安装 spec 输入框的回车订阅
     _spec_sub: Subscription,
+    /// goal 目标输入框的回车订阅
+    _goal_sub: Subscription,
 }
 
 async fn serve_control(
@@ -3691,6 +3697,15 @@ impl Root {
         let plugin_spec_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("npm name, git URL, path or tarball…")
         });
+        let goal_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("What should this session achieve?"));
+        let goal_sub = cx.subscribe(&goal_input, |this, _entity, ev: &InputEvent, cx| {
+            if let InputEvent::PressEnter { shift, .. } = ev {
+                if !*shift {
+                    this.commit_goal_edit(cx);
+                }
+            }
+        });
         let spec_sub = cx.subscribe(&plugin_spec_input, |this, _entity, ev: &InputEvent, cx| {
             if let InputEvent::PressEnter { .. } = ev {
                 let spec = this.plugin_spec_input.read(cx).value().trim().to_string();
@@ -4011,6 +4026,10 @@ impl Root {
             _enter_sub: enter_sub,
             _market_sub: market_sub,
             _spec_sub: spec_sub,
+            _goal_sub: goal_sub,
+            goal_doc: Value::Null,
+            goal_input,
+            goal_editing: false,
             plugin_spec_input,
             inspect_pending: None,
         };
@@ -4477,6 +4496,9 @@ impl Root {
                     args: json!({ "agentId": session_id.clone() }),
                 });
                 self.selected = Some(session_id);
+                self.goal_doc = Value::Null;
+                self.goal_editing = false;
+                self.reload_goal();
                 self.followed_once = true;
                 self.save_state();
                 self.items.clear();
@@ -4774,6 +4796,12 @@ impl Root {
                         }
                         "commands/list" => {
                             self.slash_commands = value.as_array().cloned().unwrap_or_default();
+                        }
+                        "goals/get" => {
+                            self.goal_doc = value;
+                        }
+                        "goals/mutate" => {
+                            self.reload_goal();
                         }
                         "session/search" => {
                             self.search_error = None;
@@ -7143,6 +7171,101 @@ impl Root {
     /// 打开系统文件选择框（结果异步回到 Ev::FilesPicked）。
     fn pick_attachments(&mut self) {
         let _ = self.cmds.send_blocking(Cmd::PickFiles);
+    }
+
+    /// 拉当前会话的 goal。
+    fn reload_goal(&mut self) {
+        let Some(agent_id) = self.selected.clone() else {
+            self.goal_doc = Value::Null;
+            return;
+        };
+        if is_file_panel(&agent_id) || self.term_tabs.contains(&agent_id) {
+            self.goal_doc = Value::Null;
+            return;
+        }
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "goals/get".to_string(),
+            endpoint: "goals/get".to_string(),
+            args: json!({ "agentId": agent_id }),
+        });
+    }
+
+    /// goal 变更（pause/resume/complete/clear）。
+    fn goal_action(&mut self, action: &str) {
+        let (Some(agent_id), Some(goal)) = (self.selected.clone(), self.goal_doc.as_object()) else {
+            return;
+        };
+        let (Some(id), Some(revision)) = (
+            goal.get("id").and_then(|v| v.as_str()),
+            goal.get("revision").and_then(|v| v.as_u64()),
+        ) else {
+            return;
+        };
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "goals/mutate".to_string(),
+            endpoint: format!("goals/{action}"),
+            args: json!({
+                "agentId": agent_id,
+                "ref": { "id": id, "revision": revision },
+            }),
+        });
+    }
+
+    /// 开始编辑 goal 目标（有 goal = 改，没有 = 建）。
+    fn open_goal_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self
+            .goal_doc
+            .get("objective")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        self.goal_input
+            .update(cx, |state, cx| state.set_value(current, window, cx));
+        self.goal_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        self.goal_editing = true;
+        cx.notify();
+    }
+
+    /// 提交 goal 编辑：已有 goal → goals/edit，没有 → goals/create。
+    fn commit_goal_edit(&mut self, cx: &mut Context<Self>) {
+        let objective = self.goal_input.read(cx).value().trim().to_string();
+        if objective.is_empty() {
+            self.goal_editing = false;
+            cx.notify();
+            return;
+        }
+        let Some(agent_id) = self.selected.clone() else {
+            return;
+        };
+        if is_file_panel(&agent_id) || self.term_tabs.contains(&agent_id) {
+            return;
+        }
+        let existing = (
+            self.goal_doc.get("id").and_then(|v| v.as_str()).map(str::to_string),
+            self.goal_doc.get("revision").and_then(|v| v.as_u64()),
+        );
+        let call = match existing {
+            (Some(id), Some(revision)) => Cmd::Call {
+                tag: "goals/mutate".to_string(),
+                endpoint: "goals/edit".to_string(),
+                args: json!({
+                    "agentId": agent_id,
+                    "ref": { "id": id, "revision": revision },
+                    "request": { "objective": objective },
+                }),
+            },
+            _ => Cmd::Call {
+                tag: "goals/mutate".to_string(),
+                endpoint: "goals/create".to_string(),
+                args: json!({ "agentId": agent_id, "request": { "objective": objective } }),
+            },
+        };
+        self.goal_editing = false;
+        let _ = self.cmds.send_blocking(call);
+        cx.notify();
     }
 
     /// 把一批路径变成待发送附件：图片内联，其它先上传换 receipt。
@@ -9577,6 +9700,14 @@ impl Root {
     }
 
     fn handle_event(&mut self, frame: &Value) {
+        // goal 变了（create/edit/pause/resume/complete/block/clear）：重新拉一份
+        let kind = frame
+            .pointer("/event/type")
+            .or_else(|| frame.get("type"))
+            .and_then(|v| v.as_str());
+        if kind == Some("goal/change") {
+            self.reload_goal();
+        }
         if let Some(config) = frame.pointer("/data/header/config") {
             if let Some(provider) = config.get("provider").and_then(|v| v.as_str()) {
                 self.current_provider = provider.to_string();
@@ -14893,6 +15024,266 @@ impl Render for Root {
 
         // size_full 而不是 flex_1：外层 split 的子容器不是 flex，
         // flex_1 在里面不生效，高度会塌成内容高度（正文只画几行）。
+        // goal 横幅：有 goal 显示目标/阶段/轮次 + 操作；没有就给一个 "＋ goal"
+        let goal_banner: AnyElement = {
+            let goal = self.goal_doc.clone();
+            let objective = goal
+                .get("objective")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let phase = goal
+                .get("phase")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let rounds = goal
+                .get("roundsStarted")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let max_rounds = goal
+                .get("maxGoalRounds")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if self.goal_editing {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .mx(px(16.))
+                    .mt(px(8.))
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded(px(8.))
+                    .bg(rgb(0x151a23))
+                    .border_1()
+                    .border_color(rgb(0x2f6fb5))
+                    .child(div().text_xs().text_color(rgb(0x7fb5e8)).child("goal"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(
+                                Input::new(&self.goal_input)
+                                    .bordered(false)
+                                    .appearance(false)
+                                    .focus_bordered(false)
+                                    .text_sm(),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("goal-edit-cancel")
+                            .px(px(8.))
+                            .py(px(3.))
+                            .text_xs()
+                            .text_color(rgb(0x9ca3b0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x20232b)))
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _ev, win, cx| {
+                                this.goal_editing = false;
+                                this.input.read(cx).focus_handle(cx).focus(win, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("goal-edit-save")
+                            .px(px(10.))
+                            .py(px(3.))
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(rgb(0x2f6fb5))
+                            .text_xs()
+                            .text_color(rgb(0x7fb5e8))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x16222f)))
+                            .child("Save")
+                            .on_click(cx.listener(move |this, _ev, win, cx| {
+                                this.commit_goal_edit(cx);
+                                this.input.read(cx).focus_handle(cx).focus(win, cx);
+                            })),
+                    )
+                    .into_any_element()
+            } else if objective.is_empty() {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .mx(px(16.))
+                    .mt(px(8.))
+                    .child(
+                        div()
+                            .id("goal-create")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(5.))
+                            .px(px(8.))
+                            .py(px(3.))
+                            .rounded(px(6.))
+                            .text_xs()
+                            .text_color(rgb(0x6b7386))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x1b1e26)).text_color(rgb(0xc9d1de)))
+                            .child("◎ goal")
+                            .on_click(cx.listener(|this, _ev, win, cx| {
+                                this.open_goal_edit(win, cx);
+                            })),
+                    )
+                    .into_any_element()
+            } else {
+                let (phase_color, phase_label) = match phase.as_str() {
+                    "active" => (0x3f8f5f, "active"),
+                    "paused" => (0xb5812f, "paused"),
+                    "blocked" => (0xff5663, "blocked"),
+                    "complete" => (0x51637e, "complete"),
+                    _ => (0x51637e, phase.as_str()),
+                };
+                let blocked = goal
+                    .pointer("/blockedReason/message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .mx(px(16.))
+                    .mt(px(8.))
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded(px(8.))
+                    .bg(rgb(0x151a23))
+                    .border_1()
+                    .border_color(rgb(0x222836))
+                    .child(div().text_xs().text_color(rgb(phase_color)).child("◎"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_xs()
+                            .text_color(rgb(0xd7dce6))
+                            .child(SharedString::from(objective)),
+                    )
+                    .children(if blocked.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            div()
+                                .max_w(px(240.))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_xs()
+                                .text_color(rgb(0xff8a97))
+                                .child(SharedString::from(blocked)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(phase_color))
+                            .child(SharedString::from(format!(
+                                "{phase_label} · {rounds}/{max_rounds}"
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .id("goal-edit")
+                            .px(px(6.))
+                            .py(px(2.))
+                            .text_xs()
+                            .text_color(rgb(0x9ca3b0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x20232b)))
+                            .child("✎")
+                            .on_click(cx.listener(|this, _ev, win, cx| {
+                                this.open_goal_edit(win, cx);
+                            })),
+                    )
+                    .children(if matches!(phase.as_str(), "active" | "blocked") {
+                        Some(
+                            div()
+                                .id("goal-pause")
+                                .px(px(6.))
+                                .py(px(2.))
+                                .text_xs()
+                                .text_color(rgb(0xb5812f))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(0x20232b)))
+                                .child("⏸")
+                                .on_click(cx.listener(|this, _ev, _win, cx| {
+                                    this.goal_action("pause");
+                                    cx.notify();
+                                })),
+                        )
+                    } else {
+                        None
+                    })
+                    .children(if phase == "paused" {
+                        Some(
+                            div()
+                                .id("goal-resume")
+                                .px(px(6.))
+                                .py(px(2.))
+                                .text_xs()
+                                .text_color(rgb(0x3f8f5f))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(0x20232b)))
+                                .child("▶")
+                                .on_click(cx.listener(|this, _ev, _win, cx| {
+                                    this.goal_action("resume");
+                                    cx.notify();
+                                })),
+                        )
+                    } else {
+                        None
+                    })
+                    .children(if phase != "complete" {
+                        Some(
+                            div()
+                                .id("goal-complete")
+                                .px(px(6.))
+                                .py(px(2.))
+                                .text_xs()
+                                .text_color(rgb(0x7fb5e8))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(0x20232b)))
+                                .child("✓")
+                                .on_click(cx.listener(|this, _ev, _win, cx| {
+                                    this.goal_action("complete");
+                                    cx.notify();
+                                })),
+                        )
+                    } else {
+                        None
+                    })
+                    .child(
+                        div()
+                            .id("goal-clear")
+                            .px(px(6.))
+                            .py(px(2.))
+                            .text_xs()
+                            .text_color(rgb(0x707786))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgb(0xff8a97)))
+                            .child("×")
+                            .on_click(cx.listener(|this, _ev, _win, cx| {
+                                this.goal_action("clear");
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element()
+            }
+        };
+
         let chat_panel = div()
             .relative()
             .flex()
@@ -14902,6 +15293,7 @@ impl Render for Root {
             .min_w(px(0.))
             .bg(rgb(0x101319))
             .child(chat_panel_head)
+            .child(goal_banner)
             .child(transcript)
             .children(leaf0_composer)
             .children(

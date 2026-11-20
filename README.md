@@ -64,6 +64,7 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 | **会话管理**：tab 右键 → Fork（`session/fork`）/ 置顶（`workspace/pinSession·unpinSession`）/ 归档（`workspace/archiveSession`） | ✅ |
 | **Slash 命令**：`commands/list` 进命令面板；输入框以已知 `/命令` 开头发送时走 `commands/execute` | ✅ |
 | **附件**：📎 选择文件 / 拖进窗口 / Ctrl+V 粘贴图片；图片内联，其它文件走 `fileUploads/upload` 换 receipt | ✅（上传 + prompt content 实测通过） |
+| **目标（goal）**：`goals/get` 横幅 + create/edit/pause/resume/complete/clear | ✅（回填、CAS revision 实测） |
 
 **dsh 的单写者模型**（踩到的坑）：一个会话同时只能有一个写句柄。
 浏览器里开着这个会话时，GUI 发 `session/prompt` 会得到
@@ -177,7 +178,7 @@ strings ~/.local/bin/herdr-app  | grep gpui           # GPUI 自绘
 ## 状态
 
 M0–M2 完成，M3 进行中（文件/编辑器、插件管理与市场、消息反馈、会话 fork/置顶/归档、
-slash 命令面板、附件上传已接）。剩余：目标/日程/子代理面板、终端搜索/Kitty 图形、
+slash 命令面板、附件上传、目标横幅已接）。剩余：日程/子代理面板、终端搜索/Kitty 图形、
 跨重启的置顶状态（`workspace/follow`）。
 
 ### 插件页与 tab 菜单
@@ -192,3 +193,6 @@ slash 命令面板、附件上传已接）。剩余：目标/日程/子代理面
 - 附件：输入框左下 📎 打开系统文件框（zenity / kdialog），也可以把文件拖进窗口、
   或用 Ctrl+V 粘贴剪贴板里的图片。图片以 base64 内联；其它文件先 `fileUploads/upload`
   换 receipt，再以 `{type:"file",receiptId}` 进 prompt。上传未完成的附件会阻止发送。
+- 目标：消息区顶部一条 goal 横幅（目标、阶段、已用轮次/上限、阻塞原因），可直接
+  暂停/继续/完成/清除/改目标；没有 goal 时显示「◎ goal」入口。变更事件（`goal/change`）
+  会自动重新拉取，所有写操作都带 revision 做 CAS。
