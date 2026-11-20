@@ -360,6 +360,97 @@ impl Term {
         }
     }
 
+    /// 当前是否开了 bracketed paste（mode 2004）。
+    pub fn bracketed_paste(&self) -> bool {
+        unsafe {
+            let mut config = GhosttyModeConfig {
+                mode: MODE_BRACKETED_PASTE,
+                value: false,
+            };
+            if ghostty_terminal_get(
+                self.terminal,
+                TERM_DATA_MODE,
+                &mut config as *mut _ as *mut c_void,
+            ) == GHOSTTY_SUCCESS
+            {
+                config.value
+            } else {
+                false
+            }
+        }
+    }
+
+    /// 文本粘贴：按当前 bracketed 模式编码成要写进 PTY 的字节。
+    pub fn paste_text(&self, text: &str) -> Vec<u8> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let bracketed = self.bracketed_paste();
+        let mut data = text.as_bytes().to_vec();
+        unsafe {
+            // 两次调用：先问需要多大
+            let mut needed = 0usize;
+            let rc = ghostty_paste_encode(
+                data.as_mut_ptr(),
+                data.len(),
+                bracketed,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+            let cap = if rc == 0 {
+                needed
+            } else {
+                // 没给尺寸就按 2 倍 + 32 估（含括号前后缀）
+                data.len() * 2 + 32
+            };
+            let mut buf = vec![0u8; cap + 1];
+            let mut written = 0usize;
+            let rc = ghostty_paste_encode(
+                data.as_mut_ptr(),
+                data.len(),
+                bracketed,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut written,
+            );
+            if rc == 0 {
+                buf.truncate(written);
+                buf
+            } else {
+                // 兜底：原样发
+                text.as_bytes().to_vec()
+            }
+        }
+    }
+
+    /// 图片粘贴：RGBA 像素走 kitty 图形协议喂给本地 VT（不进 PTY）。
+    pub fn paste_image_rgba(&mut self, width: u32, height: u32, rgba: &[u8]) {
+        use base64::Engine as _;
+        if width == 0 || height == 0 || rgba.len() < (width as usize) * (height as usize) * 4 {
+            return;
+        }
+        let b64 = base64::engine::general_purpose::STANDARD.encode(rgba);
+        const CHUNK: usize = 4096;
+        let total = b64.len();
+        let mut pos = 0usize;
+        let mut first = true;
+        while pos < total {
+            let end = (pos + CHUNK).min(total);
+            let more = end < total;
+            let m = if more { 1 } else { 0 };
+            let keys = if first {
+                format!("a=T,f=32,s={width},v={height},q=2,m={m}")
+            } else {
+                format!("m={m}")
+            };
+            let seq = format!("\x1b_G{keys};{}\x1b\\", &b64[pos..end]);
+            self.feed(&seq);
+            first = false;
+            pos = end;
+        }
+    }
+
     /// 读本帧所有可见 kitty 放置。像素按 generation 缓存，没变就不重新上传。
     unsafe fn collect_images(&mut self) {
         self.placed.clear();
@@ -783,6 +874,33 @@ mod tests {
         term.search_clear();
         let (total, _) = term.search_counts();
         assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn paste_text_follows_bracketed_mode() {
+        let mut term = Term::new(40, 6).expect("ghostty");
+        // 没开 bracketed：换行要变 CR，无包裹
+        let plain = term.paste_text("a\nb");
+        assert_eq!(plain, b"a\rb", "plain paste: {plain:?}");
+        // 开了 bracketed（mode 2004）：加 xterm 标准前后缀（CSI 200~ / 201~）
+        term.feed("\x1b[?2004h");
+        let bracketed = term.paste_text("a\nb");
+        assert_eq!(bracketed, b"\x1b[200~a\nb\x1b[201~", "bracketed: {bracketed:?}");
+    }
+
+    #[test]
+    fn paste_image_places_kitty_graphics() {
+        let mut term = Term::new(40, 12).expect("ghostty");
+        // 3×2 RGBA 渐变块
+        let mut rgba = Vec::new();
+        for y in 0..2u8 {
+            for x in 0..3u8 {
+                rgba.extend_from_slice(&[x * 40, y * 80, 0x80, 0xff]);
+            }
+        }
+        term.paste_image_rgba(3, 2, &rgba);
+        let _ = term.render_rows();
+        assert_eq!(term.images().len(), 1, "pasted image must be placed");
     }
 
     #[test]

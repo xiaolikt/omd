@@ -70,6 +70,7 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 | **子代理**：⇄ 面板列出 `parentSessionId` 子会话，可打断（`subagents/interruptByParent`）、追问（`subagents/prompt`） | ✅（参数实测） |
 | **终端搜索/回滚**：Ctrl+F 搜 scrollback（Enter 下一个 / Shift+Enter 上一个 / k·n 计数），滚轮与 Shift+PageUp·Down 滚动视口 | ✅（单测：30 行回滚定位 + 视口滚动） |
 | **长会话分页**：follow snapshot 的 `hasMore` → 「load older messages」按 `session/page`（throughSeq/beforeSeq）补页 | ✅（分页参数实测：seq 0–24 按序返回） |
+| **终端粘贴**：Ctrl+Shift+V——剪贴板有图走 kitty 图形协议本地显示（不进 PTY），文本按 bracketed paste 编码（`ghostty_paste_encode`） | ✅（单测：分块传输 + 200~ 包裹） |
 
 **dsh 的单写者模型**（踩到的坑）：一个会话同时只能有一个写句柄。
 浏览器里开着这个会话时，GUI 发 `session/prompt` 会得到
@@ -183,7 +184,7 @@ strings ~/.local/bin/herdr-app  | grep gpui           # GPUI 自绘
 
 M0–M2 完成，M3 进行中（文件/编辑器、插件管理与市场、消息反馈、会话 fork/置顶/归档、
 slash 命令面板、附件上传、目标横幅、日程面板、workspace 状态流、子代理面板、终端
-搜索/回滚、长会话分页已接）。剩余：终端粘贴图片。
+搜索/回滚、长会话分页、终端粘贴已接）。
 
 ### 插件页与 tab 菜单
 
@@ -207,6 +208,8 @@ slash 命令面板、附件上传、目标横幅、日程面板、workspace 状�
   选中后可发消息（queue）/ 打断；不显示孙代理。
 - 终端：Ctrl+F 打开回滚搜索条（ghostty 的 search API，覆盖主/副屏与 scrollback；
   Enter 向旧、Shift+Enter 向新、显示 k/n，Esc 关闭并回底部）；滚轮和
-  Shift+PageUp/PageDown 滚动视口。
+  Shift+PageUp/PageDown 滚动视口；Ctrl+Shift+V 粘贴——图片用 kitty 图形协议
+  （RGBA 分块 APC，本地显示，字节不进 PTY），文本按 mode 2004 编码（bracketed
+  前后缀 / 换行转 CR）。
 - 置顶/归档来自 `workspace/follow`（启动时 baseline + `pinned`/`archived` 增量），
   重启后仍然生效；归档的会话从侧栏过滤掉。

@@ -87,6 +87,18 @@ pub const SEARCH_DATA_STATUS: c_int = 1;
 pub const SEARCH_DATA_TOTAL_MATCHES: c_int = 3;
 pub const SEARCH_DATA_SELECTED_INDEX: c_int = 4;
 
+// GhosttyTerminalData::MODE（查询终端模式；GhosttyTerminalModeConfig）
+pub const TERM_DATA_MODE: c_int = 37;
+/// ghostty_mode_new(2004, false)：DEC private 的 bracketed paste
+pub const MODE_BRACKETED_PASTE: u16 = 2004;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyModeConfig {
+    pub mode: u16,
+    pub value: bool,
+}
+
 // GhosttyRenderStateData::COLOR_PALETTE（调色板查询）
 pub const RS_DATA_COLOR_PALETTE: c_int = 9;
 
@@ -212,6 +224,16 @@ extern "C" {
     pub fn ghostty_terminal_scroll_viewport(
         terminal: GhosttyTerminal,
         behavior: GhosttyScrollViewport,
+    ) -> c_int;
+
+    // 文本粘贴编码（按 bracketed paste 模式）
+    pub fn ghostty_paste_encode(
+        data: *mut u8,
+        data_len: usize,
+        bracketed: bool,
+        buf: *mut u8,
+        buf_len: usize,
+        out_written: *mut usize,
     ) -> c_int;
 
     // render state

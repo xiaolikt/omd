@@ -7511,6 +7511,54 @@ impl Root {
         cx.notify();
     }
 
+    /// 终端粘贴（Ctrl+Shift+V）：剪贴板里有图就贴图（kitty 协议，本地显示），
+    /// 有文本就按 bracketed 模式编码后写 PTY。返回是否处理了。
+    fn term_paste(&mut self, pane_id: u64, cx: &mut Context<Self>) -> bool {
+        let Some(item) = cx.read_from_clipboard() else {
+            return false;
+        };
+        let entries: Vec<_> = item.entries().to_vec();
+        // 图片优先
+        for entry in &entries {
+            let ClipboardEntry::Image(image) = entry else {
+                continue;
+            };
+            if let Some(frame) = image::load_from_memory(&image.bytes).ok() {
+                let rgba = frame.to_rgba8();
+                let (width, height) = (rgba.width(), rgba.height());
+                if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) {
+                    if let Some(term) = pane.term.as_mut() {
+                        term.paste_image_rgba(width, height, rgba.as_raw());
+                        pane.screen = term.render_rows();
+                        pane.images = term.images().to_vec();
+                        cx.notify();
+                        return true;
+                    }
+                }
+            }
+        }
+        // 文本粘贴
+        if let Some(text) = item.text() {
+            if text.is_empty() {
+                return false;
+            }
+            if let Some(pane) = self.panes.iter().find(|pane| pane.id == pane_id) {
+                if !pane.term_id.is_empty() {
+                    let term_id = pane.term_id.clone();
+                    if let Some(term) = pane.term.as_ref() {
+                        let bytes = term.paste_text(&text);
+                        if !bytes.is_empty() {
+                            let data = String::from_utf8_lossy(&bytes).to_string();
+                            let _ = self.cmds.send_blocking(Cmd::TerminalInput { term_id, data });
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// 往前翻一页旧消息（session/page）。
     fn load_older_messages(&mut self, cx: &mut Context<Self>) {
         let Some(session_id) = self.selected.clone() else {
@@ -12728,6 +12776,13 @@ fn pane_element(
                 if ctrl && ev.keystroke.key == "f" {
                     this.term_find_open(pane_id, win, cx);
                     cx.stop_propagation();
+                    return;
+                }
+                // Ctrl/Cmd+Shift+V：终端粘贴（图片走 kitty 图形，文本走 bracketed paste）
+                if ctrl && ev.keystroke.modifiers.shift && ev.keystroke.key == "v" {
+                    if this.term_paste(pane_id, cx) {
+                        cx.stop_propagation();
+                    }
                     return;
                 }
                 // Shift+PageUp/PageDown：滚回滚（不进 PTY）
