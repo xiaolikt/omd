@@ -2682,6 +2682,17 @@ struct FeedbackState {
     version: String,
 }
 
+/// 终端回滚搜索条：一个终端 pane 一份。
+struct TermFind {
+    pane_id: u64,
+    input: Entity<InputState>,
+    /// 上次提交的搜索词（变了才重设 needle）
+    query: String,
+    index: usize,
+    total: usize,
+    _sub: Subscription,
+}
+
 /// 待发送的附件（图片内联、其他文件先 staging 成 receipt）。
 #[derive(Clone, Debug)]
 struct PendingAttachment {
@@ -3031,6 +3042,8 @@ struct Root {
     _goal_sub: Subscription,
     /// 子代理消息输入框的回车订阅
     _subagent_sub: Subscription,
+    /// 终端回滚搜索（Ctrl+F 打开）
+    term_find: Option<TermFind>,
 }
 
 async fn serve_control(
@@ -4094,6 +4107,7 @@ impl Root {
             subagent_target: None,
             subagent_input,
             subagent_clear: false,
+            term_find: None,
             _subagent_sub: subagent_sub,
             plugin_spec_input,
             inspect_pending: None,
@@ -7361,6 +7375,126 @@ impl Root {
         });
     }
 
+    /// 打开某个终端 pane 的回滚搜索条。
+    fn term_find_open(&mut self, pane_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if !self
+            .panes
+            .iter()
+            .any(|pane| pane.id == pane_id && pane.term.is_some())
+        {
+            return;
+        }
+        if let Some(find) = &self.term_find {
+            if find.pane_id == pane_id {
+                find.input.read(cx).focus_handle(cx).focus(window, cx);
+                return;
+            }
+        }
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Find in scrollback…")
+        });
+        let sub = cx.subscribe(&input, |this, _entity, ev: &InputEvent, cx| {
+            if let InputEvent::PressEnter { shift, .. } = ev {
+                this.term_find_step(*shift, cx);
+            }
+        });
+        self.term_find = Some(TermFind {
+            pane_id,
+            input,
+            query: String::new(),
+            index: 0,
+            total: 0,
+            _sub: sub,
+        });
+        if let Some(find) = &self.term_find {
+            find.input.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Enter：下一个（更旧）；Shift+Enter：上一个。查询词变了就重设并先跑一遍。
+    fn term_find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some((pane_id, query)) = self.term_find.as_ref().map(|find| {
+            (
+                find.pane_id,
+                find.input.read(cx).value().trim().to_string(),
+            )
+        }) else {
+            return;
+        };
+        let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) else {
+            self.term_find = None;
+            cx.notify();
+            return;
+        };
+        let Some(term) = pane.term.as_mut() else {
+            self.term_find = None;
+            cx.notify();
+            return;
+        };
+        if query.is_empty() {
+            if let Some(find) = self.term_find.as_mut() {
+                find.total = 0;
+                find.index = 0;
+            }
+            cx.notify();
+            return;
+        }
+        let changed = self
+            .term_find
+            .as_ref()
+            .is_some_and(|find| query != find.query);
+        if changed {
+            term.search_set_needle(&query);
+            term.search_run();
+        }
+        let hit = term.search_select(forward);
+        pane.screen = term.render_rows();
+        pane.images = term.images().to_vec();
+        let (index, total) = hit.map(|(i, t)| (i + 1, t)).unwrap_or((0, 0));
+        if let Some(find) = self.term_find.as_mut() {
+            find.query = query;
+            find.index = index;
+            find.total = total;
+        }
+        cx.notify();
+    }
+
+    /// 滚一个终端 pane 的视口并重绘。
+    fn term_scroll(&mut self, pane_id: u64, delta: isize, cx: &mut Context<Self>) {
+        if delta == 0 {
+            return;
+        }
+        if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) {
+            if let Some(term) = pane.term.as_mut() {
+                term.scroll_rows(delta);
+                pane.screen = term.render_rows();
+                pane.images = term.images().to_vec();
+                cx.notify();
+            }
+        }
+    }
+
+    /// 关掉搜索条（清 needle，焦点回终端）。
+    fn term_find_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(find) = self.term_find.take() {
+            if let Some(pane) = self
+                .panes
+                .iter_mut()
+                .find(|pane| pane.id == find.pane_id)
+            {
+                if let Some(term) = pane.term.as_mut() {
+                    term.search_clear();
+                    term.scroll_to_bottom();
+                    pane.screen = term.render_rows();
+                    pane.images = term.images().to_vec();
+                }
+                pane.focus.focus(window, cx);
+            }
+            cx.notify();
+        }
+    }
+
     /// 给选中的子代理发一条消息（排队到下一轮）。
     fn send_subagent_prompt(&mut self, cx: &mut Context<Self>) {
         let text = self.subagent_input.read(cx).value().trim().to_string();
@@ -9554,6 +9688,11 @@ impl Root {
     ) -> bool {
         let ctrl = keystroke.modifiers.control || keystroke.modifiers.platform;
         let key = keystroke.key.as_str();
+        // 终端搜索条开着时：Esc 关掉，焦点回终端
+        if self.term_find.is_some() && key == "escape" {
+            self.term_find_close(window, cx);
+            return true;
+        }
         // 命令面板里：输入变了就顺带查一次全库搜索
         if self.show_palette {
             let query = self.palette_input.read(cx).value().trim().to_string();
@@ -12332,6 +12471,8 @@ fn pane_element(
     split_menu: Option<SplitDir>,
     media: Option<(String, MediaKind, Option<Arc<RenderImage>>)>,
     images: Vec<PlacedImage>,
+    // 打开中的回滚搜索条（输入框 + 当前序号/总数）
+    find: Option<(Entity<InputState>, usize, usize)>,
     cx: &mut Context<Root>,
 ) -> AnyElement {
     let el = div()
@@ -12343,6 +12484,9 @@ fn pane_element(
         .size_full()
         .bg(rgb(0x101319));
     let focus_click = focus.clone();
+    // 滚轮回滚用：wheel 监听需要自己的 term_id 拷贝
+    let term_id_wheel = term_id.clone();
+    let wheel_pane_id = pane_id;
     el.child(
         div()
             .id(SharedString::from(format!("pane-head-{pane_id}")))
@@ -12482,7 +12626,30 @@ fn pane_element(
             .text_color(rgb(0xe8ecf4))
             .relative()
             .track_focus(&focus)
-            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _win, cx| {
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, win, cx| {
+                // Ctrl/Cmd+F：开本 pane 的回滚搜索条（不再发给 PTY）
+                let ctrl = ev.keystroke.modifiers.control || ev.keystroke.modifiers.platform;
+                if ctrl && ev.keystroke.key == "f" {
+                    this.term_find_open(pane_id, win, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                // Shift+PageUp/PageDown：滚回滚（不进 PTY）
+                if ev.keystroke.modifiers.shift
+                    && matches!(ev.keystroke.key.as_str(), "pageup" | "pagedown")
+                {
+                    let page = this
+                        .panes
+                        .iter()
+                        .find(|pane| pane.id == pane_id)
+                        .and_then(|pane| pane.term.as_ref())
+                        .map(|term| term.dims().1.max(1) as isize)
+                        .unwrap_or(10);
+                    let delta = if ev.keystroke.key == "pageup" { -page } else { page };
+                    this.term_scroll(pane_id, delta, cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 if let Some(term_id) = term_id.as_deref() {
                     let sent = this.send_terminal_key(term_id, &ev.keystroke, cx);
                     eprintln!(
@@ -12504,7 +12671,110 @@ fn pane_element(
                     cx.stop_propagation();
                 }),
             )
+            .on_scroll_wheel(
+                cx.listener(move |this, ev: &ScrollWheelEvent, _win, cx| {
+                    // 终端 pane 的滚轮 = 滚回滚（外层容器不再滚动）
+                    if term_id_wheel.is_some() {
+                        let rows = match ev.delta {
+                            ScrollDelta::Pixels(delta) => (f32::from(delta.y) / CELL_H as f32) as isize,
+                            ScrollDelta::Lines(delta) => f32::from(delta.y).round() as isize,
+                        };
+                        if rows != 0 {
+                            this.term_scroll(wheel_pane_id, rows, cx);
+                            cx.stop_propagation();
+                        }
+                    }
+                }),
+            )
             .children(term_rows(&screen))
+            .children(find.map(|(input, index, total)| {
+                // 回滚搜索条：右上角浮层
+                div()
+                    .absolute()
+                    .top(px(6.))
+                    .right(px(10.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.))
+                    .px(px(6.))
+                    .py(px(3.))
+                    .rounded(px(6.))
+                    .bg(rgb(0x151a23))
+                    .border_1()
+                    .border_color(rgb(0x2c3340))
+                    .shadow_lg()
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        div()
+                            .w(px(180.))
+                            .child(
+                                Input::new(&input)
+                                    .bordered(false)
+                                    .appearance(false)
+                                    .focus_bordered(false)
+                                    .text_xs(),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(if total == 0 { rgb(0xff8a97) } else { rgb(0x9ca3b0) })
+                            .min_w(px(52.))
+                            .flex()
+                            .justify_center()
+                            .child(SharedString::from(if total == 0 {
+                                "no hits".to_string()
+                            } else {
+                                format!("{index}/{total}")
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(format!("term-find-prev-{pane_id}"))
+                            .px(px(6.))
+                            .py(px(2.))
+                            .text_xs()
+                            .text_color(rgb(0x9ca3b0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x20232b)))
+                            .child("↑")
+                            .on_click(cx.listener(|this, _ev, _win, cx| {
+                                this.term_find_step(false, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(format!("term-find-next-{pane_id}"))
+                            .px(px(6.))
+                            .py(px(2.))
+                            .text_xs()
+                            .text_color(rgb(0x9ca3b0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x20232b)))
+                            .child("↓")
+                            .on_click(cx.listener(|this, _ev, _win, cx| {
+                                this.term_find_step(true, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(format!("term-find-close-{pane_id}"))
+                            .px(px(6.))
+                            .py(px(2.))
+                            .text_xs()
+                            .text_color(rgb(0x707786))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgb(0xff8a97)))
+                            .child("×")
+                            .on_click(cx.listener(|this, _ev, win, cx| {
+                                this.term_find_close(win, cx);
+                            })),
+                    )
+            }))
             .children(images.into_iter().map(|placed| {
                 let pad = 8.;
                 div()
@@ -20425,6 +20695,15 @@ impl Render for Root {
                         .map(|name| name.to_string_lossy().to_string())
                 })
                 .unwrap_or_else(|| "terminal".to_string());
+            let term_find_info = self.term_find.as_ref().filter(|find| find.pane_id == pane_id).map(
+                |find| {
+                    (
+                        find.input.clone(),
+                        find.index,
+                        find.total,
+                    )
+                },
+            );
             leaf_elements.insert(
                 pane_id,
                 pane_element(
@@ -20439,6 +20718,7 @@ impl Render for Root {
                     split_menu,
                     media,
                     images,
+                    term_find_info,
                     cx,
                 ),
             );

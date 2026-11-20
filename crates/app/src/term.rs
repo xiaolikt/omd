@@ -53,6 +53,8 @@ pub struct Term {
     images_iter: GhosttyRenderStateImageIterator,
     image_cache: HashMap<(u32, u64), Arc<RenderImage>>,
     placed: Vec<PlacedImage>,
+    /// 回滚搜索（懒创建）
+    search: GhosttySearch,
 }
 
 unsafe impl Send for Term {}
@@ -96,6 +98,7 @@ impl Term {
                 images_iter,
                 image_cache: HashMap::new(),
                 placed: Vec::new(),
+                search: std::ptr::null_mut(),
             })
         }
     }
@@ -230,6 +233,131 @@ impl Term {
 
     pub fn images(&self) -> &[PlacedImage] {
         &self.placed
+    }
+
+    /// 设置搜索词（空 = 清除）。不跑搜索，等 next/prev 或 run。
+    pub fn search_set_needle(&mut self, needle: &str) {
+        if self.search.is_null() {
+            unsafe {
+                let mut search: GhosttySearch = std::ptr::null_mut();
+                if ghostty_search_new(std::ptr::null(), &mut search, self.terminal)
+                    != GHOSTTY_SUCCESS
+                {
+                    return;
+                }
+                self.search = search;
+            }
+        }
+        let value = if needle.is_empty() {
+            GhosttyString {
+                ptr: std::ptr::null(),
+                len: 0,
+            }
+        } else {
+            GhosttyString {
+                ptr: needle.as_ptr(),
+                len: needle.len(),
+            }
+        };
+        unsafe {
+            ghostty_search_set(self.search, SEARCH_OPT_NEEDLE, &value as *const _ as *const c_void);
+        }
+    }
+
+    /// 跑完当前搜索（阻塞式；滚动区大时会慢，但我们的量级可接受）。
+    pub fn search_run(&mut self) {
+        if !self.search.is_null() {
+            unsafe { ghostty_search_run(self.search) };
+        }
+    }
+
+    /// 跳到下一个（更旧）匹配；会滚动视口。返回 (选中序号, 总数)，没有匹配返回 None。
+    pub fn search_select(&mut self, forward: bool) -> Option<(usize, usize)> {
+        if self.search.is_null() {
+            return None;
+        }
+        unsafe {
+            let rc = if forward {
+                ghostty_search_select_next(self.search)
+            } else {
+                ghostty_search_select_prev(self.search)
+            };
+            if rc != GHOSTTY_SUCCESS {
+                return None;
+            }
+            let mut total = 0usize;
+            let _ = ghostty_search_get(
+                self.search,
+                SEARCH_DATA_TOTAL_MATCHES,
+                &mut total as *mut _ as *mut c_void,
+            );
+            let mut index = 0usize;
+            let got = ghostty_search_get(
+                self.search,
+                SEARCH_DATA_SELECTED_INDEX,
+                &mut index as *mut _ as *mut c_void,
+            );
+            if got == GHOSTTY_SUCCESS {
+                Some((index, total))
+            } else {
+                Some((0, total))
+            }
+        }
+    }
+
+    /// 当前搜索计数（不移动选择）。
+    pub fn search_counts(&mut self) -> (usize, Option<usize>) {
+        if self.search.is_null() {
+            return (0, None);
+        }
+        unsafe {
+            let mut total = 0usize;
+            let _ = ghostty_search_get(
+                self.search,
+                SEARCH_DATA_TOTAL_MATCHES,
+                &mut total as *mut _ as *mut c_void,
+            );
+            let mut index = 0usize;
+            let got = ghostty_search_get(
+                self.search,
+                SEARCH_DATA_SELECTED_INDEX,
+                &mut index as *mut _ as *mut c_void,
+            );
+            (total, if got == GHOSTTY_SUCCESS { Some(index) } else { None })
+        }
+    }
+
+    /// 选中匹配的文本行区间转成视口坐标（用于高亮）。v1：靠视口滚动 + 行级提示即可。
+    pub fn search_clear(&mut self) {
+        if !self.search.is_null() {
+            self.search_set_needle("");
+        }
+    }
+
+    /// 滚动视口：正 = 向新内容，负 = 向回滚。
+    pub fn scroll_rows(&mut self, delta: isize) {
+        unsafe {
+            ghostty_terminal_scroll_viewport(
+                self.terminal,
+                GhosttyScrollViewport {
+                    tag: SCROLL_VIEWPORT_DELTA,
+                    value: GhosttyScrollViewportValue { delta },
+                },
+            );
+        }
+    }
+
+    /// 视口回到底部（活动区）。
+    pub fn scroll_to_bottom(&mut self) {
+        unsafe {
+            ghostty_terminal_scroll_viewport(
+                self.terminal,
+                GhosttyScrollViewport {
+                    tag: SCROLL_VIEWPORT_BOTTOM,
+                    value: GhosttyScrollViewportValue { delta: 0 },
+                },
+            );
+        }
     }
 
     /// 读本帧所有可见 kitty 放置。像素按 generation 缓存，没变就不重新上传。
@@ -561,6 +689,7 @@ unsafe fn decode_kitty_image(
 impl Drop for Term {
     fn drop(&mut self) {
         unsafe {
+            ghostty_search_free(self.search);
             ghostty_render_state_image_iterator_free(self.images_iter);
             ghostty_render_state_row_cells_free(self.cells);
             ghostty_render_state_free(self.state);
@@ -627,6 +756,33 @@ mod tests {
         let images = term.images();
         assert_eq!(images.len(), 1, "expected one placement");
         assert!(images[0].w > 0 && images[0].h > 0);
+    }
+
+    #[test]
+    fn search_finds_scrollback_and_scrolls_viewport() {
+        let mut term = Term::new(40, 6).expect("ghostty");
+        for i in 0..30 {
+            term.feed(&format!("line-{i:02}\r\n"));
+        }
+        let _ = term.render_rows();
+        term.search_set_needle("line-03");
+        term.search_run();
+        let (total, _) = term.search_counts();
+        assert_eq!(total, 1, "expected exactly one match");
+        let hit = term.search_select(true);
+        assert_eq!(hit, Some((0, 1)), "match must be selected");
+        // 视口必须滚到匹配处：渲染出来的行里能看到 line-03
+        let rows = term.render_rows();
+        let text: String = rows
+            .iter()
+            .map(|row| row.iter().map(|span| span.text.as_str()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("line-03"), "viewport did not scroll: {text}");
+        // 清空搜索词后计数归零
+        term.search_clear();
+        let (total, _) = term.search_counts();
+        assert_eq!(total, 0);
     }
 
     #[test]

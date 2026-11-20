@@ -21,6 +21,7 @@ pub type GhosttyKeyEncoder = *mut c_void;
 pub type GhosttyKeyEvent = *mut c_void;
 pub type GhosttyKittyGraphics = *mut c_void;
 pub type GhosttyKittyGraphicsImage = *mut c_void;
+pub type GhosttySearch = *mut c_void;
 pub type GhosttyRenderStateImageIterator = *mut c_void;
 // GHOSTTY_MODS_* bits
 pub const GHOSTTY_MODS_SHIFT: u16 = 1;
@@ -79,6 +80,12 @@ pub const CELL_DATA_CODEPOINT: c_int = 1;
 
 // GhosttyRenderStateRowCellsData::STYLE
 pub const RS_CELLS_DATA_STYLE: c_int = 2;
+
+// GhosttySearchOption / GhosttySearchData
+pub const SEARCH_OPT_NEEDLE: c_int = 1;
+pub const SEARCH_DATA_STATUS: c_int = 1;
+pub const SEARCH_DATA_TOTAL_MATCHES: c_int = 3;
+pub const SEARCH_DATA_SELECTED_INDEX: c_int = 4;
 
 // GhosttyRenderStateData::COLOR_PALETTE（调色板查询）
 pub const RS_DATA_COLOR_PALETTE: c_int = 9;
@@ -145,6 +152,26 @@ pub struct GhosttyString {
     pub len: usize,
 }
 
+/// ghostty_terminal_scroll_viewport 的行为（tag + 值联合体）
+pub const SCROLL_VIEWPORT_TOP: i32 = 0;
+pub const SCROLL_VIEWPORT_BOTTOM: i32 = 1;
+pub const SCROLL_VIEWPORT_DELTA: i32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union GhosttyScrollViewportValue {
+    pub delta: isize,
+    pub row: usize,
+    pub _padding: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyScrollViewport {
+    pub tag: i32,
+    pub value: GhosttyScrollViewportValue,
+}
+
 extern "C" {
     // terminal
     pub fn ghostty_terminal_new(
@@ -163,6 +190,29 @@ extern "C" {
     ) -> c_int;
     pub fn ghostty_terminal_vt_write(terminal: GhosttyTerminal, data: *const u8, len: usize);
     pub fn ghostty_terminal_get(terminal: GhosttyTerminal, data: c_int, out: *mut c_void) -> c_int;
+
+    // search（含 scrollback；select 会滚动视口）
+    pub fn ghostty_search_new(
+        allocator: *const c_void,
+        out_search: *mut GhosttySearch,
+        terminal: GhosttyTerminal,
+    ) -> c_int;
+    pub fn ghostty_search_free(search: GhosttySearch);
+    pub fn ghostty_search_run(search: GhosttySearch) -> c_int;
+    pub fn ghostty_search_select_next(search: GhosttySearch) -> c_int;
+    pub fn ghostty_search_select_prev(search: GhosttySearch) -> c_int;
+    pub fn ghostty_search_set(
+        search: GhosttySearch,
+        option: c_int,
+        value: *const c_void,
+    ) -> c_int;
+    pub fn ghostty_search_get(search: GhosttySearch, data: c_int, out: *mut c_void) -> c_int;
+
+    // 视口滚动（scrollback）
+    pub fn ghostty_terminal_scroll_viewport(
+        terminal: GhosttyTerminal,
+        behavior: GhosttyScrollViewport,
+    ) -> c_int;
 
     // render state
     pub fn ghostty_render_state_new(
