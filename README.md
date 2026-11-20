@@ -59,7 +59,7 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 | **流式/完整回复**：`assistant/message` 事件（**不用 `assistantStream`**——它只推增量帧，流结束不固化） | ✅ |
 | **图片消息**：事件里 image 块 → `session/attachment` 拉 base64 → 解码 BGRA → GPUI `img()`（240px 圆角） | ✅（内联图 prompt 端到端验证） |
 | **插件管理**：`pluginManager/listPlugins` + `setPluginEnabled` + `listBundles` + `installBundle`/`removeBundle` | ✅（安装带 requestId、可取消、构建脚本批准、失败原因回显） |
-| **插件市场**：`pluginMarket/listIndexes` + `search`（分页/筛选字段留给协议） | ✅（搜索、安装/更新、状态徽章） |
+| **插件市场**：`pluginMarket/listIndexes` + `search`（`nextOffset` 分页） | ✅（搜索、安装/更新、状态徽章、load more） |
 | **消息反馈**：`messageFeedback/list` + `put`/`delete`，assistant 块下的 👍/👎（再点撤回） | ✅ |
 | **会话管理**：tab 右键 → Fork（`session/fork`）/ 置顶（`workspace/pinSession·unpinSession`）/ 归档（`workspace/archiveSession`） | ✅ |
 | **Slash 命令**：`commands/list` 进命令面板；输入框以已知 `/命令` 开头发送时走 `commands/execute` | ✅ |
@@ -81,7 +81,6 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 **已知缺口**：
 
 - 计划/目标、日程、子代理面板（`goals/*`、`schedule/*`、`subagents/*`）尚未做 UI
-- 插件市场分页（`nextOffset`）只加载第一页；索引切换放在设置里改
 
 ### 构建依赖（Linux）
 
