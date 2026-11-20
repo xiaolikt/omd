@@ -55,6 +55,10 @@ pub struct Term {
     placed: Vec<PlacedImage>,
     /// 回滚搜索（懒创建）
     search: GhosttySearch,
+    /// 选区（视口坐标的锚点 + 当前端点；空 = 无选区）
+    sel: Option<((u16, u32), (u16, u32))>,
+    /// 选区变了：下一帧整屏重绘（vt 的脏行机制不感知我们的选区）
+    repaint_all: bool,
 }
 
 unsafe impl Send for Term {}
@@ -99,6 +103,8 @@ impl Term {
                 image_cache: HashMap::new(),
                 placed: Vec::new(),
                 search: std::ptr::null_mut(),
+                sel: None,
+                repaint_all: false,
             })
         }
     }
@@ -171,6 +177,16 @@ impl Term {
                 self.grid.resize(self.rows as usize, Vec::new());
             }
             ghostty_render_state_update(self.state, self.terminal);
+            // 选区变化要整屏重绘（在 update 之后设置才不会被覆盖）
+            if self.repaint_all {
+                self.repaint_all = false;
+                let full = RS_DIRTY_FULL;
+                let _ = ghostty_render_state_set(
+                    self.state,
+                    RS_OPT_DIRTY,
+                    &full as *const i32 as *const c_void,
+                );
+            }
 
             let mut visible = false;
             let _ = ghostty_render_state_get(
@@ -451,6 +467,127 @@ impl Term {
         }
     }
 
+    /// 选区开始（按下）：锚点 = 当前端点 = 视口坐标。
+    pub fn selection_anchor(&mut self, x: u16, y: u32) {
+        self.sel = Some(((x, y), (x, y)));
+        self.repaint_all = true;
+    }
+
+    /// 选区延伸（拖动）。
+    pub fn selection_extend(&mut self, x: u16, y: u32) {
+        if let Some((anchor, _)) = self.sel {
+            self.sel = Some((anchor, (x, y)));
+            self.repaint_all = true;
+        }
+    }
+
+    /// 清空选区。
+    pub fn selection_clear(&mut self) {
+        if self.sel.take().is_some() {
+            self.repaint_all = true;
+        }
+    }
+
+    /// 有非空选区（锚点 ≠ 端点）。
+    pub fn selection_active(&self) -> bool {
+        matches!(self.sel, Some((a, b)) if a != b)
+    }
+
+    /// 视口格是否在选区内（线性范围）。row 是视口行号。
+    pub fn selection_includes(&self, x: u16, row: u16) -> bool {
+        let Some(((ax, ay), (bx, by))) = self.sel else {
+            return false;
+        };
+        let ((sx, sy), (ex, ey)) = if (ay, ax) <= (by, bx) {
+            ((ax, ay), (bx, by))
+        } else {
+            ((bx, by), (ax, ay))
+        };
+        let (x, row) = (x as u32, row as u32);
+        (row > sy || (row == sy && x >= sx as u32))
+            && (row < ey || (row == ey && x <= ex as u32))
+    }
+
+    /// 取选区文本（格式化器：plain + unwrap + trim）。
+    pub fn selection_text(&mut self) -> Option<String> {
+        let ((ax, ay), (bx, by)) = self.sel.filter(|(a, b)| a != b)?;
+        unsafe {
+            let viewport_point = |x: u16, y: u32| GhosttyPoint {
+                tag: POINT_TAG_VIEWPORT,
+                value: GhosttyPointValue {
+                    coordinate: GhosttyPointCoordinate { x, y },
+                },
+            };
+            let mut start = GhosttyGridRef {
+                node: std::ptr::null_mut(),
+                x: 0,
+                y: 0,
+            };
+            let mut end = GhosttyGridRef {
+                node: std::ptr::null_mut(),
+                x: 0,
+                y: 0,
+            };
+            if ghostty_terminal_grid_ref(self.terminal, viewport_point(ax, ay), &mut start)
+                != GHOSTTY_SUCCESS
+                || ghostty_terminal_grid_ref(self.terminal, viewport_point(bx, by), &mut end)
+                    != GHOSTTY_SUCCESS
+            {
+                return None;
+            }
+            let selection = GhosttySelectionFFI {
+                start,
+                end,
+                rectangle: false,
+            };
+            let mut formatter: GhosttyFormatter = std::ptr::null_mut();
+            if ghostty_formatter_terminal_new(std::ptr::null(), &mut formatter, self.terminal)
+                != GHOSTTY_SUCCESS
+                || formatter.is_null()
+            {
+                return None;
+            }
+            let unwrap = true;
+            let trim = true;
+            let _ = ghostty_formatter_set(
+                formatter,
+                FORMATTER_OPT_UNWRAP,
+                &unwrap as *const bool as *const c_void,
+            );
+            let _ = ghostty_formatter_set(
+                formatter,
+                FORMATTER_OPT_TRIM,
+                &trim as *const bool as *const c_void,
+            );
+            let ok = ghostty_formatter_set(
+                formatter,
+                FORMATTER_OPT_SELECTION,
+                &selection as *const _ as *const c_void,
+            ) == GHOSTTY_SUCCESS;
+            let mut out = None;
+            if ok {
+                let mut needed = 0usize;
+                let rc = ghostty_formatter_format_buf(formatter, std::ptr::null_mut(), 0, &mut needed);
+                if rc == 0 || needed > 0 {
+                    let mut buf = vec![0u8; needed + 1];
+                    let mut written = 0usize;
+                    if ghostty_formatter_format_buf(
+                        formatter,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                        &mut written,
+                    ) == GHOSTTY_SUCCESS
+                    {
+                        buf.truncate(written);
+                        out = Some(String::from_utf8_lossy(&buf).into_owned());
+                    }
+                }
+            }
+            ghostty_formatter_free(formatter);
+            out
+        }
+    }
+
     /// 读本帧所有可见 kitty 放置。像素按 generation 缓存，没变就不重新上传。
     unsafe fn collect_images(&mut self) {
         self.placed.clear();
@@ -587,6 +724,9 @@ impl Term {
                 fg = Some(0x101319);
                 bg = Some(0xe8ecf4);
                 bold = false;
+            } else if self.selection_includes(x, row) {
+                // 选区高亮（光标样式优先）
+                bg = Some(0x1d4d66);
             }
 
             // 宽字符跳过 spacer
@@ -901,6 +1041,30 @@ mod tests {
         term.paste_image_rgba(3, 2, &rgba);
         let _ = term.render_rows();
         assert_eq!(term.images().len(), 1, "pasted image must be placed");
+    }
+
+    #[test]
+    fn selection_text_extracts_dragged_range() {
+        let mut term = Term::new(40, 6).expect("ghostty");
+        term.feed("hello world\r\nsecond line\r\n");
+        let _ = term.render_rows();
+        // 选 "llo wor"（第 0 行 2..9）
+        term.selection_anchor(2, 0);
+        term.selection_extend(9, 0);
+        assert!(term.selection_active());
+        assert!(term.selection_includes(3, 0));
+        assert!(!term.selection_includes(0, 0));
+        assert!(!term.selection_includes(0, 1));
+        let text = term.selection_text().expect("selection text");
+        assert_eq!(text.trim(), "llo worl", "got {text:?}"); // 两端都包含
+        // 跨行：第 0 行 6..第 1 行 6
+        term.selection_anchor(6, 0);
+        term.selection_extend(6, 1);
+        let text = term.selection_text().expect("cross-line");
+        assert!(text.contains("world"), "cross-line: {text:?}");
+        assert!(text.contains("second"), "cross-line: {text:?}");
+        term.selection_clear();
+        assert!(!term.selection_active());
     }
 
     #[test]

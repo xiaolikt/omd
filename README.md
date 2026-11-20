@@ -72,6 +72,7 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 | **长会话分页**：follow snapshot 的 `hasMore` → 「load older messages」按 `session/page`（throughSeq/beforeSeq）补页 | ✅（分页参数实测：seq 0–24 按序返回） |
 | **终端粘贴**：Ctrl+Shift+V——剪贴板有图走 kitty 图形协议本地显示（不进 PTY），文本按 bracketed paste 编码（`ghostty_paste_encode`） | ✅（单测：分块传输 + 200~ 包裹） |
 | **权限预设**：composer 的 🛡 pill 显示/切换 read-only·workspace-write·danger-full-access（`/permission` 命令）；审批卡提供「always: <preset>」一键放行+切换 | ✅（`permission/preset`+`sandbox/mode` 事件实测） |
+| **终端选区**：鼠标拖选（高亮），松开自动复制；Ctrl+Shift+C 复制；单击清空。取文本走 `ghostty_formatter`（plain + unwrap + trim） | ✅（单测：行内/跨行提取，两端包含语义） |
 
 **dsh 的单写者模型**（踩到的坑）：一个会话同时只能有一个写句柄。
 浏览器里开着这个会话时，GUI 发 `session/prompt` 会得到
@@ -214,6 +215,7 @@ slash 命令面板、附件上传、目标横幅、日程面板、workspace 状�
   Enter 向旧、Shift+Enter 向新、显示 k/n，Esc 关闭并回底部）；滚轮和
   Shift+PageUp/PageDown 滚动视口；Ctrl+Shift+V 粘贴——图片用 kitty 图形协议
   （RGBA 分块 APC，本地显示，字节不进 PTY），文本按 mode 2004 编码（bracketed
-  前后缀 / 换行转 CR）。
+  前后缀 / 换行转 CR）；鼠标拖选文本（pane 边界由 canvas 记录，选区变化整屏
+  重绘），松开即复制，Ctrl+Shift+C 也可。
 - 置顶/归档来自 `workspace/follow`（启动时 baseline + `pinned`/`archived` 增量），
   重启后仍然生效；归档的会话从侧栏过滤掉。

@@ -3060,6 +3060,10 @@ struct Root {
     permission_preset: Option<String>,
     /// 权限预设菜单（点状态 pill 弹出）
     permission_menu: Option<Point<Pixels>>,
+    /// 终端拖拽选区：pane id + 是否已拖动（区分点击=清空）
+    term_select: Option<(u64, bool)>,
+    /// 终端 pane body 的窗口坐标边界（canvas paint 时更新，选区换算用）
+    pane_bounds: std::collections::HashMap<u64, Bounds<Pixels>>,
 }
 
 async fn serve_control(
@@ -4134,6 +4138,8 @@ impl Root {
             prepend_at: None,
             permission_preset: None,
             permission_menu: None,
+            term_select: None,
+            pane_bounds: std::collections::HashMap::new(),
             _subagent_sub: subagent_sub,
             plugin_spec_input,
             inspect_pending: None,
@@ -7575,6 +7581,67 @@ impl Root {
     }
 
     /// 终端粘贴（Ctrl+Shift+V）：剪贴板里有图就贴图（kitty 协议，本地显示），    /// 有文本就按 bracketed 模式编码后写 PTY。返回是否处理了。
+    /// 终端格坐标换算（pane body 内边距 8px）。
+    fn term_cell_at(&self, pane_id: u64, position: Point<Pixels>) -> Option<(u16, u32)> {
+        let bounds = self.pane_bounds.get(&pane_id)?;
+        let pad = 8.;
+        let x = (f32::from(position.x - bounds.origin.x) - pad) / CELL_W as f32;
+        let y = (f32::from(position.y - bounds.origin.y) - pad) / CELL_H as f32;
+        if x < 0. || y < 0. {
+            return None;
+        }
+        Some((x as u16, y as u32))
+    }
+
+    /// 选区落定（松开鼠标）：拖动过就复制到剪贴板；只是点击就清空。
+    fn term_select_end(&mut self, pane_id: u64, cx: &mut Context<Self>) {
+        let (_, dragged) = self.term_select.take().unwrap_or((pane_id, false));
+        let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) else {
+            return;
+        };
+        let Some(term) = pane.term.as_mut() else {
+            return;
+        };
+        if dragged && term.selection_active() {
+            if let Some(text) = term.selection_text() {
+                if !text.trim().is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }
+            pane.screen = term.render_rows();
+        } else {
+            term.selection_clear();
+            pane.screen = term.render_rows();
+        }
+        pane.images = term.images().to_vec();
+        cx.notify();
+    }
+
+    /// 复制当前终端选区（Ctrl+Shift+C）。返回是否复制到了。
+    fn term_copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let pane_id = self.term_select.map(|(id, _)| id).or(self.focused_pane);
+        let Some(pane_id) = pane_id else {
+            return false;
+        };
+        let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) else {
+            return false;
+        };
+        let Some(term) = pane.term.as_mut() else {
+            return false;
+        };
+        if !term.selection_active() {
+            return false;
+        }
+        let Some(text) = term.selection_text() else {
+            return false;
+        };
+        if text.trim().is_empty() {
+            return false;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
+    }
+
     /// 切换当前会话的权限预设（走 /permission 命令，事件回填 pill）。
     fn set_permission_preset(&mut self, preset: &str) {
         let Some(agent_id) = self.selected.clone() else {
@@ -12722,6 +12789,21 @@ fn pane_element(
     // 滚轮回滚用：wheel 监听需要自己的 term_id 拷贝
     let term_id_wheel = term_id.clone();
     let wheel_pane_id = pane_id;
+    // 选区用：down 需要 term_id，move/up 只需要 pane id
+    let term_id_select = term_id.clone();
+    let move_pane_id = pane_id;
+    let up_pane_id = pane_id;
+    // canvas 记录本 pane body 的窗口边界（选区换算用）
+    let weak_bounds = cx.entity().downgrade();
+    let bounds_pane_id = pane_id;
+    let bounds_probe = gpui_kit::canvas(
+        move |_bounds, _window, _cx| {},
+        move |bounds, _t, _window, cx| {
+            let _ = weak_bounds.update(cx, |root, _| {
+                root.pane_bounds.insert(bounds_pane_id, bounds);
+            });
+        },
+    );
     el.child(
         div()
             .id(SharedString::from(format!("pane-head-{pane_id}")))
@@ -12860,6 +12942,7 @@ fn pane_element(
             .p(px(8.))
             .text_color(rgb(0xe8ecf4))
             .relative()
+            .child(bounds_probe)
             .track_focus(&focus)
             .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, win, cx| {
                 // Ctrl/Cmd+F：开本 pane 的回滚搜索条（不再发给 PTY）
@@ -12892,6 +12975,13 @@ fn pane_element(
                     cx.stop_propagation();
                     return;
                 }
+                // Ctrl/Cmd+Shift+C：复制终端选区
+                if ctrl && ev.keystroke.modifiers.shift && ev.keystroke.key == "c" {
+                    if this.term_copy_selection(cx) {
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
                 if let Some(term_id) = term_id.as_deref() {
                     let sent = this.send_terminal_key(term_id, &ev.keystroke, cx);
                     eprintln!(
@@ -12907,10 +12997,59 @@ fn pane_element(
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _ev, win, cx| {
+                cx.listener(move |this, ev: &MouseDownEvent, win, cx| {
                     this.focused_pane = Some(pane_id);
                     focus_click.focus(win, cx);
+                    // 终端：按下即锚定选区（拖动 = 选择，单击 = 清空）
+                    if term_id_select.is_some() {
+                        if let Some(cell) = this.term_cell_at(pane_id, ev.position) {
+                            this.term_select = Some((pane_id, false));
+                            if let Some(pane) = this
+                                .panes
+                                .iter_mut()
+                                .find(|pane| pane.id == pane_id)
+                            {
+                                if let Some(term) = pane.term.as_mut() {
+                                    term.selection_anchor(cell.0, cell.1);
+                                }
+                            }
+                        }
+                    }
                     cx.stop_propagation();
+                }),
+            )
+            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _win, cx| {
+                // 左键按住 + 本 pane 正在选择：延伸
+                if ev.pressed_button != Some(MouseButton::Left) {
+                    return;
+                }
+                if !matches!(this.term_select, Some((id, _)) if id == move_pane_id) {
+                    return;
+                }
+                if let Some(cell) = this.term_cell_at(move_pane_id, ev.position) {
+                    if let Some(pane) = this
+                        .panes
+                        .iter_mut()
+                        .find(|pane| pane.id == move_pane_id)
+                    {
+                        if let Some(term) = pane.term.as_mut() {
+                            term.selection_extend(cell.0, cell.1);
+                            pane.screen = term.render_rows();
+                            pane.images = term.images().to_vec();
+                            if let Some(select) = this.term_select.as_mut() {
+                                select.1 = true;
+                            }
+                            cx.notify();
+                        }
+                    }
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _ev: &MouseUpEvent, _win, cx| {
+                    if matches!(this.term_select, Some((id, _)) if id == up_pane_id) {
+                        this.term_select_end(up_pane_id, cx);
+                    }
                 }),
             )
             .on_scroll_wheel(
@@ -22372,6 +22511,10 @@ impl Render for Root {
                     this.end_pane_drag(cx);
                     if this.tab_drag.take().is_some() {
                         cx.notify();
+                    }
+                    // 终端选区兜底：鼠标在 pane 外松开也要落定
+                    if let Some((pane_id, _)) = this.term_select {
+                        this.term_select_end(pane_id, cx);
                     }
                 }),
             )

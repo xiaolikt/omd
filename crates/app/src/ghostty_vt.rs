@@ -99,6 +99,59 @@ pub struct GhosttyModeConfig {
     pub value: bool,
 }
 
+pub type GhosttyFormatter = *mut c_void;
+
+/// GhosttyPointTag::VIEWPORT（随滚动变化的可见区坐标）
+pub const POINT_TAG_VIEWPORT: i32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyPointCoordinate {
+    pub x: u16,
+    pub y: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union GhosttyPointValue {
+    pub coordinate: GhosttyPointCoordinate,
+    /// ABI 对齐用（C 侧 union 有 uint64[2] padding，占 16 字节）
+    pub _padding: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyPoint {
+    pub tag: i32,
+    pub value: GhosttyPointValue,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyGridRef {
+    pub node: *mut c_void,
+    pub x: u16,
+    pub y: u16,
+}
+
+/// selection.h 的 GhosttySelection（40 字节，frozen layout）
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttySelectionFFI {
+    pub start: GhosttyGridRef,
+    pub end: GhosttyGridRef,
+    pub rectangle: bool,
+}
+
+// formatter 选项（bool / GhosttySelectionFFI）
+pub const FORMATTER_OPT_UNWRAP: c_int = 2;
+pub const FORMATTER_OPT_TRIM: c_int = 3;
+pub const FORMATTER_OPT_SELECTION: c_int = 4;
+
+// render state 选项（GhosttyRenderStateDirty）
+pub const RS_OPT_DIRTY: c_int = 1;
+pub const RS_DIRTY_FULL: i32 = 2;
+
 // GhosttyRenderStateData::COLOR_PALETTE（调色板查询）
 pub const RS_DATA_COLOR_PALETTE: c_int = 9;
 
@@ -234,6 +287,43 @@ extern "C" {
         buf: *mut u8,
         buf_len: usize,
         out_written: *mut usize,
+    ) -> c_int;
+
+    // 选区：视口坐标 → grid ref；格式化取文本
+    pub fn ghostty_terminal_grid_ref(
+        terminal: GhosttyTerminal,
+        point: GhosttyPoint,
+        out_ref: *mut GhosttyGridRef,
+    ) -> c_int;
+    pub fn ghostty_terminal_selection_contains(
+        terminal: GhosttyTerminal,
+        selection: *const GhosttySelectionFFI,
+        point: GhosttyPoint,
+        out_contains: *mut bool,
+    ) -> c_int;
+    pub fn ghostty_formatter_terminal_new(
+        allocator: *const c_void,
+        out_formatter: *mut GhosttyFormatter,
+        terminal: GhosttyTerminal,
+    ) -> c_int;
+    pub fn ghostty_formatter_free(formatter: GhosttyFormatter);
+    pub fn ghostty_formatter_set(
+        formatter: GhosttyFormatter,
+        option: c_int,
+        value: *const c_void,
+    ) -> c_int;
+    pub fn ghostty_formatter_format_buf(
+        formatter: GhosttyFormatter,
+        buf: *mut u8,
+        buf_len: usize,
+        out_written: *mut usize,
+    ) -> c_int;
+
+    // 强制整屏重绘（选区变化时用）
+    pub fn ghostty_render_state_set(
+        state: GhosttyRenderState,
+        option: c_int,
+        value: *const c_void,
     ) -> c_int;
 
     // render state
