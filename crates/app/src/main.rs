@@ -2806,6 +2806,9 @@ struct Root {
     market_query: String,
     /// 安装进行中/刚结束的包：包名 → 状态
     install_state: std::collections::HashMap<String, InstallState>,
+    /// 手动安装：输入 spec + inspect 结果（确认后安装）
+    plugin_spec_input: Entity<InputState>,
+    inspect_pending: Option<Value>,
     /// 置顶的会话（workspace/pinSession 返回的集合）
     pinned_sessions: Vec<String>,
     /// commands/list 的结果（当前 agent 的 slash 命令）
@@ -2864,6 +2867,8 @@ struct Root {
     _enter_sub: Subscription,
     /// 市场搜索框的回车订阅
     _market_sub: Subscription,
+    /// 手动安装 spec 输入框的回车订阅
+    _spec_sub: Subscription,
 }
 
 async fn serve_control(
@@ -3572,6 +3577,21 @@ impl Root {
         }
         let plugins_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter plugins…"));
         let market_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search the plugin market…"));
+        let plugin_spec_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("npm name, git URL, path or tarball…")
+        });
+        let spec_sub = cx.subscribe(&plugin_spec_input, |this, _entity, ev: &InputEvent, cx| {
+            if let InputEvent::PressEnter { .. } = ev {
+                let spec = this.plugin_spec_input.read(cx).value().trim().to_string();
+                if !spec.is_empty() {
+                    let _ = this.cmds.send_blocking(Cmd::Call {
+                        tag: "plugins/inspect".to_string(),
+                        endpoint: "pluginManager/inspect".to_string(),
+                        args: json!({ "spec": spec, "options": {} }),
+                    });
+                }
+            }
+        });
         let market_sub = cx.subscribe(&market_input, |this, _entity, ev: &InputEvent, cx| {
             if let InputEvent::PressEnter { shift, .. } = ev {
                 if !*shift {
@@ -3877,6 +3897,9 @@ impl Root {
             pending_question_clear: false,
             _enter_sub: enter_sub,
             _market_sub: market_sub,
+            _spec_sub: spec_sub,
+            plugin_spec_input,
+            inspect_pending: None,
         };
         {
             let home = root.browser_home.clone();
@@ -4556,6 +4579,26 @@ impl Root {
                                 self.market_search(None, true);
                             }
                         }
+                        "plugins/inspect" => {
+                            let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                            if status == "accepted" {
+                                self.settings_tab_error = None;
+                                self.inspect_pending = Some(value);
+                            } else {
+                                let problem = value
+                                    .get("problem")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("refused");
+                                let reason = value
+                                    .get("reason")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                self.settings_tab_error = Some(format!(
+                                    "{problem}: {}",
+                                    reason.chars().take(200).collect::<String>()
+                                ));
+                            }
+                        }
                         "session/pin" | "session/unpin" => {
                             self.pinned_sessions = value
                                 .get("pinnedSessionIds")
@@ -4728,7 +4771,7 @@ impl Root {
                     },
                     Err(err) => {
                         eprintln!("[ui] rpc error {endpoint}: {}", err.chars().take(300).collect::<String>());
-                        if tag == "plugins/list" || tag == "plugins/toggle" || tag == "plugins/bundles" {
+                        if tag == "plugins/list" || tag == "plugins/toggle" || tag == "plugins/bundles" || tag == "plugins/inspect" {
                             self.settings_tab_error =
                                 Some(err.chars().take(160).collect::<String>());
                         }
@@ -15193,6 +15236,184 @@ impl Render for Root {
 
                 // ---- Bundles：可安装/已安装的包（pluginManager/listBundles）----
                 plugins_rows.push(section_header("Bundles", "packages managed by the engine"));
+                // 手动按 spec 安装：输入 → inspect → 确认安装
+                plugins_rows.push({
+                    let inspect_spec = Value::Null; // 占位，下面按输入框读
+                    let _ = inspect_spec;
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.))
+                        .pb(px(6.))
+                        .child(
+                            div()
+                                .rounded(px(6.))
+                                .bg(rgb(0x14171d))
+                                .border_1()
+                                .border_color(rgb(0x23272f))
+                                .px(px(8.))
+                                .py(px(4.))
+                                .flex_1()
+                                .child(
+                                    Input::new(&self.plugin_spec_input)
+                                        .bordered(false)
+                                        .appearance(false)
+                                        .focus_bordered(false)
+                                        .text_xs(),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("plugin-spec-install")
+                                .px(px(10.))
+                                .py(px(4.))
+                                .rounded(px(6.))
+                                .border_1()
+                                .border_color(rgb(0x2f6fb5))
+                                .text_xs()
+                                .text_color(rgb(0x7fb5e8))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(0x16222f)))
+                                .child("Inspect")
+                                .on_click(cx.listener(|this, _ev, _win, cx| {
+                                    let spec = this
+                                        .plugin_spec_input
+                                        .read(cx)
+                                        .value()
+                                        .trim()
+                                        .to_string();
+                                    if spec.is_empty() {
+                                        return;
+                                    }
+                                    this.settings_tab_error = None;
+                                    let _ = this.cmds.send_blocking(Cmd::Call {
+                                        tag: "plugins/inspect".to_string(),
+                                        endpoint: "pluginManager/inspect".to_string(),
+                                        args: json!({ "spec": spec, "options": {} }),
+                                    });
+                                    cx.notify();
+                                })),
+                        )
+                        .into_any_element()
+                });
+                if let Some(inspect) = self.inspect_pending.clone() {
+                    let name = inspect
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let version = inspect
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let kind = inspect
+                        .get("kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let is_bundle = inspect.get("bundle").and_then(|v| v.as_bool());
+                    let registry = inspect
+                        .get("registry")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let spec = self
+                        .plugin_spec_input
+                        .read(cx)
+                        .value()
+                        .trim()
+                        .to_string();
+                    let description = inspect
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let install_name = if name.is_empty() { spec.clone() } else { name.clone() };
+                    plugins_rows.push(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(10.))
+                            .px(px(12.))
+                            .py(px(8.))
+                            .mb(px(8.))
+                            .rounded(px(8.))
+                            .bg(rgb(0x151a23))
+                            .border_1()
+                            .border_color(rgb(0x2c3340))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(0xe8ecf4))
+                                            .child(SharedString::from(format!(
+                                                "{}{}",
+                                                if install_name.is_empty() { spec.clone() } else { install_name.clone() },
+                                                if version.is_empty() { String::new() } else { format!(" v{version}") }
+                                            ))),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x6b7386))
+                                            .child(SharedString::from(format!(
+                                                "{kind}{}{}",
+                                                if is_bundle == Some(true) { " · bundle" } else if is_bundle == Some(false) { " · not a bundle" } else { "" },
+                                                if description.is_empty() { String::new() } else { format!(" · {description}") }
+                                            ))),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("plugin-spec-cancel")
+                                    .px(px(8.))
+                                    .py(px(4.))
+                                    .rounded(px(6.))
+                                    .text_xs()
+                                    .text_color(rgb(0x9ca3b0))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(0x20232b)))
+                                    .child("Cancel")
+                                    .on_click(cx.listener(|this, _ev, _win, cx| {
+                                        this.inspect_pending = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("plugin-spec-confirm")
+                                    .px(px(10.))
+                                    .py(px(4.))
+                                    .rounded(px(6.))
+                                    .border_1()
+                                    .border_color(rgb(0x2f6fb5))
+                                    .text_xs()
+                                    .text_color(rgb(0x7fb5e8))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(0x16222f)))
+                                    .child("Install")
+                                    .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                        this.inspect_pending = None;
+                                        let install_spec = spec.clone();
+                                        this.start_install(
+                                            &install_name,
+                                            &install_spec,
+                                            registry.clone(),
+                                            None,
+                                        );
+                                        cx.notify();
+                                    })),
+                            )
+                            .into_any_element(),
+                    );
+                }
                 if self.bundles_doc.is_empty() {
                     plugins_rows.push(
                         div()
