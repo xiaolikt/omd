@@ -2951,6 +2951,11 @@ struct Root {
     market_error: Option<String>,
     /// 上一次市场搜索的关键词（刷新/安装后重搜用）
     market_query: String,
+    /// 分页：下一页 offset（None = 没有更多）与当前文档的 fetchedAt
+    market_next: Option<u64>,
+    market_fetched_at: Option<u64>,
+    /// 下一页结果回来时追加而不是替换
+    market_offset_appending: bool,
     /// 安装进行中/刚结束的包：包名 → 状态
     install_state: std::collections::HashMap<String, InstallState>,
     /// 手动安装：输入 spec + inspect 结果（确认后安装）
@@ -4059,6 +4064,9 @@ impl Root {
             market_loading: false,
             market_error: None,
             market_query: String::new(),
+            market_next: None,
+            market_fetched_at: None,
+            market_offset_appending: false,
             install_state: std::collections::HashMap::new(),
             pinned_sessions: Vec::new(),
             archived_sessions: Vec::new(),
@@ -4803,7 +4811,32 @@ impl Root {
                         }
                         "plugins/market" => {
                             self.market_loading = false;
-                            self.market_doc = value;
+                            let appending = self.market_offset_appending;
+                            self.market_offset_appending = false;
+                            self.market_next = value
+                                .get("nextOffset")
+                                .and_then(|v| v.as_u64());
+                            self.market_fetched_at = value
+                                .get("fetchedAt")
+                                .and_then(|v| v.as_u64());
+                            if appending {
+                                // 追加一页
+                                let mut merged = self
+                                    .market_doc
+                                    .get("entries")
+                                    .and_then(|v| v.as_array())
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let page = value
+                                    .get("entries")
+                                    .and_then(|v| v.as_array())
+                                    .cloned()
+                                    .unwrap_or_default();
+                                merged.extend(page);
+                                self.market_doc["entries"] = Value::Array(merged);
+                            } else {
+                                self.market_doc = value;
+                            }
                         }
                         "plugins/remove" => {
                             self.reload_plugins();
@@ -5071,6 +5104,7 @@ impl Root {
                         }
                         if tag == "plugins/market" {
                             self.market_loading = false;
+                            self.market_offset_appending = false;
                             self.market_error = Some(err.chars().take(160).collect::<String>());
                         }
                         if tag.starts_with("schedule/") || tag.starts_with("goals/") || tag == "permission/set" || tag == "commands/execute" {
@@ -7279,12 +7313,28 @@ impl Root {
 
     /// 用当前索引搜市场。text = None 时用上次的关键词。
     fn market_search(&mut self, text: Option<String>, refresh: bool) {
+        self.market_next = None;
+        self.market_fetched_at = None;
+        self.market_search_page(text, 0, None, refresh, false);
+    }
+
+    /// 搜一页：offset=0 重置结果，>0 追加。fetchedAt 让后续页读同一份文档。
+    fn market_search_page(
+        &mut self,
+        text: Option<String>,
+        offset: u64,
+        fetched_at: Option<u64>,
+        refresh: bool,
+        append: bool,
+    ) {
         let Some(url) = self.market_url.clone() else {
             return;
         };
         let text = match text {
             Some(text) => {
-                self.market_query = text.clone();
+                if offset == 0 {
+                    self.market_query = text.clone();
+                }
                 text
             }
             None => self.market_query.clone(),
@@ -7294,11 +7344,18 @@ impl Root {
         let mut query = json!({
             "text": text,
             "sort": { "kind": "relevance" },
-            "offset": 0,
+            "offset": offset,
             "limit": 50,
         });
         if refresh {
             query["refresh"] = json!(true);
+        }
+        if let Some(fetched_at) = fetched_at {
+            query["fetchedAt"] = json!(fetched_at);
+        }
+        if append {
+            // 占位：结果回来时按 offset>0 追加（见 "plugins/market" 处理）
+            self.market_offset_appending = true;
         }
         let _ = self.cmds.send_blocking(Cmd::Call {
             tag: "plugins/market".to_string(),
@@ -17577,6 +17634,41 @@ impl Render for Root {
                                 "{} plugin(s) in this index",
                                 total_market
                             )))
+                            .into_any_element(),
+                    );
+                }
+                // 还有下一页：「load more」带着 fetchedAt 读同一份文档
+                if let Some(next) = self.market_next {
+                    let fetched_at = self.market_fetched_at;
+                    plugins_rows.push(
+                        div()
+                            .id("market-more")
+                            .mx_auto()
+                            .my(px(6.))
+                            .px(px(14.))
+                            .py(px(5.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(rgb(0x2c3340))
+                            .text_xs()
+                            .text_color(rgb(0x9ca3b0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x1b1e26)))
+                            .child(if self.market_loading {
+                                "loading…"
+                            } else {
+                                "load more"
+                            })
+                            .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                this.market_search_page(
+                                    None,
+                                    next,
+                                    fetched_at,
+                                    false,
+                                    true,
+                                );
+                                cx.notify();
+                            }))
                             .into_any_element(),
                     );
                 }
