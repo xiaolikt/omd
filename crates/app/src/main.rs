@@ -975,8 +975,8 @@ enum Cmd {
         endpoint: String,
         args: Value,
     },
-    /// Fork 一个会话（最近完成的 turn 为边界）
-    ForkSession { session_id: String },
+    /// Fork 一个会话（atSeq = None 取最近完成的 turn；Some 到那条消息为止）
+    ForkSession { session_id: String, at_seq: Option<u64> },
     /// 安装一个插件包（独立任务跑，取消不会被排队堵住）
     InstallPlugin {
         name: String,
@@ -2006,11 +2006,13 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             })
                             .await;
                     }
-                    Cmd::ForkSession { session_id } => {
+                    Cmd::ForkSession { session_id, at_seq } => {
+                        let mut request = json!({ "sessionId": session_id });
+                        if let Some(at_seq) = at_seq {
+                            request["atSeq"] = json!(at_seq);
+                        }
                         match rpc
-                            .call("session/fork", json!({
-                                "request": { "sessionId": session_id }
-                            }))
+                            .call("session/fork", json!({ "request": request }))
                             .await
                         {
                             Ok(value) => {
@@ -2549,12 +2551,14 @@ fn push_blocks(node: &Value, out: &mut String) {
 
 #[derive(Clone)]
 enum TranscriptBlock {
-    User { uid: u64, text: String },
+    User { uid: u64, text: String, seq: Option<u64> },
     Assistant {
         uid: u64,
         text: String,
         /// 可反馈的 assistant 消息 id（流式快照里可能没有）
         message_id: Option<String>,
+        /// 事件 seq（fork 边界用）
+        seq: Option<u64>,
     },
     Reasoning { uid: u64, text: String, expanded: bool },
     Tool {
@@ -4162,6 +4166,7 @@ impl Root {
                         "stress block #{i}\n\n这是压测用的段落，带 `inline code` 与列表：\n\n- item a\n- item b\n\n```rust\nfn f{i}() -> u32 {{ {i} }}\n```\n"
                     ),
                     message_id: None,
+                    seq: None,
                 });
             }
             // OMD_STRESS_FULL=1 → 一次全铺（A/B 对照用）
@@ -4707,6 +4712,7 @@ impl Root {
                                 uid: block_uid(),
                                 text: state.text,
                                 message_id: None,
+                                seq: None,
                             });
                     }
                 }
@@ -7395,9 +7401,10 @@ impl Root {
     }
 
     /// Fork / 置顶 / 归档（tab 右键菜单的动作）。
-    fn fork_session(&mut self, session_id: &str) {
+    fn fork_session(&mut self, session_id: &str, at_seq: Option<u64>) {
         let _ = self.cmds.send_blocking(Cmd::ForkSession {
             session_id: session_id.to_string(),
+            at_seq,
         });
     }
 
@@ -10399,6 +10406,7 @@ impl Root {
                 self.push_block(TranscriptBlock::User {
                     uid: block_uid(),
                     text: text.to_string(),
+                    seq: frame.pointer("/event/seq").and_then(|v| v.as_u64()),
                 });
             }
             "assistant/message" => {
@@ -10407,6 +10415,7 @@ impl Root {
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
                     .filter(|id| !id.is_empty());
+                let block_seq = frame.pointer("/event/seq").and_then(|v| v.as_u64());
                 let mut pushed = false;
                 if let Some(content) = data.pointer("/message/content").and_then(|v| v.as_array()) {
                     for block in content {
@@ -10430,6 +10439,7 @@ impl Root {
                                             uid: block_uid(),
                                             text: text.to_string(),
                                             message_id: message_id.clone(),
+                                            seq: block_seq,
                                         });
                                         pushed = true;
                                     }
@@ -10446,6 +10456,7 @@ impl Root {
                             uid: block_uid(),
                             text: text.trim().to_string(),
                             message_id,
+                            seq: block_seq,
                         });
                     }
                 }
@@ -10842,6 +10853,7 @@ impl Root {
             self.push_block(TranscriptBlock::User {
                 uid: block_uid(),
                 text: text.clone(),
+                seq: None,
             });
             self.scroll.scroll_to_bottom();
             if clear_primary {
@@ -10857,6 +10869,7 @@ impl Root {
                 .push(TranscriptBlock::User {
                     uid: block_uid(),
                     text: text.clone(),
+                    seq: None,
                 });
         }
         let request_id = format!("omd-{}", uuid_like());
@@ -14522,6 +14535,7 @@ fn render_block(
             uid,
             text,
             message_id,
+            seq,
         } => {
             let markdown = TextView::markdown(
                 SharedString::from(format!("md-{uid}")),
@@ -14559,6 +14573,28 @@ fn render_block(
                     })
             });
             let mut column = div().flex().flex_col().gap(px(3.)).w_full().child(markdown);
+            // 从这条消息处 fork（有 seq 才给入口）
+            if let (Some(seq), Some(sid)) = (seq, session_id) {
+                let fork_sid = sid.to_string();
+                column = column.child(
+                    div()
+                        .id(SharedString::from(format!("fork-here-{uid}")))
+                        .mt(px(-2.))
+                        .self_start()
+                        .px(px(6.))
+                        .py(px(1.))
+                        .rounded_sm()
+                        .text_xs()
+                        .text_color(rgb(0x51637e))
+                        .cursor_pointer()
+                        .hover(|style| style.text_color(rgb(0x7fb5e8)).bg(rgb(0x161a21)))
+                        .child("⎇ fork here")
+                        .on_click(cx.listener(move |this, _ev, _win, cx| {
+                            this.fork_session(&fork_sid, Some(seq));
+                            cx.notify();
+                        })),
+                );
+            }
             // 有 message id 才显示反馈按钮（流式快照里的块没有）
             if let (Some(mid), Some(sid)) = (message_id.as_deref(), session_id) {
                 if !mid.is_empty() {
@@ -21427,7 +21463,7 @@ impl Render for Root {
                             cx.listener(move |this, _ev, _win, cx| {
                                 this.tab_menu = None;
                                 if !fork_session_id.is_empty() {
-                                    this.fork_session(&fork_session_id);
+                                    this.fork_session(&fork_session_id, None);
                                 }
                                 cx.notify();
                             })

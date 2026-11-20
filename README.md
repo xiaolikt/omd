@@ -73,6 +73,7 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 | **终端粘贴**：Ctrl+Shift+V——剪贴板有图走 kitty 图形协议本地显示（不进 PTY），文本按 bracketed paste 编码（`ghostty_paste_encode`） | ✅（单测：分块传输 + 200~ 包裹） |
 | **权限预设**：composer 的 🛡 pill 显示/切换 read-only·workspace-write·danger-full-access（`/permission` 命令）；审批卡提供「always: <preset>」一键放行+切换 | ✅（`permission/preset`+`sandbox/mode` 事件实测） |
 | **终端选区**：鼠标拖选（高亮），松开自动复制；Ctrl+Shift+C 复制；单击清空。取文本走 `ghostty_formatter`（plain + unwrap + trim） | ✅（单测：行内/跨行提取，两端包含语义） |
+| **Fork 到指定消息**：转写里带 seq 的消息下方「⎇ fork here」（`session/fork` 的 `atSeq`）；tab 右键仍是最近完成 turn | ✅（atSeq=5 实测返回新会话） |
 
 **dsh 的单写者模型**（踩到的坑）：一个会话同时只能有一个写句柄。
 浏览器里开着这个会话时，GUI 发 `session/prompt` 会得到
@@ -197,6 +198,7 @@ slash 命令面板、附件上传、目标横幅、日程面板、workspace 状�
   Market（搜索 + 安装/更新；安装带 requestId，可取消，构建脚本需显式批准）。
   `pluginMarket/*` 在未安装市场 bundle 的 profile 里返回 404，UI 会提示未启用而不是报错。
 - tab 上右键：Rename / Fork session / Pin·Unpin / Archive（归档会关闭对应 tab 并刷新列表）。
+  转写里带事件 seq 的消息下方有「⎇ fork here」，从那条消息处切开（`atSeq`）。
 - assistant 消息下方有 👍/👎（再点撤回），走 `messageFeedback/*`。
 - `Ctrl+K` 命令面板里会列出 `commands/list` 的 slash 命令；输入框里以已知
   `/命令` 开头发送时直接走 `commands/execute`，不再当普通 prompt 发给模型。
