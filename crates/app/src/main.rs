@@ -3074,6 +3074,10 @@ struct Root {
     term_select: Option<(u64, bool)>,
     /// 格式化结果待应用（编辑器 panel id → edits；render 里有 window 才 set_value）
     pending_format_edits: Vec<(String, Vec<lsp_types::TextEdit>)>,
+    /// 编辑器大纲（documentSymbol；含路径与显隐）
+    outline: Vec<lsp::OutlineItem>,
+    outline_path: Option<String>,
+    show_outline: bool,
     /// 终端 pane body 的窗口坐标边界（canvas paint 时更新，选区换算用）
     pane_bounds: std::collections::HashMap<u64, Bounds<Pixels>>,
 }
@@ -4161,6 +4165,9 @@ impl Root {
             permission_menu: None,
             term_select: None,
             pending_format_edits: Vec::new(),
+            outline: Vec::new(),
+            outline_path: None,
+            show_outline: false,
             pane_bounds: std::collections::HashMap::new(),
             _subagent_sub: subagent_sub,
             plugin_spec_input,
@@ -7305,6 +7312,59 @@ impl Root {
         });
     }
 
+    /// 打开当前编辑器的大纲（textDocument/documentSymbol）。
+    fn open_outline(&mut self, cx: &mut Context<Self>) {
+        let Some(selected) = self.selected.clone() else {
+            return;
+        };
+        if !is_file_panel(&selected) {
+            return;
+        }
+        let Some(editor) = self.editors.get(&selected) else {
+            return;
+        };
+        let path = editor.path.clone();
+        if !self.lsp_active.contains(&path) {
+            self.error = Some("no language server for this file".to_string());
+            cx.notify();
+            return;
+        }
+        let tx = self.lsp_tx.clone();
+        self.outline_path = Some(path.clone());
+        cx.spawn(async move |this, cx| {
+            let items = lsp::document_symbols(&tx, &path).await.unwrap_or_default();
+            let _ = this.update(cx, |root, cx| {
+                root.outline = items;
+                root.show_outline = !root.outline.is_empty();
+                if root.outline.is_empty() {
+                    root.error = Some("no symbols in this file".to_string());
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 大纲条目跳转（set_cursor_position 会顺带聚焦/滚动）。
+    fn goto_outline(&mut self, line: u32, character: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.outline_path.clone() else {
+            return;
+        };
+        let Some(editor) = self.editors.get(&file_panel_id(&path)) else {
+            return;
+        };
+        let state = editor.state.clone();
+        state.update(cx, |state, cx| {
+            state.set_cursor_position(
+                lsp_types::Position { line, character },
+                window,
+                cx,
+            );
+        });
+        self.show_outline = false;
+        cx.notify();
+    }
+
     fn save_file_editor(&mut self, cx: &mut Context<Self>) {
         let ids: Vec<String> = self
             .editors
@@ -10134,6 +10194,12 @@ impl Root {
             self.term_find_close(window, cx);
             return true;
         }
+        // 大纲开着时：Esc 关掉
+        if self.show_outline && key == "escape" {
+            self.show_outline = false;
+            cx.notify();
+            return true;
+        }
         // 命令面板里：输入变了就顺带查一次全库搜索
         if self.show_palette {
             let query = self.palette_input.read(cx).value().trim().to_string();
@@ -12951,6 +13017,8 @@ fn pane_element(
     images: Vec<PlacedImage>,
     // 打开中的回滚搜索条（输入框 + 当前序号/总数）
     find: Option<(Entity<InputState>, usize, usize)>,
+    // 大纲（当前编辑器；Some 时 body 里画浮层）
+    outline_items: Option<Vec<lsp::OutlineItem>>,
     cx: &mut Context<Root>,
 ) -> AnyElement {
     let el = div()
@@ -12962,8 +13030,9 @@ fn pane_element(
         .size_full()
         .bg(rgb(0x101319));
     let focus_click = focus.clone();
-    // 格式化按钮用
+    // 格式化/大纲按钮用
     let format_pane_id = pane_id;
+    let outline_pane_id = pane_id;
     // 滚轮回滚用：wheel 监听需要自己的 term_id 拷贝
     let term_id_wheel = term_id.clone();
     let wheel_pane_id = pane_id;
@@ -13033,6 +13102,24 @@ fn pane_element(
                     );
                 }
                 Some(row)
+            }))
+            .children(editor.as_ref().map(|_| {
+                // 大纲按钮（documentSymbol 下拉）
+                div()
+                    .id(SharedString::from(format!("pane-outline-{pane_id}")))
+                    .px(px(5.))
+                    .py(px(1.))
+                    .rounded_sm()
+                    .text_xs()
+                    .text_color(rgb(0x707786))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x23272f)).text_color(rgb(0xd0d4dc)))
+                    .child("☰ outline")
+                    .on_click(cx.listener(move |this, _ev, _win, cx| {
+                        this.focused_pane = Some(outline_pane_id);
+                        this.open_outline(cx);
+                    }))
+                    .into_any_element()
             }))
             .children(editor.as_ref().map(|_| {
                 // 格式化按钮（有 LSP 的文件才有效；点了没 server 会提示）
@@ -13120,12 +13207,129 @@ fn pane_element(
             .min_h(px(0.))
             .min_w(px(0.))
             .size_full()
+            .relative()
             .child(
                 // 必须给确定高度：多行 Input 内部是 h_auto，auto 只会排出几行
                 Editor::new(&state)
                     .text_sm()
                     .h(gpui_kit::DefiniteLength::Fraction(1.)),
             )
+            .children(outline_items.map(|items| {
+                // 大纲浮层：右上角下拉，点击跳转
+                div()
+                    .absolute()
+                    .top(px(6.))
+                    .right(px(10.))
+                    .w(px(300.))
+                    .max_h(px(360.))
+                    .flex()
+                    .flex_col()
+                    .rounded(px(8.))
+                    .bg(rgb(0x151a23))
+                    .border_1()
+                    .border_color(rgb(0x2c3340))
+                    .shadow_lg()
+                    .overflow_hidden()
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .px(px(10.))
+                            .py(px(6.))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x51637e))
+                                    .child("outline"),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "outline-close-{pane_id}"
+                                    )))
+                                    .text_xs()
+                                    .text_color(rgb(0x707786))
+                                    .cursor_pointer()
+                                    .hover(|style| style.text_color(rgb(0xff8a97)))
+                                    .child("×")
+                                    .on_click(cx.listener(|this, _ev, _win, cx| {
+                                        this.show_outline = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(div().h(px(1.)).w_full().bg(rgb(0x23272f)))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("outline-body-{pane_id}")))
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            .py(px(4.))
+                            .children(items.into_iter().map(|item| {
+                                let indent = item.depth as f32 * 14.;
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "outline-{}-{}",
+                                        item.line, item.character
+                                    )))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .ml(px(8. + indent))
+                                    .mr(px(8.))
+                                    .px(px(4.))
+                                    .py(px(3.))
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(0x20232b)))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x51637e))
+                                            .min_w(px(64.))
+                                            .child(SharedString::from(item.kind.clone())),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_xs()
+                                            .text_color(if item.depth == 0 {
+                                                rgb(0xd7dce6)
+                                            } else {
+                                                rgb(0x9ca3b0)
+                                            })
+                                            .child(SharedString::from(item.name.clone())),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x3f4757))
+                                            .child(SharedString::from(format!(
+                                                ":{}",
+                                                item.line + 1
+                                            ))),
+                                    )
+                                    .on_click(cx.listener(move |this, _ev, win, cx| {
+                                        this.goto_outline(item.line, item.character, win, cx);
+                                    }))
+                            })),
+                    )
+                    .into_any_element()
+            }))
             .into_any_element()
     } else {
         div()
@@ -21484,6 +21688,17 @@ impl Render for Root {
                     )
                 },
             );
+            // 大纲浮层（只给当前选中且 show_outline 的编辑器）
+            let outline_items = self
+                .show_outline
+                .then(|| {
+                    editor_path
+                        .clone()
+                        .zip(self.outline_path.clone())
+                        .filter(|(editor_path, outline_path)| editor_path == outline_path)
+                        .map(|_| self.outline.clone())
+                })
+                .flatten();
             leaf_elements.insert(
                 pane_id,
                 pane_element(
@@ -21499,6 +21714,7 @@ impl Render for Root {
                     media,
                     images,
                     term_find_info,
+                    outline_items,
                     cx,
                 ),
             );

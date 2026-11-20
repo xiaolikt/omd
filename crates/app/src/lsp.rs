@@ -133,6 +133,11 @@ pub enum Cmd {
         tab_size: u32,
         insert_spaces: bool,
     },
+    /// 文档大纲（textDocument/documentSymbol）
+    DocumentSymbols {
+        path: String,
+        reply: async_channel::Sender<Value>,
+    },
     Shutdown,
 }
 
@@ -839,6 +844,19 @@ fn worker(cmd_rx: Receiver<Cmd>, ev_tx: async_channel::Sender<Event>) {
                 arguments,
             } => manager.execute_command(&path, &command, arguments),
             Cmd::SemanticTokens { path, reply } => manager.semantic_tokens(path, reply),
+            Cmd::DocumentSymbols { path, reply } => {
+                let Some(server) =
+                    manager.routed.get(&path).and_then(|key| manager.servers.get(key))
+                else {
+                    let _ = reply.try_send(Value::Null);
+                    return;
+                };
+                let params = json!({ "textDocument": { "uri": path_to_uri(&path) } });
+                let result = server
+                    .request("textDocument/documentSymbol", params, Duration::from_secs(8))
+                    .unwrap_or(Value::Null);
+                let _ = reply.try_send(result);
+            }
             Cmd::Formatting {
                 path,
                 tab_size,
@@ -1492,6 +1510,66 @@ pub fn request_code_actions(
     })
 }
 
+/// 大纲里的一条符号（扁平化后的 DocumentSymbol / SymbolInformation）。
+#[derive(Clone, Debug)]
+pub struct OutlineItem {
+    pub name: String,
+    pub kind: String,
+    /// 起始行列（0-based）
+    pub line: u32,
+    pub character: u32,
+    pub depth: usize,
+}
+
+/// textDocument/documentSymbol → 扁平大纲（层级符号 DFS 展开）。
+pub async fn document_symbols(tx: &Sender<Cmd>, path: &str) -> Result<Vec<OutlineItem>> {
+    let (reply_tx, reply_rx) = async_channel::bounded(1);
+    let _ = tx.send(Cmd::DocumentSymbols {
+        path: path.to_string(),
+        reply: reply_tx,
+    });
+    let value = reply_rx.recv().await.map_err(|err| anyhow::anyhow!("{err}"))?;
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    // 两种形态：DocumentSymbol[]（层级）或 SymbolInformation[]（扁平）
+    let mut out = Vec::new();
+    if let Ok(symbols) = serde_json::from_value::<Vec<lsp_types::DocumentSymbol>>(value.clone()) {
+        fn walk(symbols: &[lsp_types::DocumentSymbol], depth: usize, out: &mut Vec<OutlineItem>) {
+            for symbol in symbols {
+                let mut range = symbol.selection_range.clone();
+                if range.start == range.end {
+                    range = symbol.range.clone();
+                }
+                out.push(OutlineItem {
+                    name: symbol.name.clone(),
+                    kind: format!("{:?}", symbol.kind).to_lowercase(),
+                    line: range.start.line,
+                    character: range.start.character,
+                    depth,
+                });
+                if let Some(children) = &symbol.children {
+                    walk(children, depth + 1, out);
+                }
+            }
+        }
+        walk(&symbols, 0, &mut out);
+    } else if let Ok(items) =
+        serde_json::from_value::<Vec<lsp_types::SymbolInformation>>(value.clone())
+    {
+        for item in items {
+            out.push(OutlineItem {
+                name: item.name.clone(),
+                kind: format!("{:?}", item.kind).to_lowercase(),
+                line: item.location.range.start.line,
+                character: item.location.range.start.character,
+                depth: 0,
+            });
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // 语义高亮 provider
 // ---------------------------------------------------------------------------
@@ -1603,5 +1681,48 @@ mod tests {
         std::env::split_paths(&path)
             .map(|dir| dir.join(bin))
             .find(|candidate| candidate.is_file())
+    }
+}
+
+#[cfg(test)]
+mod outline_tests {
+    use super::*;
+
+    /// 真实 rust-analyzer 的 documentSymbol 冒烟：应返回 main 等符号。
+    #[test]
+    fn document_symbols_from_rust_analyzer() {
+        if !std::env::var_os("PATH")
+            .map(|path| {
+                std::env::split_paths(&path).any(|dir| dir.join("rust-analyzer").is_file())
+            })
+            .unwrap_or(false)
+        {
+            eprintln!("[test] rust-analyzer 不在 PATH，跳过");
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, _ev_tx, _rx) = spawn();
+            let dir = std::env::temp_dir().join("omd-lsp-outline-test");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("outline_test.rs");
+            std::fs::write(&path, "struct Foo { x: u32 }\nfn main() { let f = Foo { x: 1 }; }\n").unwrap();
+            let _ = tx.send(Cmd::Open {
+                path: path.to_string_lossy().to_string(),
+                text: "struct Foo { x: u32 }\nfn main() { let f = Foo { x: 1 }; }\n".to_string(),
+            });
+            let items = document_symbols(&tx, &path.to_string_lossy()).await.unwrap();
+            let names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
+            eprintln!("[test] outline: {names:?}");
+            assert!(names.contains(&"Foo"), "{names:?}");
+            assert!(names.contains(&"main"), "{names:?}");
+            let main = items.iter().find(|item| item.name == "main").unwrap();
+            assert_eq!(main.line, 1, "main 在第 2 行（0-based 1）");
+            let _ = tx.send(Cmd::Shutdown);
+            let _ = std::fs::remove_file(&path);
+        });
     }
 }
