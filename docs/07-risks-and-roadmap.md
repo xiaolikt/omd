@@ -46,7 +46,7 @@ M0–M3 单人大约 **6–10 周**到「能不用 web UI」。原「1.5 个月�
 - [x] 设置/凭据：动态表单、掩码、凭据增删
 - [x] 目标：goal 横幅（create/edit/pause/resume/complete/clear）
 - [x] 日程（schedule/*）：列表/历史/删除（创建走 agent 工具）
-- [ ] 子代理/任务：列表、跟进、打断、kill（job 列表/kill 已做，subagent 未做）
+- [x] 子代理/任务：列表、跟进、打断（job 列表/kill + subagents）
 - [x] 插件：已装/加载状态/预设组成、安装（含进度/取消）、卸载、启停、市场搜索（市场分页未接）
 - [x] 账号：登录（系统浏览器）、状态、余额、登出
 - [x] 命令：`commands/list` 驱动的命令面板

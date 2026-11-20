@@ -67,6 +67,7 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 | **目标（goal）**：`goals/get` 横幅 + create/edit/pause/resume/complete/clear | ✅（回填、CAS revision 实测） |
 | **日程**：⏱ 面板（`schedule/catalog` 按会话过滤）+ 投递历史 + 删除 | ✅（catalog/list 实测；创建由 agent 的 schedule 工具完成） |
 | **workpace 状态**：`workspace/follow` baseline + `pinned`/`archived` 增量；置顶/归档跨重启 | ✅（baseline 实测：2 archived） |
+| **子代理**：⇄ 面板列出 `parentSessionId` 子会话，可打断（`subagents/interruptByParent`）、追问（`subagents/prompt`） | ✅（参数实测） |
 
 **dsh 的单写者模型**（踩到的坑）：一个会话同时只能有一个写句柄。
 浏览器里开着这个会话时，GUI 发 `session/prompt` 会得到
@@ -179,8 +180,8 @@ strings ~/.local/bin/herdr-app  | grep gpui           # GPUI 自绘
 ## 状态
 
 M0–M2 完成，M3 进行中（文件/编辑器、插件管理与市场、消息反馈、会话 fork/置顶/归档、
-slash 命令面板、附件上传、目标横幅、日程面板、workspace 状态流已接）。剩余：子代理面板、
-终端搜索/Kitty 图形。
+slash 命令面板、附件上传、目标横幅、日程面板、workspace 状态流、子代理面板已接）。
+剩余：终端搜索/Kitty 图形、长会话分页。
 
 ### 插件页与 tab 菜单
 
@@ -200,3 +201,7 @@ slash 命令面板、附件上传、目标横幅、日程面板、workspace 状�
 - 日程：标题栏 ⏱ 打开当前会话的提醒列表（`schedule/catalog` 全量按 sessionId 过滤），
   可看投递历史、删除；`schedule/changed` 时自动刷新。创建提醒由 agent 的
   `schedule_create` 工具完成（协议没有给客户端的创建端点）。
+- 子代理：标题栏 ⇄ 列出当前会话派生的子会话（`session/list` 的 `parentSessionId`），
+  选中后可发消息（queue）/ 打断；不显示孙代理。
+- 置顶/归档来自 `workspace/follow`（启动时 baseline + `pinned`/`archived` 增量），
+  重启后仍然生效；归档的会话从侧栏过滤掉。

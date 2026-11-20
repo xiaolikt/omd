@@ -276,6 +276,8 @@ struct SessionRow {
     running: bool,
     blank: bool,
     updated_at: i64,
+    /// 子代理会话的父会话 id（session/list 的 parentSessionId）
+    parent: Option<String>,
 }
 
 /// 对话正文列的最大宽度（居中），以及输入框的最大宽度（比正文窄一点）。
@@ -2437,6 +2439,10 @@ async fn refresh_sessions(rpc: &Rpc<'_>, evs: &Sender<Ev>) {
                                 .get("running")
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false);
+                            let parent = item
+                                .get("parentSessionId")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string);
                             Some(SessionRow {
                                 id,
                                 cwd,
@@ -2444,6 +2450,7 @@ async fn refresh_sessions(rpc: &Rpc<'_>, evs: &Sender<Ev>) {
                                 running,
                                 blank,
                                 updated_at,
+                                parent,
                             })
                         })
                         .collect::<Vec<_>>()
@@ -2957,7 +2964,14 @@ struct Root {
     show_schedules: bool,
     schedule_doc: Value,
     schedule_history: std::collections::HashMap<String, Value>,
-    schedule_expanded: Option<String>,    /// 附件 id 计数器
+    schedule_expanded: Option<String>,
+    /// 子代理面板：列出 parentSessionId == 当前会话的子会话
+    show_subagents: bool,
+    subagent_target: Option<String>,
+    subagent_input: Entity<InputState>,
+    /// 下一帧清空子代理输入框
+    subagent_clear: bool,
+    /// 附件 id 计数器
     attach_seq: u64,
     /// 消息反馈的本地状态：messageId → 反馈项
     feedback: std::collections::HashMap<String, FeedbackState>,
@@ -3015,6 +3029,8 @@ struct Root {
     _spec_sub: Subscription,
     /// goal 目标输入框的回车订阅
     _goal_sub: Subscription,
+    /// 子代理消息输入框的回车订阅
+    _subagent_sub: Subscription,
 }
 
 async fn serve_control(
@@ -3735,6 +3751,16 @@ impl Root {
                 }
             }
         });
+        let subagent_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Message the selected subagent…")
+        });
+        let subagent_sub = cx.subscribe(&subagent_input, |this, _entity, ev: &InputEvent, cx| {
+            if let InputEvent::PressEnter { shift, .. } = ev {
+                if !*shift {
+                    this.send_subagent_prompt(cx);
+                }
+            }
+        });
         let spec_sub = cx.subscribe(&plugin_spec_input, |this, _entity, ev: &InputEvent, cx| {
             if let InputEvent::PressEnter { .. } = ev {
                 let spec = this.plugin_spec_input.read(cx).value().trim().to_string();
@@ -4064,6 +4090,11 @@ impl Root {
             schedule_doc: Value::Null,
             schedule_history: std::collections::HashMap::new(),
             schedule_expanded: None,
+            show_subagents: false,
+            subagent_target: None,
+            subagent_input,
+            subagent_clear: false,
+            _subagent_sub: subagent_sub,
             plugin_spec_input,
             inspect_pending: None,
         };
@@ -7312,6 +7343,51 @@ impl Root {
             endpoint: "schedule/delete".to_string(),
             args: json!({ "request": { "sessionId": session_id, "id": task_id } }),
         });
+    }
+
+    /// 打断一个子代理（continuable 地址）。
+    fn interrupt_subagent(&mut self, child_session_id: &str) {
+        let Some(parent) = self.selected.clone() else {
+            return;
+        };
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "subagents/interrupt".to_string(),
+            endpoint: "subagents/interruptByParent".to_string(),
+            args: json!({
+                "parentSessionId": parent,
+                "childSessionId": child_session_id,
+                "mode": "continuable",
+            }),
+        });
+    }
+
+    /// 给选中的子代理发一条消息（排队到下一轮）。
+    fn send_subagent_prompt(&mut self, cx: &mut Context<Self>) {
+        let text = self.subagent_input.read(cx).value().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let (Some(parent), Some(child)) = (self.selected.clone(), self.subagent_target.clone())
+        else {
+            return;
+        };
+        self.subagent_clear = true;
+        let request_id = format!("omd-sub-{}", uuid_like());
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "subagents/prompt".to_string(),
+            endpoint: "subagents/prompt".to_string(),
+            args: json!({
+                "request": {
+                    "requestId": request_id,
+                    "parentSessionId": parent,
+                    "childSessionId": child,
+                    "mode": "continuable",
+                    "delivery": "queue",
+                    "content": [ { "type": "text", "text": text } ],
+                }
+            }),
+        });
+        cx.notify();
     }
 
     /// goal 变更（pause/resume/complete/clear）。
@@ -14274,6 +14350,11 @@ impl Render for Root {
             if let Some(input) = self.block_inputs.get(slot).cloned() {
                 input.update(cx, |state, cx| state.set_value("", window, cx));
             }
+        }
+        if self.subagent_clear {
+            self.subagent_clear = false;
+            self.subagent_input
+                .update(cx, |state, cx| state.set_value("", window, cx));
         }
         // 跨文件 WorkspaceEdit 里"文件已经开着"的那部分（这里才有 window）
         if !self.pending_workspace_edits.is_empty() {
@@ -21260,6 +21341,233 @@ impl Render for Root {
             None
         };
 
+        // 子代理面板：session/list 里 parentSessionId == 当前会话的子会话
+        let subagents_modal = if self.show_subagents {
+            let parent = self.selected.clone().unwrap_or_default();
+            let children: Vec<SessionRow> = self
+                .sessions
+                .iter()
+                .filter(|row| {
+                    row.parent.as_deref() == Some(parent.as_str())
+                })
+                .cloned()
+                .collect();
+            let mut rows: Vec<AnyElement> = Vec::new();
+            if children.is_empty() {
+                rows.push(
+                    div()
+                        .px(px(4.))
+                        .py(px(12.))
+                        .text_xs()
+                        .text_color(rgb(0x707786))
+                        .child("No subagents for this session")
+                        .into_any_element(),
+                );
+            }
+            for child in children {
+                let id = child.id.clone();
+                let selected_child = self.subagent_target.as_deref() == Some(id.as_str());
+                let short = if id.len() > 24 { format!("…{}", &id[id.len() - 20..]) } else { id.clone() };
+                let status = if child.running {
+                    ("running", 0xc9a15a)
+                } else {
+                    ("idle", 0x6b7386)
+                };
+                let choose_id = id.clone();
+                let interrupt_id = id.clone();
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("subagent-row-{id}")))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        .px(px(6.))
+                        .py(px(6.))
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .bg(if selected_child { rgb(0x16222f) } else { rgb(0x1b1e26) })
+                        .hover(|style| style.bg(rgb(0x20232b)))
+                        .on_click(cx.listener(move |this, _ev, _win, cx| {
+                            this.subagent_target = Some(choose_id.clone());
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_family("monospace")
+                                        .text_color(rgb(0xd7dce6))
+                                        .child(SharedString::from(short)),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x5a6070))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(SharedString::from(if child.title.trim().is_empty() { child.cwd.clone() } else { child.title.clone() })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(status.1))
+                                .child(SharedString::from(status.0)),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("subagent-interrupt-{id}")))
+                                .px(px(6.))
+                                .py(px(2.))
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(rgb(0xff5663))
+                                .hover(|style| style.bg(rgb(0x3a1f24)))
+                                .child("interrupt")
+                                .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                    cx.stop_propagation();
+                                    this.interrupt_subagent(&interrupt_id);
+                                    cx.notify();
+                                })),
+                        )
+                        .into_any_element(),
+                );
+            }
+            Some(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .occlude()
+                    .bg(rgba(0x000000cc))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev, _win, cx| {
+                            this.show_subagents = false;
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id("subagents-card")
+                            .w(px(620.))
+                            .max_h(px(480.))
+                            .flex()
+                            .flex_col()
+                            .rounded_lg()
+                            .bg(rgb(0x1b1e26))
+                            .border_1()
+                            .border_color(rgb(0x23272f))
+                            .overflow_hidden()
+                            .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .px(px(14.))
+                                    .py(px(10.))
+                                    .child(div().text_sm().child("Subagents"))
+                                    .child(div().flex_1())
+                                    .child(
+                                        div()
+                                            .id("subagents-close")
+                                            .px(px(8.))
+                                            .py(px(2.))
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .text_color(rgb(0x9ca3b0))
+                                            .hover(|style| style.bg(rgb(0x20232b)))
+                                            .child("close")
+                                            .on_click(cx.listener(|this, _ev, _win, cx| {
+                                                this.show_subagents = false;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(div().h(px(1.)).w_full().bg(rgb(0x23272f)))
+                            .child(
+                                div()
+                                    .id("subagents-body")
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .flex_1()
+                                    .min_h(px(0.))
+                                    .overflow_y_scroll()
+                                    .px(px(10.))
+                                    .py(px(6.))
+                                    .children(rows),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .px(px(10.))
+                                    .py(px(8.))
+                                    .border_t_1()
+                                    .border_color(rgb(0x23272f))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .rounded(px(6.))
+                                            .bg(rgb(0x14171d))
+                                            .border_1()
+                                            .border_color(rgb(0x23272f))
+                                            .px(px(8.))
+                                            .py(px(4.))
+                                            .child(
+                                                Input::new(&self.subagent_input)
+                                                    .bordered(false)
+                                                    .appearance(false)
+                                                    .focus_bordered(false)
+                                                    .text_xs(),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("subagent-send")
+                                            .px(px(10.))
+                                            .py(px(4.))
+                                            .rounded(px(6.))
+                                            .border_1()
+                                            .border_color(rgb(0x2f6fb5))
+                                            .text_xs()
+                                            .text_color(rgb(0x7fb5e8))
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgb(0x16222f)))
+                                            .child(match self.subagent_target {
+                                                Some(_) => "Send",
+                                                None => "Pick one",
+                                            })
+                                            .on_click(cx.listener(|this, _ev, _win, cx| {
+                                                this.send_subagent_prompt(cx);
+                                            })),
+                                    ),
+                            ),
+                    ),
+            )
+        } else {
+            None
+        };
+
         // tab 条溢出状态：决定左右箭头是否显示 / 是否还能滚
         let tab_overflow = tab_strip_viewport > 0. && tab_content_w > tab_strip_viewport + 4.;
         let tab_offset_x = -f32::from(self.tab_scroll.offset().x);
@@ -21973,6 +22281,24 @@ impl Render for Root {
                             })
                             .child(
                                 div()
+                                    .id("subagents")
+                                    .w(px(HEAD_BTN)).h(px(HEAD_BTN))
+                                    .flex().items_center().justify_center()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_size(px(HEAD_GLYPH))
+                                    .text_color(rgb(0xd0d4dc))
+                                    .hover(|style| style.bg(rgb(0x23272f)))
+                                    .child("⇄")
+                                    .on_click(cx.listener(|this, _ev, _win, cx| {
+                                        this.show_subagents = true;
+                                        this.subagent_target = None;
+                                        let _ = this.cmds.send_blocking(Cmd::Refresh);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
                                     .id("schedules")
                                     .w(px(HEAD_BTN)).h(px(HEAD_BTN))
                                     .flex().items_center().justify_center()
@@ -22047,6 +22373,9 @@ impl Render for Root {
             }))
             .children(schedules_modal.map(|modal| {
                 gpui_kit::deferred(modal).with_priority(45).into_any_element()
+            }))
+            .children(subagents_modal.map(|modal| {
+                gpui_kit::deferred(modal).with_priority(46).into_any_element()
             }))
             .children(palette.map(|modal| {
                 gpui_kit::deferred(modal).with_priority(60).into_any_element()
@@ -22226,6 +22555,10 @@ fn load_sessions_cache() -> Option<Vec<SessionRow>> {
                     running: false,
                     blank: item.get("blank").and_then(|v| v.as_bool()).unwrap_or(false),
                     updated_at: item.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0),
+                    parent: item
+                        .get("parent")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
                 })
             })
             .collect(),
@@ -22243,6 +22576,7 @@ fn save_sessions_cache(rows: &[SessionRow]) {
                 "running": row.running,
                 "blank": row.blank,
                 "updated_at": row.updated_at,
+                "parent": row.parent,
             })
         })
         .collect();
