@@ -58,6 +58,11 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 | **终端键盘**：点击终端聚焦，按键→PTY（Enter/Backspace/方向键/Home/End/Delete/PageUp·Down/Ctrl+字母/可打印字符） | ✅ |
 | **流式/完整回复**：`assistant/message` 事件（**不用 `assistantStream`**——它只推增量帧，流结束不固化） | ✅ |
 | **图片消息**：事件里 image 块 → `session/attachment` 拉 base64 → 解码 BGRA → GPUI `img()`（240px 圆角） | ✅（内联图 prompt 端到端验证） |
+| **插件管理**：`pluginManager/listPlugins` + `setPluginEnabled` + `listBundles` + `installBundle`/`removeBundle` | ✅（安装带 requestId、可取消、构建脚本批准、失败原因回显） |
+| **插件市场**：`pluginMarket/listIndexes` + `search`（分页/筛选字段留给协议） | ✅（搜索、安装/更新、状态徽章） |
+| **消息反馈**：`messageFeedback/list` + `put`/`delete`，assistant 块下的 👍/👎（再点撤回） | ✅ |
+| **会话管理**：tab 右键 → Fork（`session/fork`）/ 置顶（`workspace/pinSession·unpinSession`）/ 归档（`workspace/archiveSession`） | ✅ |
+| **Slash 命令**：`commands/list` 进命令面板；输入框以已知 `/命令` 开头发送时走 `commands/execute` | ✅ |
 
 **dsh 的单写者模型**（踩到的坑）：一个会话同时只能有一个写句柄。
 浏览器里开着这个会话时，GUI 发 `session/prompt` 会得到
@@ -66,9 +71,10 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 
 **已知缺口**：
 
-- 没有停止/取消按钮（`session/cancel`）
-- 没有终端块（M2）
-- 没有图片渲染（`session/attachment`）
+- 附件上传（`fileUploads/upload`）尚未接到输入框（图片走内联 prompt）
+- 计划/目标、日程、子代理面板（`goals/*`、`schedule/*`、`subagents/*`）尚未做 UI
+- 插件市场分页（`nextOffset`）只加载第一页；索引切换放在设置里改
+- 置顶状态只在本次运行内保留（`workspace/follow` 未接）
 
 ### 构建依赖（Linux）
 
@@ -105,6 +111,27 @@ DESTDIR=/tmp/gvt-pkg ZIG_GLOBAL_CACHE_DIR=/tmp/gvt-cache \
 ```
 
 运行时：`LD_LIBRARY_PATH=vendor/libghostty-vt/lib`（或 rpath）。绑定在 `crates/app/src/ghostty_vt.rs`（render-state 脏行路径）。
+
+### 内置浏览器（Linux / Wayland）
+
+CEF 二进制位于 `vendor/cef/<version>/cef_linux_x86_64/`，不随源码分发。
+
+```sh
+CEF_PATH="$PWD/vendor/cef" cargo build --release -p omd
+# 在 Wayland 桌面的终端运行；WAYLAND_DISPLAY 和 XDG_RUNTIME_DIR 由会话提供。
+OMD_BROWSER=1 LD_LIBRARY_PATH="$PWD/vendor/libghostty-vt/lib" ./target/release/omd
+```
+
+- GPUI 与 CEF 在初始化前选择会话；有 `WAYLAND_DISPLAY` 时使用原生 Wayland，不需要 `DISPLAY`。
+- Wayland 使用 CEF OSR 的 BGRA 像素回读，再上传到复用的 GPUI 纹理；这不是零拷贝。
+  当前 CEF 156 在 Wayland 下共享纹理捕获分配失败，因此不启用 DMA-BUF 导出，也不关闭 Chromium GPU 渲染。
+- X11 可设置 `OMD_FORCE_X11=1 OMD_BROWSER_ACCEL=1` 使用 DMA-BUF；
+  `OMD_BROWSER_CHILD=1` 则选择原生 X11 子窗口（需要同时设置 `OMD_BROWSER=1`）。
+- `OMD_BROWSER_URL` 指定初始页面，默认 `https://example.com`；CDP 默认端口为本机 `9222`，可用 `OMD_CDP_PORT` 修改。
+- 已在 GNOME/Mutter 原生 Wayland（移除 `DISPLAY`、隔离合成器禁用 XWayland）验证纹理显示、
+  原生鼠标聚焦、字母输入、Backspace 编辑及 CDP；页面收到的输入事件为可信事件。
+  中文 IME、剪贴板、弹出菜单与跨显示器缩放尚未验证。
+- 当前 CEF 配置关闭了 Chromium 沙箱；浏览器块尚不具备系统浏览器同等的安全隔离，不用于不可信站点。
 
 ### 代码结构
 
@@ -149,5 +176,16 @@ strings ~/.local/bin/herdr-app  | grep gpui           # GPUI 自绘
 
 ## 状态
 
-研究阶段完成，尚未开始编码。下一步：M0 spike（spawn host + token/cookie +
-`session/list` + `$events` 流式回显）。
+M0–M2 完成，M3 进行中（文件/编辑器、插件管理与市场、消息反馈、会话 fork/置顶/归档、
+slash 命令面板已接）。剩余：附件上传、目标/日程/子代理面板、终端搜索/Kitty 图形、
+跨重启的置顶状态（`workspace/follow`）。
+
+### 插件页与 tab 菜单
+
+- 设置 → Plugins 现在分三段：内置插件（启停）、Bundles（官方 on-demand 安装 / 卸载）、
+  Market（搜索 + 安装/更新；安装带 requestId，可取消，构建脚本需显式批准）。
+  `pluginMarket/*` 在未安装市场 bundle 的 profile 里返回 404，UI 会提示未启用而不是报错。
+- tab 上右键：Rename / Fork session / Pin·Unpin / Archive（归档会关闭对应 tab 并刷新列表）。
+- assistant 消息下方有 👍/👎（再点撤回），走 `messageFeedback/*`。
+- `Ctrl+K` 命令面板里会列出 `commands/list` 的 slash 命令；输入框里以已知
+  `/命令` 开头发送时直接走 `commands/execute`，不再当普通 prompt 发给模型。

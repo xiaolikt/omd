@@ -18,6 +18,7 @@ async fn main() -> Result<()> {
     let mut follow_msgs = 3usize;
     let mut list_only = false;
     let mut prompt: Option<String> = None;
+    let mut probe: Option<(String, Value)> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -25,6 +26,18 @@ async fn main() -> Result<()> {
             "--follow" => follow_msgs = args.next().unwrap_or_default().parse().unwrap_or(3),
             "--list-only" => list_only = true,
             "--prompt" => prompt = Some(args.next().ok_or_else(|| anyhow!("--prompt needs text"))?),
+            "--call" => {
+                let endpoint = args.next().ok_or_else(|| anyhow!("--call needs an endpoint"))?;
+                probe = Some((endpoint, Value::Null));
+            }
+            "--args" => {
+                let text = args.next().ok_or_else(|| anyhow!("--args needs JSON"))?;
+                let value: Value = serde_json::from_str(&text)?;
+                let Some((_, slot)) = probe.as_mut() else {
+                    return Err(anyhow!("--args must follow --call"));
+                };
+                *slot = value;
+            }
             other => return Err(anyhow!("unknown arg: {other}")),
         }
     }
@@ -291,6 +304,33 @@ async fn main() -> Result<()> {
                 Ok(v) => println!("PROBE {ep}: {}", v.to_string().chars().take(800).collect::<String>()),
                 Err(e) => println!("PROBE {ep} ERR: {e}"),
             }
+        }
+        return Ok(());
+    }
+
+    if let Some((endpoint, args)) = probe {
+        let sid = items
+            .first()
+            .and_then(|item| item.get("sessionId"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let args = if args.is_null() {
+            if endpoint.starts_with("commands/") {
+                json!({ "agentId": sid })
+            } else {
+                json!({})
+            }
+        } else {
+            args
+        };
+        println!("\n== {endpoint} ==");
+        match rpc.call(&endpoint, args).await {
+            Ok(v) => {
+                let text = serde_json::to_string_pretty(&v)?;
+                println!("{}", text.chars().take(4000).collect::<String>());
+            }
+            Err(e) => println!("ERR: {e}"),
         }
         return Ok(());
     }

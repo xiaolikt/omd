@@ -389,6 +389,8 @@ enum PaletteAction {
     GitStageAll,
     GitUnstageAll,
     GitCommit,
+    /// 把 `/name ` 放进输入框（dsh 的 slash 命令）
+    SlashCommand(String),
 }
 
 struct PaletteEntry {
@@ -964,6 +966,19 @@ enum Cmd {
         endpoint: String,
         args: Value,
     },
+    /// Fork 一个会话（最近完成的 turn 为边界）
+    ForkSession { session_id: String },
+    /// 安装一个插件包（独立任务跑，取消不会被排队堵住）
+    InstallPlugin {
+        name: String,
+        spec: String,
+        registry: Option<String>,
+        request_id: String,
+        /// 批准构建脚本后重试时带上
+        approved_builds: Option<Vec<String>>,
+    },
+    /// 取消一个进行中的安装
+    CancelInstall { request_id: String },
     Cancel,
     Decide { event_id: String, allow: bool },
     AnswerQuestion { event_id: String, answer: Value },
@@ -1053,6 +1068,11 @@ enum Ev {
     ApprovalGone,
     Question { event_id: String, request: Value },
     QuestionGone,
+    /// 一个插件安装结束（成功/失败/取消/需要批准构建脚本）
+    InstallSettled {
+        name: String,
+        result: std::result::Result<Value, String>,
+    },
     DshInfo { version: String, bundled: bool },
     DshUpdate { done: bool, message: String },
     Error(String),
@@ -1090,6 +1110,7 @@ fn ev_name(ev: &Ev) -> &'static str {
         Ev::ApprovalGone => "ApprovalGone",
         Ev::Question { .. } => "Question",
         Ev::QuestionGone => "QuestionGone",
+        Ev::InstallSettled { .. } => "InstallSettled",
         Ev::DshInfo { .. } => "DshInfo",
         Ev::DshUpdate { .. } => "DshUpdate",
         Ev::Error(_) => "Error",
@@ -1943,6 +1964,84 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             })
                             .await;
                     }
+                    Cmd::ForkSession { session_id } => {
+                        match rpc
+                            .call("session/fork", json!({
+                                "request": { "sessionId": session_id }
+                            }))
+                            .await
+                        {
+                            Ok(value) => {
+                                if let Some(new_id) =
+                                    value.get("sessionId").and_then(|v| v.as_str())
+                                {
+                                    eprintln!("[worker] forked {session_id} -> {new_id}");
+                                    let _ = evs.send(Ev::SessionCreated(new_id.to_string())).await;
+                                } else {
+                                    let _ = evs
+                                        .send(Ev::Error(format!(
+                                            "fork returned no session id: {value}"
+                                        )))
+                                        .await;
+                                }
+                            }
+                            Err(err) => {
+                                let _ = evs.send(Ev::Error(format!("fork failed: {err}"))).await;
+                            }
+                        }
+                    }
+                    Cmd::InstallPlugin {
+                        name,
+                        spec,
+                        registry,
+                        request_id,
+                        approved_builds,
+                    } => {
+                        // 安装可能跑几分钟：放到独立任务里，让 CancelInstall
+                        // 能穿过命令循环立刻送达。
+                        let http = http.clone();
+                        let base = base.clone();
+                        let evs = evs.clone();
+                        tokio::spawn(async move {
+                            let rpc = Rpc::new(&http, &base);
+                            let mut options = json!({ "requestId": request_id, "enabled": true });
+                            if let Some(registry) = registry {
+                                options["registry"] = json!(registry);
+                            }
+                            if let Some(builds) = approved_builds {
+                                options["approvedBuilds"] = json!(builds);
+                            }
+                            let r = rpc
+                                .call("pluginManager/installBundle", json!({
+                                    "spec": spec,
+                                    "options": options,
+                                }))
+                                .await;
+                            let _ = evs
+                                .send(Ev::InstallSettled {
+                                    name,
+                                    result: r.map_err(|e| e.to_string()),
+                                })
+                                .await;
+                        });
+                    }
+                    Cmd::CancelInstall { request_id } => {
+                        match rpc
+                            .call("pluginManager/cancelInstall", json!({
+                                "requestId": request_id
+                            }))
+                            .await
+                        {
+                            Ok(value) => {
+                                eprintln!("[worker] cancelInstall {request_id}: {value}");
+                            }
+                            Err(err) => {
+                                let _ = evs
+                                    .send(Ev::Error(format!("cancel install failed: {err}")))
+                                    .await;
+                            }
+                        }
+                    }
                     Cmd::TerminalInput { term_id, data } => {
                         let found = terminal_up.lock().await.get(&term_id).is_some();
                         eprintln!("[worker] TerminalInput term={term_id} found={found} bytes={}", data.len());
@@ -2336,7 +2435,12 @@ fn push_blocks(node: &Value, out: &mut String) {
 #[derive(Clone)]
 enum TranscriptBlock {
     User { uid: u64, text: String },
-    Assistant { uid: u64, text: String },
+    Assistant {
+        uid: u64,
+        text: String,
+        /// 可反馈的 assistant 消息 id（流式快照里可能没有）
+        message_id: Option<String>,
+    },
     Reasoning { uid: u64, text: String, expanded: bool },
     Tool {
         uid: u64,
@@ -2432,6 +2536,35 @@ static NEXT_BLOCK_UID: AtomicU64 = AtomicU64::new(1);
 
 fn block_uid() -> u64 {
     NEXT_BLOCK_UID.fetch_add(1, Ordering::SeqCst)
+}
+
+/// 一个包安装的进行状态（市场 / bundle 安装按钮用）。
+#[derive(Clone, Debug)]
+struct InstallState {
+    /// installBundle 的 requestId（取消用）
+    request_id: String,
+    /// 安装的 spec（重试用）
+    spec: String,
+    registry: Option<String>,
+    status: InstallStatus,
+}
+
+#[derive(Clone, Debug)]
+enum InstallStatus {
+    Running,
+    /// 完成（附一句人话摘要）
+    Done(String),
+    /// 失败（附错误摘要）
+    Failed(String),
+    /// 需要批准构建脚本：包名列表
+    NeedsBuilds(Vec<String>),
+}
+
+/// 一条已存在的消息反馈（messageFeedback/list 的 item）。
+#[derive(Clone, Debug)]
+struct FeedbackState {
+    rating: String,
+    version: String,
 }
 
 struct Root {
@@ -2658,6 +2791,31 @@ struct Root {
     /// 设置页左侧的搜索框。
     settings_search: Entity<InputState>,
     plugins_input: Entity<InputState>,
+    /// pluginManager/listBundles 的结果（安装/可安装的 bundle）
+    bundles_doc: Vec<Value>,
+    /// pluginMarket/listIndexes 的结果（配置的市场索引）
+    market_indexes: Vec<Value>,
+    /// 当前选用的市场索引 URL
+    market_url: Option<String>,
+    /// pluginMarket/search 的结果（一页）
+    market_doc: Value,
+    market_input: Entity<InputState>,
+    market_loading: bool,
+    market_error: Option<String>,
+    /// 上一次市场搜索的关键词（刷新/安装后重搜用）
+    market_query: String,
+    /// 安装进行中/刚结束的包：包名 → 状态
+    install_state: std::collections::HashMap<String, InstallState>,
+    /// 置顶的会话（workspace/pinSession 返回的集合）
+    pinned_sessions: Vec<String>,
+    /// commands/list 的结果（当前 agent 的 slash 命令）
+    slash_commands: Vec<Value>,
+    /// 发起了归档的 panel：归档成功后关掉它
+    archive_pending: Option<String>,
+    /// 消息反馈的本地状态：messageId → 反馈项
+    feedback: std::collections::HashMap<String, FeedbackState>,
+    /// tab 右键菜单：panel id + 菜单弹出的位置
+    tab_menu: Option<(String, Point<Pixels>)>,
     /// 设置 → Browser：首页地址。
     browser_home_input: Entity<InputState>,
     /// 设置 → Browser：CDP 端口。
@@ -2704,6 +2862,8 @@ struct Root {
     pending_clear: bool,
     pending_question_clear: bool,
     _enter_sub: Subscription,
+    /// 市场搜索框的回车订阅
+    _market_sub: Subscription,
 }
 
 async fn serve_control(
@@ -3411,6 +3571,15 @@ impl Root {
             }));
         }
         let plugins_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter plugins…"));
+        let market_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search the plugin market…"));
+        let market_sub = cx.subscribe(&market_input, |this, _entity, ev: &InputEvent, cx| {
+            if let InputEvent::PressEnter { shift, .. } = ev {
+                if !*shift {
+                    let text = this.market_input.read(cx).value().trim().to_string();
+                    this.market_search(Some(text), false);
+                }
+            }
+        });
         let browser_home_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com"));
         let browser_port_input = cx.new(|cx| InputState::new(window, cx).placeholder("9222"));
@@ -3657,6 +3826,20 @@ impl Root {
             settings_input,
             settings_search,
             plugins_input,
+            bundles_doc: Vec::new(),
+            market_indexes: Vec::new(),
+            market_url: None,
+            market_doc: Value::Null,
+            market_input,
+            market_loading: false,
+            market_error: None,
+            market_query: String::new(),
+            install_state: std::collections::HashMap::new(),
+            pinned_sessions: Vec::new(),
+            slash_commands: Vec::new(),
+            feedback: std::collections::HashMap::new(),
+            archive_pending: None,
+            tab_menu: None,
             browser_home_input,
             browser_port_input,
             pending_panel_tab: None,
@@ -3693,6 +3876,7 @@ impl Root {
             pending_clear: false,
             pending_question_clear: false,
             _enter_sub: enter_sub,
+            _market_sub: market_sub,
         };
         {
             let home = root.browser_home.clone();
@@ -3711,6 +3895,7 @@ impl Root {
                     text: format!(
                         "stress block #{i}\n\n这是压测用的段落，带 `inline code` 与列表：\n\n- item a\n- item b\n\n```rust\nfn f{i}() -> u32 {{ {i} }}\n```\n"
                     ),
+                    message_id: None,
                 });
             }
             // OMD_STRESS_FULL=1 → 一次全铺（A/B 对照用）
@@ -4141,6 +4326,20 @@ impl Root {
                     space.activate_panel(&session_id);
                 }
                 self.current_space = Some(space_id);
+                // 拉这个会话已有的消息反馈（点赞/点踩的初始高亮 + version）
+                self.feedback.clear();
+                let _ = self.cmds.send_blocking(Cmd::Call {
+                    tag: "feedback/list".to_string(),
+                    endpoint: "messageFeedback/list".to_string(),
+                    args: json!({ "request": { "sessionId": session_id.clone() } }),
+                });
+                // slash 命令按 agent 作用域，切换会话时重新拉
+                self.slash_commands.clear();
+                let _ = self.cmds.send_blocking(Cmd::Call {
+                    tag: "commands/list".to_string(),
+                    endpoint: "commands/list".to_string(),
+                    args: json!({ "agentId": session_id.clone() }),
+                });
                 self.selected = Some(session_id);
                 self.followed_once = true;
                 self.save_state();
@@ -4238,6 +4437,7 @@ impl Root {
                             .push(TranscriptBlock::Assistant {
                                 uid: block_uid(),
                                 text: state.text,
+                                message_id: None,
                             });
                     }
                 }
@@ -4320,6 +4520,104 @@ impl Root {
                                 endpoint: "pluginManager/listPlugins".to_string(),
                                 args: json!({}),
                             });
+                        }
+                        "plugins/bundles" => {
+                            self.bundles_doc = value.as_array().cloned().unwrap_or_default();
+                        }
+                        "plugins/market-indexes" => {
+                            self.market_indexes = value.as_array().cloned().unwrap_or_default();
+                            let first = self
+                                .market_indexes
+                                .iter()
+                                .find(|idx| {
+                                    !idx
+                                        .get("error")
+                                        .and_then(|v| v.as_str())
+                                        .is_some_and(|err| !err.is_empty())
+                                })
+                                .or_else(|| self.market_indexes.first());
+                            if self.market_url.is_none() {
+                                self.market_url = first
+                                    .and_then(|idx| idx.get("url"))
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string);
+                            }
+                            if self.market_url.is_some() && self.market_doc.is_null() {
+                                self.market_search(None, false);
+                            }
+                        }
+                        "plugins/market" => {
+                            self.market_loading = false;
+                            self.market_doc = value;
+                        }
+                        "plugins/remove" => {
+                            self.reload_plugins();
+                            if self.market_url.is_some() {
+                                self.market_search(None, true);
+                            }
+                        }
+                        "session/pin" | "session/unpin" => {
+                            self.pinned_sessions = value
+                                .get("pinnedSessionIds")
+                                .and_then(|v| v.as_array())
+                                .map(|ids| {
+                                    ids.iter()
+                                        .filter_map(|id| id.as_str().map(str::to_string))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                        }
+                        "session/archive" => {
+                            // 归档成功：关掉对应 tab 并刷新会话列表
+                            if let Some(panel) = self.archive_pending.clone() {
+                                self.archive_pending = None;
+                                self.close_panel_everywhere(&panel, cx);
+                            }
+                            let _ = self.cmds.send_blocking(Cmd::Refresh);
+                        }
+                        "feedback/list" => {
+                            // 结果可能是 {ok, value:{items}} 或直接 {items}
+                            let items = value
+                                .pointer("/value/items")
+                                .and_then(|v| v.as_array())
+                                .or_else(|| value.get("items").and_then(|v| v.as_array()))
+                                .cloned()
+                                .unwrap_or_default();
+                            self.feedback.clear();
+                            for item in items {
+                                let Some(message_id) =
+                                    item.get("messageId").and_then(|v| v.as_str())
+                                else {
+                                    continue;
+                                };
+                                let rating = item
+                                    .get("rating")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let version = item
+                                    .get("version")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                self.feedback.insert(
+                                    message_id.to_string(),
+                                    FeedbackState { rating, version },
+                                );
+                            }
+                        }
+                        "feedback/put" | "feedback/delete" => {
+                            // 版本号变了：重新拉一遍，保证后续操作不冲突
+                            if let Some(session_id) = self.selected.clone() {
+                                let _ = self.cmds.send_blocking(Cmd::Call {
+                                    tag: "feedback/list".to_string(),
+                                    endpoint: "messageFeedback/list".to_string(),
+                                    args: json!({ "request": { "sessionId": session_id } }),
+                                });
+                            }
+                        }
+                        "commands/list" => {
+                            self.slash_commands = value.as_array().cloned().unwrap_or_default();
                         }
                         "session/search" => {
                             self.search_error = None;
@@ -4430,9 +4728,21 @@ impl Root {
                     },
                     Err(err) => {
                         eprintln!("[ui] rpc error {endpoint}: {}", err.chars().take(300).collect::<String>());
-                        if tag == "plugins/list" || tag == "plugins/toggle" {
+                        if tag == "plugins/list" || tag == "plugins/toggle" || tag == "plugins/bundles" {
                             self.settings_tab_error =
                                 Some(err.chars().take(160).collect::<String>());
+                        }
+                        if tag == "plugins/market-indexes" {
+                            // 市场是可选 bundle：未装时 404，不算错误
+                            self.market_indexes.clear();
+                            self.market_error = Some(
+                                "plugin market is not enabled in this profile (install dsh-plugin-market)"
+                                    .to_string(),
+                            );
+                        }
+                        if tag == "plugins/market" {
+                            self.market_loading = false;
+                            self.market_error = Some(err.chars().take(160).collect::<String>());
                         }
                         if tag == "session/search" {
                             self.search_error = Some(if err.contains("search is disabled") {
@@ -4452,6 +4762,8 @@ impl Root {
             }
             Ev::SessionCreated(session_id) => {
                 eprintln!("[ui] session created {session_id}");
+                // 列表里补一行（fork 出来的会话也需要出现在侧栏）
+                let _ = self.cmds.send_blocking(Cmd::Refresh);
                 self.assign_block_input(&session_id);
                 if let Some((leaf, dir)) = self.pending_split.take() {
                     // 分屏装 dsh：新会话直接进这个 tab 的新 pane
@@ -4605,6 +4917,76 @@ impl Root {
             }
             Ev::QuestionGone => {
                 self.question = None;
+            }
+            Ev::InstallSettled { name, result } => {
+                let summary = match &result {
+                    Ok(value) => {
+                        let application = value
+                            .get("application")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let version = value
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let pending_builds: Vec<String> = value
+                            .get("pendingBuilds")
+                            .and_then(|v| v.as_array())
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(|v| v.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if !pending_builds.is_empty() {
+                            if let Some(state) = self.install_state.get_mut(&name) {
+                                state.status = InstallStatus::NeedsBuilds(pending_builds);
+                            }
+                            cx.notify();
+                            return;
+                        }
+                        match application {
+                            "applied" => format!(
+                                "installed{}",
+                                if version.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" v{version}")
+                                }
+                            ),
+                            "restart-required" => "installed · restart the engine to apply"
+                                .to_string(),
+                            "overridden" => "installed (kept disabled)".to_string(),
+                            "cancelled" => "cancelled".to_string(),
+                            "failed" => {
+                                let detail = value
+                                    .pointer("/error/message")
+                                    .and_then(|v| v.as_str())
+                                    .or_else(|| value.pointer("/packageResult/kind").and_then(|v| v.as_str()))
+                                    .unwrap_or("failed");
+                                detail.to_string()
+                            }
+                            other => other.to_string(),
+                        }
+                    }
+                    Err(err) => err.chars().take(120).collect::<String>(),
+                };
+                let failed = matches!(result.as_ref().err(), Some(_))
+                    || matches!(&result, Ok(value) if value.get("application").and_then(|v| v.as_str()) == Some("failed"));
+                if let Some(state) = self.install_state.get_mut(&name) {
+                    state.status = if failed {
+                        InstallStatus::Failed(summary)
+                    } else {
+                        InstallStatus::Done(summary)
+                    };
+                }
+                // 安装改变了清单：刷新插件页三份数据
+                self.reload_plugins();
+                if self.market_url.is_some() {
+                    self.market_search(None, false);
+                }
+                cx.notify();
             }
             Ev::DshInfo { version, bundled } => {
                 self.dsh_version = Some(version);
@@ -5174,6 +5556,69 @@ impl Root {
             let _ = self.cmds.send_blocking(Cmd::NewSession {
                 cwd: Some(space_cwd),
             });
+        }
+        self.save_state();
+        cx.notify();
+    }
+
+    /// 把一个 panel（dsh 会话）从所有空间/tab 里摘掉（归档后用）。
+    /// 空 tab 跟着删；不杀 dsh 会话（归档本身已经停了它）。
+    fn close_panel_everywhere(&mut self, panel_id: &str, cx: &mut Context<Self>) {
+        for space in &mut self.spaces {
+            for tab in &mut space.panels {
+                tab.blocks.retain(|block| block != panel_id);
+                if tab.active.as_deref() == Some(panel_id) {
+                    tab.active = tab.blocks.first().cloned();
+                }
+            }
+            let closed_here: Vec<String> = space
+                .panels
+                .iter()
+                .filter(|tab| tab.blocks.is_empty())
+                .map(|tab| tab.id.clone())
+                .collect();
+            space.panels.retain(|tab| !tab.blocks.is_empty());
+            if space
+                .active_panel
+                .as_deref()
+                .is_some_and(|id| closed_here.iter().any(|closed| closed == id))
+            {
+                space.active_panel = space.panels.first().map(|tab| tab.id.clone());
+            }
+        }
+        // 绑定这个会话的 pane 一起清（终端 pane 的 PTY 由 terminal/close 负责）
+        let term_ids: Vec<String> = self
+            .panes
+            .iter()
+            .filter(|pane| pane.session.as_deref() == Some(panel_id) && !pane.term_id.is_empty())
+            .map(|pane| pane.term_id.clone())
+            .collect();
+        for term_id in term_ids {
+            let _ = self.cmds.send_blocking(Cmd::Call {
+                tag: "terminal-close".to_string(),
+                endpoint: "terminal/close".to_string(),
+                args: json!({ "id": term_id }),
+            });
+        }
+        self.panes
+            .retain(|pane| pane.session.as_deref() != Some(panel_id));
+        if self.selected.as_deref() == Some(panel_id) {
+            let next = self
+                .current_space
+                .as_ref()
+                .and_then(|id| self.spaces.iter().find(|space| &space.id == id))
+                .and_then(|space| space.current_tab())
+                .and_then(|tab| tab.active.clone().or_else(|| tab.blocks.first().cloned()));
+            self.selected = next.clone();
+            if let Some(next) = next {
+                let _ = self.cmds.send_blocking(Cmd::Follow(next.clone()));
+                let _ = self
+                    .cmds
+                    .send_blocking(Cmd::JobsWatch { session_id: Some(next) });
+            } else {
+                self.items.clear();
+                self.streaming = None;
+            }
         }
         self.save_state();
         cx.notify();
@@ -6382,11 +6827,7 @@ impl Root {
             SettingsTab::Plugins => {
                 self.plugins_input
                     .update(cx, |state, cx| state.set_value("", window, cx));
-                let _ = self.cmds.send_blocking(Cmd::Call {
-                    tag: "plugins/list".to_string(),
-                    endpoint: "pluginManager/listPlugins".to_string(),
-                    args: json!({}),
-                });
+                self.reload_plugins();
                 self.reload_settings();
             }
             _ => {
@@ -6406,6 +6847,107 @@ impl Root {
             tag: "settings/describe".to_string(),
             endpoint: "settings/describe".to_string(),
             args: json!({}),
+        });
+    }
+
+    /// 刷新插件页的全部数据：内置插件 + bundle 清单 + 市场索引。
+    fn reload_plugins(&mut self) {
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "plugins/list".to_string(),
+            endpoint: "pluginManager/listPlugins".to_string(),
+            args: json!({}),
+        });
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "plugins/bundles".to_string(),
+            endpoint: "pluginManager/listBundles".to_string(),
+            args: json!({}),
+        });
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "plugins/market-indexes".to_string(),
+            endpoint: "pluginMarket/listIndexes".to_string(),
+            args: json!({}),
+        });
+    }
+
+    /// 用当前索引搜市场。text = None 时用上次的关键词。
+    fn market_search(&mut self, text: Option<String>, refresh: bool) {
+        let Some(url) = self.market_url.clone() else {
+            return;
+        };
+        let text = match text {
+            Some(text) => {
+                self.market_query = text.clone();
+                text
+            }
+            None => self.market_query.clone(),
+        };
+        self.market_loading = true;
+        self.market_error = None;
+        let mut query = json!({
+            "text": text,
+            "sort": { "kind": "relevance" },
+            "offset": 0,
+            "limit": 50,
+        });
+        if refresh {
+            query["refresh"] = json!(true);
+        }
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "plugins/market".to_string(),
+            endpoint: "pluginMarket/search".to_string(),
+            args: json!({ "url": url, "query": query }),
+        });
+    }
+
+    /// 发起一次安装（市场条目或官方 on-demand bundle 共用）。
+    fn start_install(&mut self, name: &str, spec: &str, registry: Option<String>, approved_builds: Option<Vec<String>>) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+        let request_id = format!("omd-install-{n}");
+        self.install_state.insert(
+            name.to_string(),
+            InstallState {
+                request_id: request_id.clone(),
+                spec: spec.to_string(),
+                registry: registry.clone(),
+                status: InstallStatus::Running,
+            },
+        );
+        let _ = self.cmds.send_blocking(Cmd::InstallPlugin {
+            name: name.to_string(),
+            spec: spec.to_string(),
+            registry,
+            request_id,
+            approved_builds,
+        });
+    }
+
+    /// Fork / 置顶 / 归档（tab 右键菜单的动作）。
+    fn fork_session(&mut self, session_id: &str) {
+        let _ = self.cmds.send_blocking(Cmd::ForkSession {
+            session_id: session_id.to_string(),
+        });
+    }
+
+    fn set_session_pinned(&mut self, session_id: &str, pinned: bool) {
+        let (endpoint, tag) = if pinned {
+            ("workspace/pinSession", "session/pin")
+        } else {
+            ("workspace/unpinSession", "session/unpin")
+        };
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: tag.to_string(),
+            endpoint: endpoint.to_string(),
+            args: json!({ "request": { "sessionId": session_id } }),
+        });
+    }
+
+    fn archive_session(&mut self, session_id: &str) {
+        let _ = self.cmds.send_blocking(Cmd::Call {
+            tag: "session/archive".to_string(),
+            endpoint: "workspace/archiveSession".to_string(),
+            args: json!({ "request": { "sessionId": session_id, "stopActivity": true } }),
         });
     }
 
@@ -8183,6 +8725,26 @@ impl Root {
                     action,
                 });
             }
+            // dsh 的 slash 命令（commands/list）
+            for command in &self.slash_commands {
+                let Some(name) = command.get("name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let description = command
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                entries.push(PaletteEntry {
+                    section: "Slash",
+                    label: format!("/{name}"),
+                    tag: String::new(),
+                    sub: description,
+                    badge: None,
+                    dot: None,
+                    action: PaletteAction::SlashCommand(name.to_string()),
+                });
+            }
         }
 
         if matches!(self.palette_tab, PaletteTab::All | PaletteTab::Tabs) {
@@ -8357,6 +8919,11 @@ impl Root {
             PaletteAction::OpenSettings => {
                 self.show_settings = true;
                 self.open_settings_tab(SettingsTab::General, window, cx);
+            }
+            PaletteAction::SlashCommand(name) => {
+                self.input.update(cx, |state, cx| {
+                    state.set_value(format!("/{name} "), window, cx);
+                });
             }
         }
         if !keep_focus {
@@ -8617,7 +9184,7 @@ impl Root {
     fn push_block(&mut self, block: TranscriptBlock) {
         // 自己刚发的消息引出的完整回复：逐字打出来（dsh 不一定推 text-delta）
         if self.awaiting_reply {
-            if let TranscriptBlock::Assistant { uid, text } = &block {
+            if let TranscriptBlock::Assistant { uid, text, .. } = &block {
                 let total = text.chars().count();
                 if total > 0 {
                     self.awaiting_reply = false;
@@ -8742,6 +9309,11 @@ impl Root {
                 });
             }
             "assistant/message" => {
+                let message_id = data
+                    .pointer("/message/id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .filter(|id| !id.is_empty());
                 let mut pushed = false;
                 if let Some(content) = data.pointer("/message/content").and_then(|v| v.as_array()) {
                     for block in content {
@@ -8764,6 +9336,7 @@ impl Root {
                                         self.push_block(TranscriptBlock::Assistant {
                                             uid: block_uid(),
                                             text: text.to_string(),
+                                            message_id: message_id.clone(),
                                         });
                                         pushed = true;
                                     }
@@ -8779,6 +9352,7 @@ impl Root {
                         self.push_block(TranscriptBlock::Assistant {
                             uid: block_uid(),
                             text: text.trim().to_string(),
+                            message_id,
                         });
                     }
                 }
@@ -9086,6 +9660,35 @@ impl Root {
         cx: &mut Context<Self>,
     ) {
         trace(format_args!("[ui] send_text_for {session_id} {text:?}"));
+        // 已知 slash 命令走 commands/execute，不进模型上下文
+        if let Some(rest) = text.trim().strip_prefix('/') {
+            let name = rest.split_whitespace().next().unwrap_or("");
+            let known = !name.is_empty()
+                && self.slash_commands.iter().any(|command| {
+                    command.get("name").and_then(|v| v.as_str()) == Some(name)
+                });
+            if known {
+                let line = text.trim().to_string();
+                if self.selected.as_deref() == Some(session_id.as_str()) {
+                    self.push_block(TranscriptBlock::Notice(format!("› {line}")));
+                    self.scroll.scroll_to_bottom();
+                    if clear_primary {
+                        self.pending_clear = true;
+                    }
+                }
+                let _ = self.cmds.send_blocking(Cmd::Call {
+                    tag: "commands/execute".to_string(),
+                    endpoint: "commands/execute".to_string(),
+                    args: json!({
+                        "agentId": session_id,
+                        "line": line,
+                        "submittedAttachments": [],
+                    }),
+                });
+                cx.notify();
+                return;
+            }
+        }
         if self.selected.as_deref() == Some(session_id.as_str()) {
             self.push_block(TranscriptBlock::User {
                 uid: block_uid(),
@@ -9509,6 +10112,74 @@ fn info_row(label: &str, value: &str) -> AnyElement {
                 .child(SharedString::from(value.to_string())),
         )
         .into_any_element()
+}
+
+/// 设置页里的小节标题。
+fn section_header(title: &str, sub: &str) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_baseline()
+        .gap(px(8.))
+        .px(px(16.))
+        .pt(px(18.))
+        .pb(px(8.))
+        .child(
+            div()
+                .text_sm()
+                .text_color(rgb(0xd7dce6))
+                .child(SharedString::from(title.to_string())),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x51637e))
+                .child(SharedString::from(sub.to_string())),
+        )
+        .into_any_element()
+}
+
+/// LocalizedText：字符串或 {en: …, zh: …}。优先中文，其次 en，其次任意。
+fn localized_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Object(map) => {
+            let pick = map
+                .get("zh")
+                .or_else(|| map.get("en"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            pick.or_else(|| {
+                map.values()
+                    .find_map(|v| v.as_str().map(str::to_string))
+            })
+        }
+        _ => None,
+    }
+}
+
+/// 市场条目默认版本的安装参数：(spec, registry)。
+fn market_install_target(entry: &Value) -> Option<(String, Option<String>)> {
+    let default_version = entry
+        .get("defaultVersion")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let versions = entry.get("versions")?.as_array()?;
+    let chosen = versions
+        .iter()
+        .find(|version| {
+            default_version
+                .as_deref()
+                .is_some_and(|dv| version.get("version").and_then(|v| v.as_str()) == Some(dv))
+        })
+        .or_else(|| versions.first())?;
+    let install = chosen.get("install")?;
+    let spec = install.get("spec")?.as_str()?.to_string();
+    let registry = install
+        .get("registry")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Some((spec, registry))
 }
 
 /// `@deepseek-ai/dsh-plugin-manager/tools` → `Plugin Manager / Tools`。
@@ -11326,6 +11997,37 @@ impl Element for BrowserElement {
                 width.round().max(1.) as u32,
                 height.round().max(1.) as u32,
             );
+            // 鼠标监听必须在 paint 阶段注册（prepaint 里调会触发 debug 断言）；
+            // 见 paint()。
+        } else {
+            crate::browser::child_bounds(
+                self.index,
+                x.round() as i32,
+                y.round() as i32,
+                width.round() as i32,
+                height.round() as i32,
+            );
+        }
+        Some(window.insert_hitbox(bounds, HitboxBehavior::Normal))
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui_kit::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        _: &mut App,
+    ) {
+        // 有窗口时 CEF 自己画（GPUI 这块留空）；OSR 时把导入的 dmabuf 纹理贴上。
+        if !crate::browser::osr_mode() {
+            return;
+        }
+        // 鼠标/键盘监听都必须在 paint 阶段注册（prepaint 里调会静默失效或触发断言）。
+        {
+            let scale = window.scale_factor();
             let index = self.index;
             let focus = self.focus.clone();
             // CEF 的鼠标坐标是 view 坐标（物理像素），GPUI 给的是窗口逻辑坐标。
@@ -11408,9 +12110,7 @@ impl Element for BrowserElement {
                 if phase.bubble() && inside(ev.position) {
                     let (x, y) = to_page(ev.position);
                     let (dx, dy) = match ev.delta {
-                        ScrollDelta::Pixels(delta) => {
-                            (f32::from(delta.x), f32::from(delta.y))
-                        }
+                        ScrollDelta::Pixels(delta) => (f32::from(delta.x), f32::from(delta.y)),
                         ScrollDelta::Lines(delta) => (delta.x * 40., delta.y * 40.),
                     };
                     crate::browser::osr_mouse_wheel(
@@ -11423,33 +12123,7 @@ impl Element for BrowserElement {
                     );
                 }
             });
-        } else {
-            crate::browser::child_bounds(
-                self.index,
-                x.round() as i32,
-                y.round() as i32,
-                width.round() as i32,
-                height.round() as i32,
-            );
         }
-        Some(window.insert_hitbox(bounds, HitboxBehavior::Normal))
-    }
-
-    fn paint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&gpui_kit::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _: &mut Self::RequestLayoutState,
-        _: &mut Self::PrepaintState,
-        window: &mut Window,
-        _: &mut App,
-    ) {
-        // 有窗口时 CEF 自己画（GPUI 这块留空）；OSR 时把导入的 dmabuf 纹理贴上。
-        if !crate::browser::osr_mode() {
-            return;
-        }
-        // gpui 要求 on_key_event 在 paint 阶段注册（prepaint 里调会静默失效）。
         let index = self.index;
         let mods = |modifiers: gpui_kit::Modifiers| -> u32 {
             let mut bits = 0;
@@ -12455,7 +13129,14 @@ fn term_rows(screen: &[Vec<Span>]) -> Vec<AnyElement> {
         .collect()
 }
 
-fn render_block(block: TranscriptBlock, reveal: Option<usize>, cx: &mut Context<Root>) -> AnyElement {
+fn render_block(
+    block: TranscriptBlock,
+    reveal: Option<usize>,
+    feedback: &std::collections::HashMap<String, FeedbackState>,
+    session_id: Option<&str>,
+    cmds: &Sender<Cmd>,
+    cx: &mut Context<Root>,
+) -> AnyElement {
     match block {
         // 用户消息靠右，气泡样式，不加 "you:" 这类 label
         TranscriptBlock::User { text, .. } => div()
@@ -12477,42 +13158,129 @@ fn render_block(block: TranscriptBlock, reveal: Option<usize>, cx: &mut Context<
                     .child(SharedString::from(text)),
             )
             .into_any_element(),
-        TranscriptBlock::Assistant { uid, text } => TextView::markdown(
-            SharedString::from(format!("md-{uid}")),
-            SharedString::from(match reveal {
-                Some(shown) => text.chars().take(shown).collect::<String>(),
-                None => text,
-            }),
-        )
-        .w_full()
-        .text_size(px(15.))
-        .line_height(relative(1.55))
-        .selectable(true)
-        .code_block_actions(|block: &gpui_kit::base::text::CodeBlock, _window, cx| {
-            let code = block.code().to_string();
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            use std::hash::{Hash as _, Hasher as _};
-            code.hash(&mut hasher);
-            let id = format!("copy-{:x}", hasher.finish());
-            let code_for_click = code.clone();
-            let label = match block.lang() {
-                Some(lang) => format!("{lang} · copy"),
-                None => "copy".to_string(),
-            };
-            div()
-                .id(SharedString::from(id))
-                .px(px(6.))
-                .py(px(1.))
-                .rounded_sm()
-                .bg(rgb(0x20232b))
-                .text_xs()
-                .cursor_pointer()
-                .child(SharedString::from(label))
-                .on_click(move |_ev, _win, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(code_for_click.clone()));
-                })
-        })
-        .into_any_element(),
+        TranscriptBlock::Assistant {
+            uid,
+            text,
+            message_id,
+        } => {
+            let markdown = TextView::markdown(
+                SharedString::from(format!("md-{uid}")),
+                SharedString::from(match reveal {
+                    Some(shown) => text.chars().take(shown).collect::<String>(),
+                    None => text,
+                }),
+            )
+            .w_full()
+            .text_size(px(15.))
+            .line_height(relative(1.55))
+            .selectable(true)
+            .code_block_actions(|block: &gpui_kit::base::text::CodeBlock, _window, cx| {
+                let code = block.code().to_string();
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                use std::hash::{Hash as _, Hasher as _};
+                code.hash(&mut hasher);
+                let id = format!("copy-{:x}", hasher.finish());
+                let code_for_click = code.clone();
+                let label = match block.lang() {
+                    Some(lang) => format!("{lang} · copy"),
+                    None => "copy".to_string(),
+                };
+                div()
+                    .id(SharedString::from(id))
+                    .px(px(6.))
+                    .py(px(1.))
+                    .rounded_sm()
+                    .bg(rgb(0x20232b))
+                    .text_xs()
+                    .cursor_pointer()
+                    .child(SharedString::from(label))
+                    .on_click(move |_ev, _win, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(code_for_click.clone()));
+                    })
+            });
+            let mut column = div().flex().flex_col().gap(px(3.)).w_full().child(markdown);
+            // 有 message id 才显示反馈按钮（流式快照里的块没有）
+            if let (Some(mid), Some(sid)) = (message_id.as_deref(), session_id) {
+                if !mid.is_empty() {
+                    let current = feedback.get(mid).map(|item| item.rating.clone());
+                    let version = feedback.get(mid).map(|item| item.version.clone());
+                    let build = |positive: bool| -> AnyElement {
+                        let active = if positive {
+                            current.as_deref() == Some("positive")
+                        } else {
+                            current.as_deref() == Some("negative")
+                        };
+                        let cmds = cmds.clone();
+                        let sid = sid.to_string();
+                        let mid = mid.to_string();
+                        let version = version.clone();
+                        let glyph = if positive { "👍" } else { "👎" };
+                        div()
+                            .id(SharedString::from(format!(
+                                "fb-{}-{mid}",
+                                if positive { "up" } else { "down" }
+                            )))
+                            .px(px(5.))
+                            .py(px(1.))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(if active {
+                                rgb(0x2f6fb5)
+                            } else {
+                                rgb(0x20232b)
+                            })
+                            .bg(if active { rgb(0x16222f) } else { rgb(0x161a21) })
+                            .text_xs()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x20232b)))
+                            .child(glyph)
+                            .on_click(move |_ev, _win, _cx| {
+                                if active {
+                                    // 再点一次 = 撤回
+                                    let _ = cmds.send_blocking(Cmd::Call {
+                                        tag: "feedback/delete".to_string(),
+                                        endpoint: "messageFeedback/delete".to_string(),
+                                        args: json!({
+                                            "request": {
+                                                "sessionId": sid.clone(),
+                                                "messageId": mid.clone(),
+                                                "ifVersion": version.clone().unwrap_or_default(),
+                                            }
+                                        }),
+                                    });
+                                } else {
+                                    let if_version = version
+                                        .clone()
+                                        .map(Value::String)
+                                        .unwrap_or(Value::Null);
+                                    let _ = cmds.send_blocking(Cmd::Call {
+                                        tag: "feedback/put".to_string(),
+                                        endpoint: "messageFeedback/put".to_string(),
+                                        args: json!({
+                                            "request": {
+                                                "sessionId": sid.clone(),
+                                                "messageId": mid.clone(),
+                                                "rating": if positive { "positive" } else { "negative" },
+                                                "ifVersion": if_version,
+                                            }
+                                        }),
+                                    });
+                                }
+                            })
+                            .into_any_element()
+                    };
+                    column = column.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(4.))
+                            .child(build(true))
+                            .child(build(false)),
+                    );
+                }
+            }
+            column.into_any_element()
+        }
         TranscriptBlock::Reasoning {
             uid,
             text,
@@ -13013,6 +13781,7 @@ impl Render for Root {
         let renaming = self.renaming.clone();
         let tab_drag = self.tab_drag.clone();
         // 三层：space → tab → panel
+        let pinned_sessions = self.pinned_sessions.clone();
         let tab_chips: Vec<(String, String, bool)> = current_space
             .as_ref()
             .map(|space| {
@@ -13022,9 +13791,19 @@ impl Render for Root {
                     .iter()
                     .enumerate()
                     .map(|(index, tab)| {
+                        let mut title = tab_display_name(tab, index);
+                        let session = tab
+                            .active
+                            .as_deref()
+                            .or_else(|| tab.blocks.first().map(|id| id.as_str()));
+                        if session
+                            .is_some_and(|session| pinned_sessions.iter().any(|pin| pin == session))
+                        {
+                            title = format!("📌 {title}");
+                        }
                         (
                             tab.id.clone(),
-                            tab_display_name(tab, index),
+                            title,
                             active_panel.as_deref() == Some(tab.id.as_str()),
                         )
                     })
@@ -13178,7 +13957,14 @@ impl Render for Root {
                             }
                             _ => None,
                         };
-                        render_block(block, reveal, cx)
+                        render_block(
+                            block,
+                            reveal,
+                            &self.feedback,
+                            self.selected.as_deref(),
+                            &self.cmds,
+                            cx,
+                        )
                     }),
             )
             .children(streaming_markdown.map(|text| {
@@ -14400,6 +15186,562 @@ impl Render for Root {
                             .text_color(rgb(0x5a6070))
                             .child(SharedString::from(format!(
                                 "{shown_count} of {total} plugins"
+                            )))
+                            .into_any_element(),
+                    );
+                }
+
+                // ---- Bundles：可安装/已安装的包（pluginManager/listBundles）----
+                plugins_rows.push(section_header("Bundles", "packages managed by the engine"));
+                if self.bundles_doc.is_empty() {
+                    plugins_rows.push(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x707786))
+                            .child("No bundles reported")
+                            .into_any_element(),
+                    );
+                }
+                for bundle in self.bundles_doc.clone() {
+                    let name = bundle
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let version = bundle
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let description = bundle
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let installed = bundle.get("installed").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let removable = bundle.get("removable").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let official = bundle.get("official").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let install_spec = bundle
+                        .pointer("/installTarget/spec")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    // 市场也覆盖这个包时，安装按钮让位给市场条目（那边有版本选择）
+                    let covered_by_market = self
+                        .market_doc
+                        .get("entries")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|entries| {
+                            entries
+                                .iter()
+                                .any(|entry| entry.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
+                        });
+                    let badge = if installed {
+                        if official { "official · installed" } else { "installed" }
+                    } else if official {
+                        "official"
+                    } else {
+                        ""
+                    };
+                    plugins_rows.push(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(12.))
+                            .px(px(16.))
+                            .py(px(11.))
+                            .border_t_1()
+                            .border_color(rgb(0x1d2229))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_baseline()
+                                            .gap(px(8.))
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(rgb(0xe8ecf4))
+                                                    .child(SharedString::from(name.clone())),
+                                            )
+                                            .children(if version.is_empty() {
+                                                None
+                                            } else {
+                                                Some(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(0x6b7386))
+                                                        .child(SharedString::from(format!("v{version}"))),
+                                                )
+                                            }),
+                                    )
+                                    .children(if description.is_empty() {
+                                        None
+                                    } else {
+                                        Some(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x6b7386))
+                                                .overflow_hidden()
+                                                .child(SharedString::from(description)),
+                                        )
+                                    }),
+                            )
+                            .children(if badge.is_empty() {
+                                None
+                            } else {
+                                Some(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x51637e))
+                                        .child(SharedString::from(badge)),
+                                )
+                            })
+                            .child(if installed && removable {
+                                // 卸载：removeBundle 后刷新
+                                let remove_name = name.clone();
+                                div()
+                                    .id(SharedString::from(format!("bundle-remove-{name}")))
+                                    .px(px(10.))
+                                    .py(px(4.))
+                                    .rounded(px(6.))
+                                    .border_1()
+                                    .border_color(rgb(0x51303a))
+                                    .text_xs()
+                                    .text_color(rgb(0xff8a97))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(0x2a1b20)))
+                                    .child("Remove")
+                                    .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                        let _ = this.cmds.send_blocking(Cmd::Call {
+                                            tag: "plugins/remove".to_string(),
+                                            endpoint: "pluginManager/removeBundle".to_string(),
+                                            args: json!({ "name": remove_name.clone() }),
+                                        });
+                                        cx.notify();
+                                    }))
+                                    .into_any_element()
+                            } else if !installed && !covered_by_market && install_spec.is_some() {
+                                let install_name = name.clone();
+                                let spec = install_spec.clone().unwrap();
+                                div()
+                                    .id(SharedString::from(format!("bundle-install-{name}")))
+                                    .px(px(10.))
+                                    .py(px(4.))
+                                    .rounded(px(6.))
+                                    .border_1()
+                                    .border_color(rgb(0x2f6fb5))
+                                    .text_xs()
+                                    .text_color(rgb(0x7fb5e8))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(0x16222f)))
+                                    .child("Install")
+                                    .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                        this.start_install(&install_name, &spec, None, None);
+                                        cx.notify();
+                                    }))
+                                    .into_any_element()
+                            } else {
+                                div().into_any_element()
+                            })
+                            .into_any_element(),
+                    );
+                }
+
+                // ---- Market：市场索引 + 搜索（pluginMarket/*）----
+                plugins_rows.push(section_header("Market", "community plugin index"));
+                if !self.market_indexes.is_empty() {
+                    let index_title = self
+                        .market_url
+                        .as_ref()
+                        .and_then(|url| {
+                            self.market_indexes
+                                .iter()
+                                .find(|idx| idx.get("url").and_then(|v| v.as_str()) == Some(url.as_str()))
+                        })
+                        .and_then(|idx| localized_text(idx.get("title").unwrap_or(&Value::Null)))
+                        .unwrap_or_else(|| self.market_url.clone().unwrap_or_default());
+                    plugins_rows.push(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .pb(px(6.))
+                            .child(
+                                div()
+                                    .rounded(px(6.))
+                                    .bg(rgb(0x14171d))
+                                    .border_1()
+                                    .border_color(rgb(0x23272f))
+                                    .px(px(8.))
+                                    .py(px(4.))
+                                    .flex_1()
+                                    .child(
+                                        div()
+                                            .id("market-search-box")
+                                            .child(
+                                                Input::new(&self.market_input)
+                                                    .bordered(false)
+                                                    .appearance(false)
+                                                    .focus_bordered(false)
+                                                    .text_xs(),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("market-refresh")
+                                    .px(px(8.))
+                                    .py(px(5.))
+                                    .rounded(px(6.))
+                                    .border_1()
+                                    .border_color(rgb(0x23272f))
+                                    .text_xs()
+                                    .text_color(rgb(0x9ca3b0))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(0x20232b)))
+                                    .child(if self.market_loading { "…" } else { "↻" })
+                                    .on_click(cx.listener(|this, _ev, _win, cx| {
+                                        this.market_search(None, true);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x51637e))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .max_w(px(240.))
+                                    .child(SharedString::from(index_title)),
+                            )
+                            .into_any_element(),
+                    );
+                }
+                if let Some(err) = self.market_error.clone() {
+                    plugins_rows.push(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xff5663))
+                            .child(SharedString::from(err))
+                            .into_any_element(),
+                    );
+                }
+                let entries = self
+                    .market_doc
+                    .get("entries")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                if self.market_indexes.is_empty() {
+                    if self.market_error.is_none() {
+                        plugins_rows.push(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x707786))
+                                .child("No market index configured")
+                                .into_any_element(),
+                        );
+                    }
+                } else if entries.is_empty() && !self.market_loading {
+                    plugins_rows.push(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x707786))
+                            .child("No plugins matched")
+                            .into_any_element(),
+                    );
+                }
+                for entry in entries {
+                    let name = entry
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let title = localized_text(entry.get("title").unwrap_or(&Value::Null))
+                        .unwrap_or_else(|| name.clone());
+                    let description =
+                        localized_text(entry.get("description").unwrap_or(&Value::Null))
+                            .unwrap_or_default();
+                    let author = entry
+                        .get("author")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let version = entry
+                        .get("defaultVersion")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let status = entry
+                        .pointer("/installation/status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("not-installed")
+                        .to_string();
+                    let target = market_install_target(&entry);
+                    // 状态徽章颜色
+                    let (badge, badge_color) = match status.as_str() {
+                        "installed" => ("installed", 0x3f8f5f),
+                        "update-available" => ("update available", 0xb5812f),
+                        "provided" => ("built in", 0x51637e),
+                        _ => ("", 0),
+                    };
+                    let action: AnyElement = if let Some(state) = self.install_state.get(&name) {
+                        match &state.status {
+                            InstallStatus::Running => {
+                                let request_id = state.request_id.clone();
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x7fb5e8))
+                                            .child("installing…"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "market-cancel-{name}"
+                                            )))
+                                            .px(px(8.))
+                                            .py(px(3.))
+                                            .rounded(px(6.))
+                                            .border_1()
+                                            .border_color(rgb(0x51303a))
+                                            .text_xs()
+                                            .text_color(rgb(0xff8a97))
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgb(0x2a1b20)))
+                                            .child("Cancel")
+                                            .on_click(cx.listener(
+                                                move |this, _ev, _win, cx| {
+                                                    let _ = this.cmds.send_blocking(
+                                                        Cmd::CancelInstall {
+                                                            request_id: request_id.clone(),
+                                                        },
+                                                    );
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                                    .into_any_element()
+                            }
+                            InstallStatus::Done(summary) => div()
+                                .text_xs()
+                                .text_color(rgb(0x3f8f5f))
+                                .child(SharedString::from(summary.clone()))
+                                .into_any_element(),
+                            InstallStatus::Failed(summary) => div()
+                                .text_xs()
+                                .text_color(rgb(0xff5663))
+                                .child(SharedString::from(summary.clone()))
+                                .into_any_element(),
+                            InstallStatus::NeedsBuilds(builds) => {
+                                let install_name = name.clone();
+                                let spec = state.spec.clone();
+                                let registry = state.registry.clone();
+                                let builds = builds.clone();
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .items_end()
+                                    .gap(px(4.))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0xb5812f))
+                                            .child(SharedString::from(format!(
+                                                "build scripts: {}",
+                                                builds.join(", ")
+                                            ))),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "market-allow-builds-{name}"
+                                            )))
+                                            .px(px(10.))
+                                            .py(px(4.))
+                                            .rounded(px(6.))
+                                            .border_1()
+                                            .border_color(rgb(0xb5812f))
+                                            .text_xs()
+                                            .text_color(rgb(0xd9a441))
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgb(0x2a2216)))
+                                            .child("Allow & install")
+                                            .on_click(cx.listener(
+                                                move |this, _ev, _win, cx| {
+                                                    this.start_install(
+                                                        &install_name,
+                                                        &spec,
+                                                        registry.clone(),
+                                                        Some(builds.clone()),
+                                                    );
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                                    .into_any_element()
+                            }
+                        }
+                    } else if status == "update-available" && target.is_some() {
+                        let install_name = name.clone();
+                        let (spec, registry) = target.unwrap();
+                        div()
+                            .id(SharedString::from(format!("market-update-{name}")))
+                            .px(px(10.))
+                            .py(px(4.))
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(rgb(0xb5812f))
+                            .text_xs()
+                            .text_color(rgb(0xd9a441))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x2a2216)))
+                            .child("Update")
+                            .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                this.start_install(&install_name, &spec, registry.clone(), None);
+                                cx.notify();
+                            }))
+                            .into_any_element()
+                    } else if status == "not-installed" && target.is_some() {
+                        let install_name = name.clone();
+                        let (spec, registry) = target.unwrap();
+                        div()
+                            .id(SharedString::from(format!("market-install-{name}")))
+                            .px(px(10.))
+                            .py(px(4.))
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(rgb(0x2f6fb5))
+                            .text_xs()
+                            .text_color(rgb(0x7fb5e8))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x16222f)))
+                            .child("Install")
+                            .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                this.start_install(&install_name, &spec, registry.clone(), None);
+                                cx.notify();
+                            }))
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    };
+                    plugins_rows.push(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(12.))
+                            .px(px(16.))
+                            .py(px(11.))
+                            .border_t_1()
+                            .border_color(rgb(0x1d2229))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_baseline()
+                                            .gap(px(8.))
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(rgb(0xe8ecf4))
+                                                    .child(SharedString::from(title)),
+                                            )
+                                            .children(if version.is_empty() {
+                                                None
+                                            } else {
+                                                Some(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(0x6b7386))
+                                                        .child(SharedString::from(format!(
+                                                            "v{version}"
+                                                        ))),
+                                                )
+                                            })
+                                            .children(if author.is_empty() {
+                                                None
+                                            } else {
+                                                Some(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(0x51637e))
+                                                        .child(SharedString::from(format!(
+                                                            "by {author}"
+                                                        ))),
+                                                )
+                                            }),
+                                    )
+                                    .children(if description.is_empty() {
+                                        None
+                                    } else {
+                                        Some(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x6b7386))
+                                                .overflow_hidden()
+                                                .child(SharedString::from(description)),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x3f4757))
+                                            .child(SharedString::from(name.clone())),
+                                    ),
+                            )
+                            .children(if badge.is_empty() {
+                                None
+                            } else {
+                                Some(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(badge_color))
+                                        .child(SharedString::from(badge)),
+                                )
+                            })
+                            .child(action)
+                            .into_any_element(),
+                    );
+                }
+                let total_market = self
+                    .market_doc
+                    .get("total")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                if total_market > 0 {
+                    plugins_rows.push(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x5a6070))
+                            .py(px(6.))
+                            .child(SharedString::from(format!(
+                                "{} plugin(s) in this index",
+                                total_market
                             )))
                             .into_any_element(),
                     );
@@ -17846,6 +19188,124 @@ impl Render for Root {
             build_layout(&layout, &mut leaf_elements, cx)
         };
 
+        // tab 右键菜单：改名 / Fork / 置顶 / 归档
+        let tab_menu_overlay = self.tab_menu.clone().map(|(tab_id, pos)| {
+            let session_id = self
+                .spaces
+                .iter()
+                .flat_map(|space| space.panels.iter())
+                .find(|tab| tab.id == tab_id)
+                .and_then(|tab| tab.active.clone().or_else(|| tab.blocks.first().cloned()));
+            let is_session = session_id
+                .as_deref()
+                .is_some_and(|id| !is_file_panel(id) && !self.term_tabs.contains(id));
+            let pinned = session_id
+                .as_deref()
+                .is_some_and(|id| self.pinned_sessions.iter().any(|pin| pin == id));
+            let row = move |id: &'static str, label: &'static str, danger: bool| {
+                div()
+                    .id(id)
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_sm()
+                    .text_color(if danger { rgb(0xff8a97) } else { rgb(0xe8ecf4) })
+                    .hover(|style| style.bg(rgb(0x20232b)))
+                    .child(SharedString::from(label))
+            };
+            let rename_tab_id = tab_id.clone();
+            let fork_session_id = session_id.clone().unwrap_or_default();
+            let pin_session_id = session_id.clone().unwrap_or_default();
+            let archive_tab_id = tab_id.clone();
+            let archive_session_id = session_id.clone().unwrap_or_default();
+            let menu = div()
+                .absolute()
+                .left(pos.x)
+                .top(pos.y + px(6.))
+                .w(px(200.))
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .p(px(4.))
+                .rounded(px(8.))
+                .bg(rgb(0x1b1e26))
+                .border_1()
+                .border_color(rgb(0x2c3340))
+                .shadow_lg()
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
+                    cx.stop_propagation();
+                })
+                .child(row("tab-menu-rename", "Rename tab", false).on_click({
+                    cx.listener(move |this, _ev, win, cx| {
+                        this.tab_menu = None;
+                        this.begin_rename(RenameTarget::Panel(rename_tab_id.clone()), win, cx);
+                    })
+                }))
+                .children(if is_session {
+                    Some(
+                        row("tab-menu-fork", "Fork session", false).on_click({
+                            cx.listener(move |this, _ev, _win, cx| {
+                                this.tab_menu = None;
+                                if !fork_session_id.is_empty() {
+                                    this.fork_session(&fork_session_id);
+                                }
+                                cx.notify();
+                            })
+                        }),
+                    )
+                } else {
+                    None
+                })
+                .children(if is_session {
+                    Some(
+                        row(
+                            "tab-menu-pin",
+                            if pinned { "Unpin session" } else { "Pin session" },
+                            false,
+                        )
+                        .on_click({
+                            cx.listener(move |this, _ev, _win, cx| {
+                                this.tab_menu = None;
+                                if !pin_session_id.is_empty() {
+                                    this.set_session_pinned(&pin_session_id, !pinned);
+                                }
+                                cx.notify();
+                            })
+                        }),
+                    )
+                } else {
+                    None
+                })
+                .children(if is_session {
+                    Some(row("tab-menu-archive", "Archive session", true).on_click({
+                        cx.listener(move |this, _ev, _win, cx| {
+                            this.tab_menu = None;
+                            if !archive_session_id.is_empty() {
+                                this.archive_pending = Some(archive_tab_id.clone());
+                                this.archive_session(&archive_session_id);
+                            }
+                            cx.notify();
+                        })
+                    }))
+                } else {
+                    None
+                });
+            div()
+                .absolute()
+                .inset_0()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _win, cx| {
+                    this.tab_menu = None;
+                    cx.notify();
+                }))
+                .child(menu)
+        });
+
         let palette = if self.show_palette {
             let query = self.palette_query(cx);
             let entries = self.palette_entries(&query);
@@ -18451,6 +19911,18 @@ impl Render for Root {
                                             .cursor_pointer()
                                             .hover(|style| style.bg(rgb(0x1f232c)))
                                             .on_mouse_down(
+                                                MouseButton::Right,
+                                                cx.listener({
+                                                    let menu_id = id.clone();
+                                                    move |this, ev: &MouseDownEvent, _win, cx| {
+                                                        cx.stop_propagation();
+                                                        this.tab_menu =
+                                                            Some((menu_id.clone(), ev.position));
+                                                        cx.notify();
+                                                    }
+                                                }),
+                                            )
+                                            .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
                                                     if this.renaming.is_none() {
@@ -19037,6 +20509,9 @@ impl Render for Root {
             }))
             .children(palette.map(|modal| {
                 gpui_kit::deferred(modal).with_priority(60).into_any_element()
+            }))
+            .children(tab_menu_overlay.map(|overlay| {
+                gpui_kit::deferred(overlay).with_priority(70).into_any_element()
             }));
         let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
         if render_no <= 8 || render_ms >= 8.0 {

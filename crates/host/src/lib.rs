@@ -491,7 +491,21 @@ fn spawn_daemon(runtime: Option<&DshRuntime>, profile: &str, log_path: &Path) ->
             }
         });
     }
-    let child = cmd.spawn().context("failed to spawn dsh host daemon")?;
+    let child = cmd.spawn().with_context(|| {
+        if runtime.is_none() && std::env::var("DSH_BIN").is_err() {
+            format!(
+                "failed to spawn dsh host daemon: no engine under {} and no `dsh` on PATH \
+                 (unset DSH_GUI_NO_AUTO_INSTALL to let the app install its bundled runtime, \
+                 or point DSH_BIN at a dsh entrypoint)",
+                runtime_root().display()
+            )
+        } else {
+            format!(
+                "failed to spawn dsh host daemon ({})",
+                cmd.get_program().to_string_lossy()
+            )
+        }
+    })?;
     let pid = child.id();
     // The Child handle is deliberately dropped: kill_on_drop is false and the
     // daemon must outlive this process.
