@@ -65,6 +65,7 @@ fn t0() -> std::time::Instant {
 /// fontconfig 配置，用同目录软链组成私有字体目录，再把 FONTCONFIG_FILE 指过去。
 ///
 /// 探测不到关键字体（CJK / sans / mono）时什么都不做，回落到系统全量扫描。
+#[cfg(target_os = "linux")]
 fn setup_fontconfig() {
     if std::env::var_os("OMD_NO_FONTCONFIG").is_some() {
         stamp("fontconfig: OMD_NO_FONTCONFIG set, using system scan");
@@ -181,6 +182,11 @@ fn setup_fontconfig() {
     ));
 }
 
+#[cfg(not(target_os = "linux"))]
+fn setup_fontconfig() {
+    // fontconfig is a Linux facility; Windows uses DirectWrite.
+}
+
 /// 让 wgpu 选直连屏幕的那块 GPU，而不是 `PowerPreference::HighPerformance` 唤醒的独显。
 ///
 /// gpui-pre-wgpu 的排序是「离散 > 集成」，所以在核显+独显的笔记本上会选独显；
@@ -255,6 +261,7 @@ fn setup_gpu_preference() {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn dirs_config_path() -> PathBuf {
     data_dir().join("fontconfig.xml")
 }
@@ -1000,12 +1007,29 @@ enum Cmd {
 }
 
 /// 每个 shell 起来时写进环境，terminal-browser 靠它找到 omd 的 socket。
+#[cfg(unix)]
 fn terminal_browser_prelude() -> String {
     let path = block_socket_path()
         .display()
         .to_string()
         .replace('\'', "'\\''");
     format!("export TERMINAL_BROWSER_TERMINAL_SOCKET='{path}'\r")
+}
+
+/// The control socket is a Unix-domain socket; Windows has no equivalent
+/// wired up yet, so terminal blocks start without the browser bridge.
+#[cfg(not(unix))]
+fn terminal_browser_prelude() -> String {
+    String::new()
+}
+
+/// 终端 pane 没带 cwd 时的默认目录。
+fn default_terminal_cwd() -> String {
+    if cfg!(windows) {
+        std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string())
+    } else {
+        "/tmp".to_string()
+    }
 }
 
 fn shell_join(args: &[String]) -> String {
@@ -1306,8 +1330,9 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
     > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let terminal_buffers: Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>> =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    let control_path = block_socket_path();
+    #[cfg(unix)]
     {
+        let control_path = block_socket_path();
         let http_c = host.client().clone();
         let base_c = host.base().clone();
         let mux_c = mux.clone();
@@ -1841,7 +1866,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                         cwd,
                         run,
                     } => {
-                        let term_cwd = cwd.unwrap_or_else(|| "/tmp".to_string());
+                        let term_cwd = cwd.unwrap_or_else(default_terminal_cwd);
                         eprintln!("[worker] NewTerminal pane={pane_id} cwd={term_cwd}");
                         let session_id = match rpc
                             .call("session/create", json!({ "request": { "cwd": term_cwd } }))
@@ -3199,6 +3224,7 @@ struct Root {
     pane_bounds: std::collections::HashMap<u64, Bounds<Pixels>>,
 }
 
+#[cfg(unix)]
 async fn serve_control(
     path: PathBuf,
     http: reqwest::Client,
@@ -3827,6 +3853,7 @@ impl Root {
             let url = std::env::var("OMD_BROWSER_URL")
                 .unwrap_or_else(|_| "https://example.com".to_string());
             let scale = window.scale_factor();
+            #[cfg(target_os = "linux")]
             let index = if std::env::var("OMD_BROWSER_CHILD").is_ok() {
                 // 原生子窗口：CEF 直接画进 GPUI 窗口，零拷贝。
                 let parent = match window.native_window_handle() {
@@ -3854,6 +3881,8 @@ impl Root {
             } else {
                 browser::create(1000, 700, &url)
             };
+            #[cfg(not(target_os = "linux"))]
+            let index = browser::create(1000, 700, &url);
             eprintln!("[browser] created index={index:?}");
             browser::set_primary(index);
             browser_index = index;
@@ -24606,12 +24635,19 @@ fn data_dir() -> PathBuf {
     {
         return PathBuf::from(dir);
     }
+    let home = || {
+        std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".into())
+    };
+    #[cfg(windows)]
+    let base = std::env::var("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(home()).join("AppData/Local"));
+    #[cfg(not(windows))]
     let base = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".local/share")
-        });
+        .unwrap_or_else(|_| PathBuf::from(home()).join(".local/share"));
     let primary = base.join("omd");
     if primary.exists() {
         primary
@@ -25662,10 +25698,12 @@ fn short_cwd(cwd: &str) -> String {
     parts.into_iter().rev().collect::<Vec<_>>().join("/")
 }
 
+#[cfg(unix)]
 fn block_socket_path() -> PathBuf {
     data_dir().join("control.sock")
 }
 
+#[cfg(unix)]
 fn run_block_cli() -> i32 {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::net::UnixStream;
@@ -25798,6 +25836,7 @@ fn main() {
     if let Some(code) = browser::run_subprocess_if_requested() {
         std::process::exit(code);
     }
+    #[cfg(unix)]
     if std::env::args().nth(1).as_deref() == Some("block") {
         std::process::exit(run_block_cli());
     }
@@ -25915,7 +25954,7 @@ fn trace(args: std::fmt::Arguments) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/omd-trace.log")
+        .open(std::env::temp_dir().join("omd-trace.log"))
     {
         let _ = writeln!(f, "{args}");
     }
@@ -25944,7 +25983,10 @@ fn ctrlc_proxy() {
 }
 
 #[cfg(not(unix))]
-fn ctrlc_proxy() {}
+fn ctrlc_proxy() {
+    // Windows console control handlers would be the equivalent; the host
+    // daemon is detached and does not need the GUI to clean it up.
+}
 
 fn shifted_char(c: char) -> char {
     match c {

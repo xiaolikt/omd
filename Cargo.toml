@@ -2,6 +2,14 @@
 resolver = "2"
 members = ["crates/host", "crates/transport", "crates/spike", "crates/sdk", "crates/app"]
 
+# Windows 交叉编译用：release 级优化，但保留 debug_assertions，
+# 这样 gpui-pre-windows 在运行时用 D3DCompile 编 shader，
+# 不需要只在 Windows 宿主机上存在的 fxc.exe。
+[profile.winrelease]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+
 [workspace.package]
 edition = "2021"
 license = "MIT"
@@ -27,3 +35,6 @@ gpui-pre-wgpu = { path = "vendor/gpui-pre/gpui-pre-wgpu" }
 gpui-pre-linux = { path = "vendor/gpui-pre/gpui-pre-linux" }
 # 本地补丁：把共享纹理拷贝的目标纹理改成按尺寸池化（CEF 每帧新建纹理太贵）。
 cef = { path = "vendor/cef-rs" }
+# 本地补丁：交叉编译时 shader 源码走内嵌 + 临时文件，而不是构建机的
+# CARGO_MANIFEST_DIR（release 的 fxc 预编译在 Linux 上没有等价工具）。
+gpui-pre-windows = { path = "vendor/gpui-pre/gpui-pre-windows" }

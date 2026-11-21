@@ -9,7 +9,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -458,19 +460,23 @@ fn spawn_daemon(runtime: Option<&DshRuntime>, profile: &str, log_path: &Path) ->
                 paths.push(existing);
             }
         }
-        c.env("NODE_PATH", paths.join(":"));
+        let joined = std::env::join_paths(&paths)
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| paths.join(":"));
+        c.env("NODE_PATH", joined);
         c
     } else if let Ok(bin) = std::env::var("DSH_BIN") {
-        let mut c = Command::new("node");
+        let mut c = Command::new(exe_name("node"));
         c.arg(&bin);
         c
+    } else if cfg!(windows) {
+        // `dsh` on Windows is a .cmd shim; CreateProcess only appends .exe.
+        Command::new("dsh.cmd")
     } else {
         Command::new("dsh")
     };
 
-    if let Ok(home) = std::env::var("HOME") {
-        cmd.current_dir(home);
-    }
+    cmd.current_dir(home_dir());
     cmd.arg("--profile")
         .arg(profile)
         .arg("--no-open")
@@ -482,6 +488,7 @@ fn spawn_daemon(runtime: Option<&DshRuntime>, profile: &str, log_path: &Path) ->
 
     // Detach from the GUI's session, so closing the app (or its terminal)
     // does not SIGHUP the host's Node/pnpm children.
+    #[cfg(unix)]
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -490,6 +497,12 @@ fn spawn_daemon(runtime: Option<&DshRuntime>, profile: &str, log_path: &Path) ->
                 Ok(())
             }
         });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000);
     }
     let child = cmd.spawn().with_context(|| {
         if runtime.is_none() && std::env::var("DSH_BIN").is_err() {
@@ -549,10 +562,22 @@ async fn stop_daemon(pid: u32) {
     unsafe {
         libc::kill(-(pid as i32), 15);
     }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T"])
+            .output();
+    }
     tokio::time::sleep(Duration::from_millis(300)).await;
     #[cfg(unix)]
     unsafe {
         libc::kill(-(pid as i32), 9);
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output();
     }
 }
 
@@ -561,7 +586,23 @@ fn pid_alive(pid: u32) -> bool {
     unsafe {
         libc::kill(pid as i32, 0) == 0
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let Ok(output) = Command::new("tasklist")
+            .args([
+                "/FI",
+                &format!("PID eq {pid}"),
+                "/NH",
+                "/FO",
+                "CSV",
+            ])
+            .output()
+        else {
+            return false;
+        };
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         false
@@ -634,12 +675,28 @@ fn profile_fingerprint(profile: &str) -> u64 {
     hasher.finish()
 }
 
+/// The user's home directory, with the Windows variable as a fallback.
+fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
 fn dsh_home() -> PathBuf {
     if let Ok(home) = std::env::var("DSH_HOME") {
         return PathBuf::from(home);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".dsh")
+    home_dir().join(".dsh")
+}
+
+/// Executable file name for the current platform.
+fn exe_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -659,12 +716,14 @@ pub fn data_root() -> PathBuf {
     {
         return PathBuf::from(dir);
     }
+    #[cfg(windows)]
+    let base = std::env::var("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home_dir().join("AppData/Local"));
+    #[cfg(not(windows))]
     let base = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".local/share")
-        });
+        .unwrap_or_else(|_| home_dir().join(".local/share"));
     let primary = base.join("omd");
     if primary.exists() {
         primary
@@ -702,10 +761,11 @@ impl DshRuntime {
         }
         let version = version_from_bin(&bin).unwrap_or_else(|| selected.to_string());
         let _ = write_metadata(&root, &version);
-        let node = if root.join("node").is_file() {
-            root.join("node")
+        let bundled = root.join(exe_name("node"));
+        let node = if bundled.is_file() {
+            bundled
         } else {
-            PathBuf::from("node")
+            PathBuf::from(exe_name("node"))
         };
         Some(Self {
             version,
@@ -736,7 +796,7 @@ fn node_in_path_named(name: &str) -> Option<PathBuf> {
 }
 
 fn node_in_path() -> Option<PathBuf> {
-    node_in_path_named("node")
+    node_in_path_named(&exe_name("node"))
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
@@ -750,6 +810,17 @@ fn copy_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
         } else if file_type.is_symlink() {
             #[cfg(unix)]
             std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, &to)?;
+            #[cfg(windows)]
+            {
+                // Windows symlinks need developer mode or admin rights; copying
+                // the target is enough for the bundled npm tree.
+                let target = std::fs::canonicalize(entry.path())?;
+                if target.is_dir() {
+                    copy_dir(&target, &to)?;
+                } else {
+                    std::fs::copy(&target, &to)?;
+                }
+            }
         } else {
             std::fs::copy(entry.path(), &to)?;
         }
@@ -764,18 +835,23 @@ fn ensure_npm(root: &Path) -> Option<PathBuf> {
     if cli.is_file() {
         return Some(cli);
     }
-    let npm = node_in_path_named("npm")?;
-    let real = std::fs::canonicalize(npm).ok()?;
-    if real.file_name()?.to_str()? != "npm-cli.js" {
-        return None;
-    }
+    // Unix: `npm` in PATH resolves to .../node_modules/npm/bin/npm-cli.js.
+    // Windows ships `npm.cmd` instead, so derive the CLI from node.exe.
+    let real = node_in_path_named("npm")
+        .and_then(|npm| std::fs::canonicalize(npm).ok())
+        .filter(|real| real.file_name().and_then(|n| n.to_str()) == Some("npm-cli.js"))
+        .or_else(|| {
+            let node = node_in_path()?;
+            let cli = node.parent()?.join("node_modules/npm/bin/npm-cli.js");
+            cli.is_file().then_some(cli)
+        })?;
     let package = real.parent()?.parent()?;
     copy_dir(package, &root.join("npm")).ok()?;
     Some(cli)
 }
 
 fn ensure_node(root: &Path) -> anyhow::Result<PathBuf> {
-    let target = root.join("node");
+    let target = root.join(exe_name("node"));
     if target.is_file() {
         return Ok(target);
     }
@@ -801,23 +877,29 @@ fn write_metadata(root: &Path, version: &str) -> anyhow::Result<()> {
         root.join("manager.json"),
         "{\"manager\":\"omd\",\"name\":\"OMD\"}\n",
     )?;
+    #[cfg(unix)]
+    let launcher = root.join("bin/dsh");
+    #[cfg(unix)]
+    let script = format!(
+        "#!/bin/sh\nROOT=$(CDPATH= cd -- \"$(dirname -- \"$0\")/..\" && pwd)\nVER=$(cat \"$ROOT/current\")\nexec \"$ROOT/node\" \"$ROOT/$VER/node_modules/@deepseek-ai/dsh/lib/bin.js\" \"$@\"\n"
+    );
+    #[cfg(windows)]
+    let launcher = root.join("bin/dsh.cmd");
+    #[cfg(windows)]
+    let script = "@echo off\r\nsetlocal\r\nset ROOT=%~dp0..\r\nset /p VER=<\"%ROOT%\\current\"\r\n\"%ROOT%\\node.exe\" \"%ROOT%\\%VER%\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js\" %*\r\n";
     let state = serde_json::json!({
         "managed": true,
         "installed": {
             "version": version,
             "via": { "how": "npm" }
         },
-        "link": root.join("bin/dsh").display().to_string(),
+        "link": launcher.display().to_string(),
     });
     std::fs::write(
         root.join("state.json"),
         serde_json::to_vec_pretty(&state)?,
     )?;
 
-    let launcher = root.join("bin/dsh");
-    let script = format!(
-        "#!/bin/sh\nROOT=$(CDPATH= cd -- \"$(dirname -- \"$0\")/..\" && pwd)\nVER=$(cat \"$ROOT/current\")\nexec \"$ROOT/node\" \"$ROOT/$VER/node_modules/@deepseek-ai/dsh/lib/bin.js\" \"$@\"\n"
-    );
     std::fs::write(&launcher, script)?;
     #[cfg(unix)]
     {
@@ -852,7 +934,7 @@ pub async fn install_dsh(tag: &str) -> anyhow::Result<DshRuntime> {
         command.arg(cli);
         command
     } else {
-        tokio::process::Command::new("npm")
+        tokio::process::Command::new(if cfg!(windows) { "npm.cmd" } else { "npm" })
     };
     let output = npm_cmd
         .arg("install")

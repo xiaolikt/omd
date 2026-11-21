@@ -104,7 +104,9 @@ packaging/test-deb.sh           # 不解进系统，抽出包跑一轮冒烟
 
 deb 约 150MB（xz），里面带上 CEF 和 `libghostty-vt`，因为 CEF 在可执行文件旁边找 `icudtl.dat`。dsh 运行时不打进包，仍用 `~/.local/share/omd/runtime`。
 
-Windows exe 现在打不出来：仓库里只有 Linux 的 CEF / ghostty，浏览器嵌入是 `cfg(linux)`，这台机器也没有 MinGW。`packaging/windows/build.sh` 会以退出码 2 说明原因，并留下 `omd.ico` 给以后的 Windows 构建。
+Windows exe 可以在这台 Linux 上交叉编译出来（`packaging/windows/build.sh`，产出 `packaging/dist/omd-windows.zip`）。工具链全部免 root：rustup 加 `x86_64-pc-windows-msvc` target、`cargo install cargo-xwin`、apt download 解包 clang-21/lld-21/libclang-common-21-dev、venv 装 cmake+ninja。Windows 版 CEF 已 vendor（`vendor/cef/156.0.26/cef_windows_x86_64`，`packaging/windows/vendor-cef.sh` 刷新），`ghostty-vt.dll` 用 Zig 0.17 从官方 vt-1.0.0 源码交叉编译（构建说明在 `vendor/libghostty-vt/windows/README.md`）。
+
+Windows 版**只做了编译级验证**（导入表检查：除系统 DLL 外只依赖包内自带的 `ghostty-vt.dll`/`libcef.dll`，及 Win10 2004+ 系统自带的 `icuuc.dll`；52 个 ghostty-vt 导入符号全部在 DLL 导出表里），没在真实 Windows 上跑过。已知缺口：控制 socket（`omd block`）没接、浏览器走 CPU 像素上传（D3D11 共享纹理未接）、IME/剪贴板/弹窗未验证。细节见 `packaging/windows/README.md`。
 
 ### 构建依赖（Linux）
 

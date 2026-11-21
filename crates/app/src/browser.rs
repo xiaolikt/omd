@@ -209,10 +209,7 @@ pub fn init(remote_port: i32, cache_dir: &std::path::Path, windowless: bool) -> 
 
 /// 写 CDP 端点描述，供 Playwright / 任一 CDP 客户端直连。
 fn write_cdp_endpoint(port: i32) {
-    let Some(home) = std::env::var_os("HOME") else {
-        return;
-    };
-    let dir = std::path::PathBuf::from(home).join(".local/share/omd");
+    let dir = crate::data_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -230,8 +227,10 @@ fn write_cdp_endpoint(port: i32) {
 }
 
 /// 当前 CEF 的 Wayland 后端无法分配共享捕获缓冲，使用像素上传而非 DMA-BUF。
+/// Windows 的共享纹理是 D3D11，导入路径还没接，同样走像素上传。
 fn accel_available() -> bool {
-    !WAYLAND.load(Ordering::Relaxed)
+    cfg!(target_os = "linux")
+        && !WAYLAND.load(Ordering::Relaxed)
         && std::env::var_os("OMD_BROWSER_ACCEL").is_some()
         && gpui_wgpu::shared_gpu().is_some_and(|(device, _)| {
             device
@@ -448,7 +447,11 @@ pub fn create(width: u32, height: u32, url: &str) -> Option<usize> {
     let mut window_info = WindowInfo::default();
     window_info.runtime_style = RuntimeStyle::ALLOY;
     // windowless 也需要一个父窗口句柄给弹窗/显示器定位；0 = 无。
-    let mut window_info = window_info.set_as_windowless(0);
+    #[cfg(target_os = "windows")]
+    let null_parent: cef::sys::cef_window_handle_t = cef::sys::HWND(std::ptr::null_mut());
+    #[cfg(not(target_os = "windows"))]
+    let null_parent: cef::sys::cef_window_handle_t = 0;
+    let mut window_info = window_info.set_as_windowless(null_parent);
     // OSR 由我们推 begin frame（外部时钟），否则 CEF 内部定时器只在部分场景出帧。
     // 实测：靠我们外部推 begin frame 时 CEF 从不出画（pump 在 GPUI 线程，
     // CEF 认为不是它的 UI 线程）；改用 CEF 自己的合成时钟后首帧立刻到。
@@ -959,6 +962,7 @@ source 的话：CreateWindow 的错误没人收、MapNotify/ConfigureNotify 永�
 
 glib 符号从已加载的 libglib-2.0 解析（libcef.so 硬依赖它），不增加链接依赖。
 */
+#[cfg(target_os = "linux")]
 fn glib_dispatch() -> u32 {
     struct Glib {
         context: *mut std::ffi::c_void,
@@ -1010,6 +1014,12 @@ fn glib_dispatch() -> u32 {
         }
     }
     n
+}
+
+/// Windows 上没有 glib 主循环要派发；CEF 在那边用自己的内部泵。
+#[cfg(not(target_os = "linux"))]
+fn glib_dispatch() -> u32 {
+    0
 }
 
 pub fn pump() {
@@ -1187,15 +1197,18 @@ cef::wrap_app! {
         ) {
             use cef::ImplCommandLine as _;
             let Some(cmd) = command_line else { return };
-            let platform = if WAYLAND.load(Ordering::Relaxed) {
-                "wayland"
-            } else {
-                "x11"
-            };
-            cmd.append_switch_with_value(
-                Some(&CefString::from("ozone-platform")),
-                Some(&CefString::from(platform)),
-            );
+            #[cfg(target_os = "linux")]
+            {
+                let platform = if WAYLAND.load(Ordering::Relaxed) {
+                    "wayland"
+                } else {
+                    "x11"
+                };
+                cmd.append_switch_with_value(
+                    Some(&CefString::from("ozone-platform")),
+                    Some(&CefString::from(platform)),
+                );
+            }
             // 没有 GPU 的环境（Xvfb、远程会话）跑 OSR：让 Chromium 退到软件合成，
             // 否则 GPU 进程反复崩掉。
             if std::env::var("OMD_BROWSER_CPU").is_ok() {
@@ -1573,18 +1586,22 @@ cef::wrap_render_handler! {
             if !debug || (n > 3 && n % 30 != 0) {
                 return;
             }
-            let count = info.plane_count.max(0) as usize;
-            let planes: Vec<(i32, u32, u64)> = info.planes[..count.min(4)]
-                .iter()
-                .map(|p| (p.fd, p.stride, p.size))
-                .collect();
-            eprintln!(
-                "[accel] n={n} planes={planes:?} fmt={:?} modifier=0x{:x} coded={:?} dirty={:?}",
-                info.format,
-                info.modifier,
-                info.extra.coded_size,
-                dirty_rects.map(|d| d.len())
-            );
+            // plane_count/planes/modifier 是 Linux DMA-BUF 路径的扩展字段。
+            #[cfg(target_os = "linux")]
+            {
+                let count = info.plane_count.max(0) as usize;
+                let planes: Vec<(i32, u32, u64)> = info.planes[..count.min(4)]
+                    .iter()
+                    .map(|p| (p.fd, p.stride, p.size))
+                    .collect();
+                eprintln!(
+                    "[accel] n={n} planes={planes:?} fmt={:?} modifier=0x{:x} coded={:?} dirty={:?}",
+                    info.format,
+                    info.modifier,
+                    info.extra.coded_size,
+                    dirty_rects.map(|d| d.len())
+                );
+            }
         }
 
         fn on_paint(
@@ -1665,9 +1682,10 @@ cef::wrap_render_handler! {
                     slot.captured.push((pin_id, path));
                 }
             }
-            if std::env::var("OMD_BROWSER_DUMP").is_ok() {
+            if std::env::var("OMD_BROWSER_DUMP").is_ok() && cfg!(target_os = "linux") {
                 static D: AtomicU64 = AtomicU64::new(0);
                 if D.fetch_add(1, Ordering::Relaxed) % 30 == 0 {
+                    #[cfg(target_os = "linux")]
                     dump_texture(&device, &queue, &texture, "/tmp/cef-osr-last.png");
                 }
             }

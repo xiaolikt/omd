@@ -1,43 +1,60 @@
 fn main() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let dir = std::path::Path::new(&manifest)
+    let root = std::path::Path::new(&manifest)
         .parent()
         .unwrap()
         .parent()
-        .unwrap()
-        .join("vendor/libghostty-vt");
-    let so = dir.join("lib/libghostty-vt.so");
-    // rust-lld 找不到 -l 名字时，直接把绝对路径的 .so 传给链接器
-    println!("cargo:rustc-link-arg={}", so.display());
-    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../../vendor/libghostty-vt/lib");
-    println!("cargo:rerun-if-changed={}", so.display());
+        .unwrap();
 
-    // CEF：libcef.so 在 vendor/cef/<version>/<platform>/Release 下，用 rpath 指过去，
-    // 免得每次启动都要手动设 LD_LIBRARY_PATH。platform 目录名和 cef-dll-sys
-    // 的 OsAndArch 命名一致（cef_linux_x86_64 等），这里不写死。
-    let cef_root = std::path::Path::new(&manifest)
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("vendor/cef");
+    // libghostty-vt：Linux 用 .so，Windows 用 ghostty-vt.dll + 导入库。
+    let vt = root.join("vendor/libghostty-vt");
+    if target_os == "windows" {
+        let dir = vt.join("windows");
+        println!("cargo:rustc-link-search=native={}", dir.display());
+        println!("cargo:rustc-link-lib=dylib=ghostty-vt");
+        println!("cargo:rerun-if-changed={}", dir.display());
+        // CEF wrapper 的 C++ 异常符号默认走 VCRUNTIME140.dll；换成静态的
+        // libvcruntime（xwin CRT 里有），免得用户机器还得装 VC++ 运行库。
+        println!("cargo:rustc-link-arg=/nodefaultlib:vcruntime.lib");
+        println!("cargo:rustc-link-arg=libvcruntime.lib");
+    } else {
+        let so = vt.join("lib/libghostty-vt.so");
+        // rust-lld 找不到 -l 名字时，直接把绝对路径的 .so 传给链接器
+        println!("cargo:rustc-link-arg={}", so.display());
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../../vendor/libghostty-vt/lib");
+        println!("cargo:rerun-if-changed={}", so.display());
+    }
+
+    // CEF：libcef.so / libcef.dll 在 vendor/cef/<version>/<platform>/Release 下，
+    // 用 rpath 指过去（Windows 用 DLL 搜索路径，不需要 rpath）。
+    // platform 目录名和 cef-dll-sys 的 OsAndArch 命名一致（cef_linux_x86_64 等），
+    // 这里不写死；只挑当前目标的平台，避免把另一个 OS 的运行时拷进 target。
+    let want_windows = target_os == "windows";
+    let cef_root = root.join("vendor/cef");
     if let Ok(versions) = std::fs::read_dir(&cef_root) {
         for version in versions.flatten() {
             if let Ok(platforms) = std::fs::read_dir(version.path()) {
                 for platform in platforms.flatten() {
+                    let name = platform.file_name().to_string_lossy().into_owned();
+                    if name.contains("windows") != want_windows {
+                        continue;
+                    }
                     let release = platform.path().join("Release");
                     if release.join("libcef.so").exists() || release.join("libcef.dll").exists() {
                         println!("cargo:rustc-link-search=native={}", release.display());
-                        println!(
-                            "cargo:rustc-link-arg=-Wl,-rpath,{}/Release",
-                            platform.path().display()
-                        );
+                        if target_os != "windows" {
+                            println!(
+                                "cargo:rustc-link-arg=-Wl,-rpath,{}/Release",
+                                platform.path().display()
+                            );
+                        }
                     }
                 }
             }
         }
     }
-    // CEF 在 Linux 上按「可执行文件旁边」找 icudtl.dat / *.pak / locales，
+    // CEF 按「可执行文件旁边」找 icudtl.dat / *.pak / locales，
     // resources_dir_path 管不到 ICU 这一步。把运行时文件拷到 target 目录。
     let out_dir = std::env::var("OUT_DIR").unwrap_or_default();
     if let Some(target_dir) = std::path::Path::new(&out_dir).ancestors().nth(3) {
@@ -69,6 +86,13 @@ fn main() {
                         }
                     }
                 }
+            }
+        }
+        // Windows 的 libghostty-vt 是运行时 DLL，也要在 exe 旁边。
+        if target_os == "windows" {
+            let dll = vt.join("windows/ghostty-vt.dll");
+            if dll.is_file() {
+                let _ = std::fs::copy(&dll, target_dir.join("ghostty-vt.dll"));
             }
         }
     }
