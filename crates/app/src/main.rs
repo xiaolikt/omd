@@ -2835,6 +2835,12 @@ struct Root {
     drag_leaf: Option<(u64, f32, f32)>,
     /// 点开中的 block 头菜单（pane id；⠿ 抓手点击）
     block_menu: Option<u64>,
+    /// 指针所在的 block（pane id）——顶部手柄细线只在 hover 时出现
+    hover_pane: Option<u64>,
+    /// 指针压在顶部手柄命中区（细线展开成六点抓手）
+    hover_grip: Option<u64>,
+    /// 每个 block 的整块边界（含头部，手柄 hover 判定用）
+    block_bounds: std::collections::HashMap<u64, Bounds<Pixels>>,
     /// 重启恢复的终端扫描是否已跑过（terminal/list 一次性）
     term_sweep_done: bool,
     /// session/control 第一帧到达时间（冒烟验证用）
@@ -4058,6 +4064,9 @@ impl Root {
             drag_pane: None,
             drag_split: None,
             drag_leaf: None,
+            hover_pane: None,
+            hover_grip: None,
+            block_bounds: std::collections::HashMap::new(),
             browser_pump_started: false,
             browser_inputs: std::collections::HashMap::new(),
             browser_pins: std::collections::HashMap::new(),
@@ -10047,6 +10056,39 @@ impl Root {
             .map(|pane| pane.term_id.clone())
     }
 
+    /// 全局鼠标位置 → 哪个 block 被 hover、是否压在顶部抓手命中区。
+    /// 只在状态变化时 notify，避免每帧重绘。
+    fn update_block_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let px_x = f32::from(position.x);
+        let px_y = f32::from(position.y);
+        let mut hover = None;
+        for (id, bounds) in &self.block_bounds {
+            let x0 = f32::from(bounds.origin.x);
+            let y0 = f32::from(bounds.origin.y);
+            let x1 = x0 + f32::from(bounds.size.width);
+            let y1 = y0 + f32::from(bounds.size.height);
+            if px_x >= x0 && px_x < x1 && px_y >= y0 && px_y < y1 {
+                hover = Some(*id);
+                break;
+            }
+        }
+        let grip = hover.filter(|id| {
+            self.block_bounds.get(id).is_some_and(|bounds| {
+                let center = f32::from(bounds.origin.x) + f32::from(bounds.size.width) / 2.;
+                (px_x - center).abs() <= 24.
+                    && px_y - f32::from(bounds.origin.y) <= 14.
+            })
+        });
+        if hover != self.hover_pane || grip != self.hover_grip {
+            if std::env::var_os("OMD_HOVER_PROBE").is_some() {
+                eprintln!("[hover] pane={hover:?} grip={grip:?} at ({px_x:.0},{px_y:.0})");
+            }
+            self.hover_pane = hover;
+            self.hover_grip = grip;
+            cx.notify();
+        }
+    }
+
     /// 拖拽分隔条：按鼠标位移改 pane 尺寸。
     fn drag_pane_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         // 拖 panel 头：和同 split 的邻居交换
@@ -13310,6 +13352,88 @@ fn media_pane_body(
 }
 
 /// 一个终端 pane：标题条 + 可滚动视口。
+/// Notion 式 block 抓手：
+/// - 平时完全不可见（只有一条不可见的命中区）
+/// - 指针进入 block → 顶部中间出现一条细横线
+/// - 指针压到细线 → 展开成 ⠿ 六点抓手（按住拖动换位，点击弹菜单）
+fn block_grip(
+    pane_id: u64,
+    hovered: bool,
+    hot: bool,
+    menu_open: bool,
+    cx: &mut Context<Root>,
+) -> AnyElement {
+    let shown = hot || menu_open;
+    div()
+        .id(SharedString::from(format!("pane-grip-{pane_id}")))
+        .w(px(44.))
+        .h(px(14.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .cursor_pointer()
+        .text_size(px(12.))
+        .text_color(rgb(if shown { 0xd7dce6 } else { 0x8b93a7 }))
+        .bg(if shown {
+            rgba(0x232a36ff)
+        } else {
+            rgba(0x00000000)
+        })
+        .child(if shown {
+            div().child("⠿").into_any_element()
+        } else if hovered {
+            div()
+                .w(px(30.))
+                .h(px(2.))
+                .rounded(px(1.))
+                .bg(rgb(0x3d4553))
+                .into_any_element()
+        } else {
+            div().w(px(30.)).h(px(2.)).into_any_element()
+        })
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
+                // 抓手自己吃掉按下：不要冒泡到 block 体（那里会清菜单）
+                cx.stop_propagation();
+                this.focused_pane = Some(pane_id);
+                this.drag_leaf = Some((
+                    pane_id,
+                    f32::from(ev.position.x),
+                    f32::from(ev.position.y),
+                ));
+                cx.notify();
+            }),
+        )
+        .on_click(cx.listener(move |this, _ev, _win, cx| {
+            this.focused_pane = Some(pane_id);
+            this.block_menu = if this.block_menu == Some(pane_id) {
+                None
+            } else {
+                Some(pane_id)
+            };
+            cx.notify();
+        }))
+        .into_any_element()
+}
+
+/// block 整块边界探针（绝对定位，不参与布局）——给顶部手柄的 hover 判定用。
+fn block_bounds_probe(pane_id: u64, cx: &mut Context<Root>) -> AnyElement {
+    let weak = cx.entity().downgrade();
+    gpui_kit::canvas(
+        move |bounds, _window, cx| {
+            let _ = weak.update(cx, |root, _| {
+                root.block_bounds.insert(pane_id, bounds);
+            });
+        },
+        |_bounds, _t, _window, _cx| {},
+    )
+    .absolute()
+    .inset_0()
+    .into_any_element()
+}
+
 fn pane_element(
     pane_id: u64,
     screen: Vec<Vec<Span>>,
@@ -13329,6 +13453,10 @@ fn pane_element(
     active: bool,
     // ⠿ 抓手菜单是否展开
     menu_open: bool,
+    // 指针是否在本 block 内（显示细线）
+    hovered: bool,
+    // 指针是否压在抓手命中区（细线变六点）
+    grip_hot: bool,
     // 引擎侧终端已退出/不存在（terminal/list 扫描发现）
     term_dead: bool,
     cx: &mut Context<Root>,
@@ -13366,90 +13494,20 @@ fn pane_element(
             });
         },
     );
-    el.child(
-        div()
-            .id(SharedString::from(format!("pane-head-{pane_id}")))
-            .flex()
-            .flex_row()
-            .items_center()
-            .px(px(4.))
-            .h(px(22.))
-            .bg(if active {
-                rgb(0x1b2029)
-            } else {
-                rgb(0x15181f)
-            })
-            .border_b_1()
-            .border_color(if active {
-                rgb(0x2f3846)
-            } else {
-                rgb(0x23272f)
-            })
-            // 头部只留 ⠿ 抓手：icon/标题/诊断/format/outline 全部去掉
-            //（format/outline 在抓手菜单里还有）
-            .child(div().flex_1())
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
-                    this.block_menu = None;
-                    this.drag_leaf = Some((
-                        pane_id,
-                        f32::from(ev.position.x),
-                        f32::from(ev.position.y),
-                    ));
-                    cx.notify();
-                }),
-            )
-            // ⠿ 抓手下拉菜单：按住拖动 = 换位；点击 = 菜单
-            .child(
-                div()
-                    .id(SharedString::from(format!("pane-grip-{pane_id}")))
-                    .w(px(22.))
-                    .h(px(18.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_sm()
-                    .text_color(if menu_open {
-                        rgb(0xe2e7f0)
-                    } else if active {
-                        rgb(0x9aa3b5)
-                    } else {
-                        rgb(0x707786)
-                    })
-                    .bg(if menu_open {
-                        rgba(0x283140ff)
-                    } else {
-                        rgba(0x00000000)
-                    })
-                    .hover(|style| style.bg(rgb(0x232a36)).text_color(rgb(0xe2e7f0)))
-                    .child("⠿")
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
-                            // 抓手自己处理按下：不要再冒泡到头部（那里会清菜单）
-                            cx.stop_propagation();
-                            this.drag_leaf = Some((
-                                pane_id,
-                                f32::from(ev.position.x),
-                                f32::from(ev.position.y),
-                            ));
-                            cx.notify();
-                        }),
-                    )
-                    .on_click(cx.listener(move |this, _ev, _win, cx| {
-                        this.focused_pane = Some(pane_id);
-                        this.block_menu = if this.block_menu == Some(pane_id) {
-                            None
-                        } else {
-                            Some(pane_id)
-                        };
-                        cx.notify();
-                    })),
-            ),
-    )
+    el.child(block_bounds_probe(pane_id, cx))
+        .child(
+            div()
+                .id(SharedString::from(format!("pane-head-{pane_id}")))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .h(px(14.))
+                .flex_shrink_0()
+                // 头部没有常驻控件：hover block 才在顶部中间露出细线，
+                // hover 细线才变成 ⠿ 六点抓手
+                .child(block_grip(pane_id, hovered, grip_hot, menu_open, cx)),
+        )
     .child(if let Some((path, kind, image)) = media {
         media_pane_body(pane_id, path, kind, image)
     } else if let Some(state) = editor {
@@ -14190,6 +14248,8 @@ fn browser_pane_element(
     suggestions: Option<AnyElement>,
     active: bool,
     menu_open: bool,
+    hovered: bool,
+    grip_hot: bool,
     is_maximized: bool,
     cx: &mut Context<Root>,
 ) -> AnyElement {
@@ -14265,88 +14325,18 @@ fn browser_pane_element(
                 cx.notify();
             }),
         )
-        // block 头：只留 ⠿ 抓手（拖动换位 / 点击菜单），活动态提亮
+        .child(block_bounds_probe(pane_id, cx))
+        // block 头：没有常驻控件，hover 出细线 / hover 细线变六点抓手
         .child(
             div()
                 .id(SharedString::from(format!("browser-pane-head-{pane_id}")))
                 .flex()
                 .flex_row()
                 .items_center()
-                .px(px(4.))
-                .h(px(22.))
+                .justify_center()
+                .h(px(14.))
                 .flex_shrink_0()
-                .bg(if active {
-                    rgb(0x1b2029)
-                } else {
-                    rgb(0x15181f)
-                })
-                .border_b_1()
-                .border_color(if active {
-                    rgb(0x2f3846)
-                } else {
-                    rgb(0x23272f)
-                })
-                .child(div().flex_1())
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
-                        this.block_menu = None;
-                        this.drag_leaf = Some((
-                            pane_id,
-                            f32::from(ev.position.x),
-                            f32::from(ev.position.y),
-                        ));
-                        cx.notify();
-                    }),
-                )
-                // ⠿ 抓手：拖动换位，点击下拉菜单
-                .child(
-                    div()
-                        .id(SharedString::from(format!("browser-pane-grip-{pane_id}")))
-                        .w(px(22.))
-                        .h(px(18.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .text_sm()
-                        .text_color(if menu_open {
-                            rgb(0xe2e7f0)
-                        } else if active {
-                            rgb(0x9aa3b5)
-                        } else {
-                            rgb(0x707786)
-                        })
-                        .bg(if menu_open {
-                            rgba(0x283140ff)
-                        } else {
-                            rgba(0x00000000)
-                        })
-                        .hover(|style| style.bg(rgb(0x232a36)).text_color(rgb(0xe2e7f0)))
-                        .child("⠿")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
-                                cx.stop_propagation();
-                                this.drag_leaf = Some((
-                                    pane_id,
-                                    f32::from(ev.position.x),
-                                    f32::from(ev.position.y),
-                                ));
-                                cx.notify();
-                            }),
-                        )
-                        .on_click(cx.listener(move |this, _ev, _win, cx| {
-                            this.focused_pane = Some(pane_id);
-                            this.block_menu = if this.block_menu == Some(pane_id) {
-                                None
-                            } else {
-                                Some(pane_id)
-                            };
-                            cx.notify();
-                        })),
-                ),
+                .child(block_grip(pane_id, hovered, grip_hot, menu_open, cx)),
         )
         .child(bar)
         // 地址栏聚焦时的历史建议（下拉在工具条和页面之间）。
@@ -14969,6 +14959,8 @@ fn chat_pane_element(
     split_menu: Option<SplitDir>,
     active: bool,
     menu_open: bool,
+    hovered: bool,
+    grip_hot: bool,
     cx: &mut Context<Root>,
 ) -> AnyElement {
     let weak_body = cx.entity().downgrade();
@@ -15040,83 +15032,17 @@ fn chat_pane_element(
         } else {
             rgb(0x0d1015)
         })
+        .child(block_bounds_probe(pane_id, cx))
         .child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .px(px(4.))
-                .h(px(22.))
+                .justify_center()
+                .h(px(14.))
                 .flex_shrink_0()
-                .bg(if active {
-                    rgb(0x1b2029)
-                } else {
-                    rgb(0x15181f)
-                })
-                .border_b_1()
-                .border_color(if active {
-                    rgb(0x2f3846)
-                } else {
-                    rgb(0x23272f)
-                })
-                // 头部只留 ⠿ 抓手（拖动换位 / 点击菜单）
-                .child(div().flex_1())
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
-                        this.block_menu = None;
-                        this.drag_leaf = Some((pane_id, f32::from(ev.position.x), f32::from(ev.position.y)));
-                        cx.notify();
-                    }),
-                )
-                // ⠿ 抓手：拖动换位，点击下拉菜单
-                .child(
-                    div()
-                        .id(SharedString::from(format!("chat-pane-grip-{pane_id}")))
-                        .w(px(22.))
-                        .h(px(18.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .text_sm()
-                        .text_color(if menu_open {
-                            rgb(0xe2e7f0)
-                        } else if active {
-                            rgb(0x9aa3b5)
-                        } else {
-                            rgb(0x707786)
-                        })
-                        .bg(if menu_open {
-                            rgba(0x283140ff)
-                        } else {
-                            rgba(0x00000000)
-                        })
-                        .hover(|style| style.bg(rgb(0x232a36)).text_color(rgb(0xe2e7f0)))
-                        .child("⠿")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
-                                cx.stop_propagation();
-                                this.drag_leaf = Some((
-                                    pane_id,
-                                    f32::from(ev.position.x),
-                                    f32::from(ev.position.y),
-                                ));
-                                cx.notify();
-                            }),
-                        )
-                        .on_click(cx.listener(move |this, _ev, _win, cx| {
-                            this.focused_pane = Some(pane_id);
-                            this.block_menu = if this.block_menu == Some(pane_id) {
-                                None
-                            } else {
-                                Some(pane_id)
-                            };
-                            cx.notify();
-                        })),
-                ),
+                // 头部没有常驻控件：hover 出细线 / hover 细线变六点抓手
+                .child(block_grip(pane_id, hovered, grip_hot, menu_open, cx)),
         )
         .child(
             div()
@@ -16098,6 +16024,14 @@ impl Render for Root {
             self.ensure_typing_ticker(cx);
         }
         let render_no = RENDER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        // block 整块边界每帧由 canvas 在 prepaint 阶段回填（手柄 hover 判定用）
+        if std::env::var_os("OMD_HOVER_PROBE").is_some() && render_no == 6 {
+            eprintln!(
+                "[hover] block_bounds={:?}",
+                self.block_bounds.keys().collect::<Vec<_>>()
+            );
+        }
+        self.block_bounds.clear();
         // 第一帧之后再要一次焦点（窗口映射前 activate 常常无效）
         if render_no == 2 {
             window.activate_window();
@@ -16956,87 +16890,17 @@ impl Render for Root {
         let chat_menu_open = self.block_menu == Some(0);
         // 聊天 panel 自己的头（和 terminal / editor panel 一个样式）
         let chat_panel_head = {
+            let hovered = self.hover_pane == Some(0);
+            let grip_hot = self.hover_grip == Some(0);
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .px(px(4.))
-                .h(px(22.))
+                .justify_center()
+                .h(px(14.))
                 .flex_shrink_0()
-                .bg(if chat_active {
-                    rgb(0x1b2029)
-                } else {
-                    rgb(0x15181f)
-                })
-                .border_b_1()
-                .border_color(if chat_active {
-                    rgb(0x2f3846)
-                } else {
-                    rgb(0x23272f)
-                })
-                // 头部只留 ⠿ 抓手（拖动换位 / 点击菜单）
-                .child(div().flex_1())
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, ev: &MouseDownEvent, _win, cx| {
-                        this.focused_pane = Some(0);
-                        this.block_menu = None;
-                        this.drag_leaf = Some((
-                            0,
-                            f32::from(ev.position.x),
-                            f32::from(ev.position.y),
-                        ));
-                        cx.notify();
-                    }),
-                )
-                // ⠿ 抓手：拖动换位，点击下拉菜单
-                .child(
-                    div()
-                        .id("primary-chat-grip")
-                        .w(px(22.))
-                        .h(px(18.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .text_sm()
-                        .text_color(if chat_menu_open {
-                            rgb(0xe2e7f0)
-                        } else if chat_active {
-                            rgb(0x9aa3b5)
-                        } else {
-                            rgb(0x707786)
-                        })
-                        .bg(if chat_menu_open {
-                            rgba(0x283140ff)
-                        } else {
-                            rgba(0x00000000)
-                        })
-                        .hover(|style| style.bg(rgb(0x232a36)).text_color(rgb(0xe2e7f0)))
-                        .child("⠿")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, ev: &MouseDownEvent, _win, cx| {
-                                cx.stop_propagation();
-                                this.drag_leaf = Some((
-                                    0,
-                                    f32::from(ev.position.x),
-                                    f32::from(ev.position.y),
-                                ));
-                                cx.notify();
-                            }),
-                        )
-                        .on_click(cx.listener(|this, _ev, _win, cx| {
-                            this.focused_pane = Some(0);
-                            this.block_menu = if this.block_menu == Some(0) {
-                                None
-                            } else {
-                                Some(0)
-                            };
-                            cx.notify();
-                        })),
-                )
+                // 头部没有常驻控件：hover 出细线 / hover 细线变六点抓手
+                .child(block_grip(0, hovered, grip_hot, chat_menu_open, cx))
         };
 
         // size_full 而不是 flex_1：外层 split 的子容器不是 flex，
@@ -17332,6 +17196,7 @@ impl Render for Root {
                     cx.notify();
                 }),
             )
+            .child(block_bounds_probe(0, cx))
             .child(chat_panel_head)
             .child(goal_banner)
             .child(transcript)
@@ -21955,6 +21820,8 @@ impl Render for Root {
                         self.split_hover.filter(|(leaf, _)| *leaf == 0).map(|(_, dir)| dir),
                         self.focused_pane == Some(0),
                         self.block_menu == Some(0),
+                        self.hover_pane == Some(0),
+                        self.hover_grip == Some(0),
                         cx,
                     ),
                 );
@@ -22094,6 +21961,8 @@ impl Render for Root {
                         self.split_hover.filter(|(leaf, _)| *leaf == pane_id).map(|(_, dir)| dir),
                         self.focused_pane == Some(pane_id),
                         self.block_menu == Some(pane_id),
+                        self.hover_pane == Some(pane_id),
+                        self.hover_grip == Some(pane_id),
                         cx,
                     ),
                 );
@@ -22311,6 +22180,8 @@ impl Render for Root {
                             suggestions,
                             self.focused_pane == Some(pane_id),
                             self.block_menu == Some(pane_id),
+                            self.hover_pane == Some(pane_id),
+                            self.hover_grip == Some(pane_id),
                             maximized == Some(pane_id),
                             cx,
                         ),
@@ -22354,6 +22225,8 @@ impl Render for Root {
                     outline_items,
                     self.focused_pane == Some(pane_id),
                     self.block_menu == Some(pane_id),
+                    self.hover_pane == Some(pane_id),
+                    self.hover_grip == Some(pane_id),
                     pane_term_dead,
                     cx,
                 ),
@@ -24550,6 +24423,28 @@ impl Render for Root {
             .children(permission_menu_overlay.map(|overlay| {
                 gpui_kit::deferred(overlay).with_priority(71).into_any_element()
             }));
+        // 全局鼠标监听：paint 阶段注册到下一帧，驱动 block 顶部抓手的 hover 显隐。
+        let hover_probe = {
+            let weak = cx.entity().downgrade();
+            gpui_kit::canvas(
+                |_bounds, _window, _cx| (),
+                move |_bounds, _t, window, _cx| {
+                    window.on_mouse_event(
+                        move |ev: &MouseMoveEvent, phase, _window, cx| {
+                            if !phase.bubble() {
+                                return;
+                            }
+                            let _ = weak.update(cx, |root, cx| {
+                                root.update_block_hover(ev.position, cx);
+                            });
+                        },
+                    );
+                },
+            )
+            .absolute()
+            .inset_0()
+        };
+        let element = element.child(hover_probe);
         let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
         if render_no <= 8 || render_ms >= 8.0 {
             stamp(format!(
