@@ -112,13 +112,54 @@ Also bump inotify limits if dsh's HMR watches the profile directory:
 sudo sysctl fs.inotify.max_user_instances=512
 ```
 
-### Packaging
+### Install and update
+
+The package is called **`omd-desktop`**, not `omd`: Ubuntu ships an unrelated `omd`
+(an OCaml Markdown frontend), and on 2026-11-21 23:58 a routine `apt upgrade`
+treated our deb as an old version of it (`omd 0.1.0 → 1.3.2-2build5`), replaced
+`/usr/bin/omd` and deleted `/usr/lib/omd/*` — the app simply vanished. With the
+new name no distro package can collide with it.
+
+Two ways to install:
 
 ```sh
-packaging/build-deb.sh   # → packaging/dist/omd_0.1.0_amd64.deb
+# 1) user-local (no root, invisible to apt / Software Updater)
+packaging/install-user.sh                 # → ~/.local/{bin,opt,share/applications}
+
+# 2) system deb
+sudo dpkg -i packaging/dist/omd-desktop_<version>_amd64.deb
+```
+
+Start it from the app menu (**OMD**) or `omd-desktop` on the command line.
+
+**Updating from GitHub**: Settings → General opens with an Updates card (current
+version, status, release notes, *Check now* / *Download & install*, progress bar).
+The app also checks silently on startup and puts an amber dot on the gear when a
+release is waiting. The CLI is equivalent:
+
+```sh
+omd-desktop update --check   # is there anything newer?
+omd-desktop update           # download and install (restart the app to apply)
+```
+
+Where it installs depends on the running binary: a user install under
+`~/.local/opt/omd-desktop` is replaced in place without root, a system package goes
+through `pkexec dpkg -i`, and a dev build (`cargo run`) only downloads into
+`~/.cache/omd/updates/` with a hint. `OMD_UPDATE_API` can point at a local fake
+response for offline testing, and `OMD_NO_UPDATE_CHECK=1` disables the startup check.
+
+### Packaging and releasing
+
+```sh
+packaging/build-deb.sh   # → packaging/dist/omd-desktop_<version>_amd64.deb
 packaging/test-deb.sh    # unpack and smoke-test without installing
+packaging/release.sh     # tag + upload the deb/zip to GitHub Releases
 packaging/windows/build.sh  # → packaging/dist/omd-windows.zip (cross-compiled on Linux)
 ```
+
+`release.sh` publishes `v<version>` from `Cargo.toml`; the asset names
+(`omd-desktop_<version>_amd64.deb`, `omd-windows.zip`) are what the in-app updater
+looks for.
 
 The Windows build is **compile-time verified only** (import table checked, 52 `ghostty-vt` symbols
 present in the DLL export table); it has not been run on real hardware yet.
@@ -132,7 +173,7 @@ present in the DLL export table); it has not been run on real hardware yet.
   browser block is not a security boundary — do not point it at untrusted sites.
 - **Wayland**: browser frames are BGRA read-back uploaded to a shared GPUI texture (no DMA-BUF);
   IME, clipboard and popup menus inside the browser are unverified there.
-- **Windows**: control socket (`omd block`) and D3D11 shared-texture capture are still missing;
+- **Windows**: control socket (`omd-desktop block`) and D3D11 shared-texture capture are still missing;
   browser frames go through CPU upload.
 - Some panels are display-only where the gateway offers no client-side write endpoint
   (for example, reminders are created by the agent's `schedule_create` tool, not by the UI).

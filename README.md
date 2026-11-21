@@ -94,21 +94,59 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 
 - 计划/目标、日程、子代理面板（`goals/*`、`schedule/*`、`subagents/*`）尚未做 UI
 
-### 打包
+### 安装与更新
+
+包名是 **`omd-desktop`**，不是 `omd`：Ubuntu 源里有个同名包（OCaml 写的 Markdown
+前端），2026-11-21 23:58 的常规 `apt upgrade` 把它当成同包升级
+（`omd 0.1.0 → 1.3.2-2build5`），直接删掉了 `/usr/lib/omd/*`，app 就这么"消失"了。
+改名之后 distro 再怎么升级都碰不到我们。
+
+两种装法：
+
+```sh
+# 1) 用户态（免 root，apt/软件更新器完全看不见，最不会被搞掉）
+packaging/install-user.sh                 # → ~/.local/{bin,opt,share/applications}
+packaging/install-user.sh --deb <deb>     # 装指定包
+
+# 2) 系统 deb（需要 root）
+sudo dpkg -i packaging/dist/omd-desktop_<version>_amd64.deb
+```
+
+启动：应用菜单里的 **OMD**，或命令行 `omd-desktop`（用户态在 `~/.local/bin`）。
+
+**从 GitHub 更新**：设置 → General 顶部有更新卡片（当前版本、状态、release notes、
+「Check now」/「Download & install」、进度条），启动时会自动静默检查一次，有新版本时
+齿轮右上角亮一个琥珀点。命令行等价：
+
+```sh
+omd-desktop update --check     # 只看有没有新版本
+omd-desktop update             # 下载并安装（重启 app 生效）
+```
+
+安装方式按当前可执行文件位置分派：`~/.local/opt/omd-desktop` 的副本就地覆盖（免 root），
+`/usr/lib/omd-desktop` 的走 `pkexec dpkg -i`，`cargo run` 之类只下载到
+`~/.cache/omd/updates/` 并提示手动装。`OMD_UPDATE_API` 可指向本地假响应（离线测试），
+`OMD_NO_UPDATE_CHECK=1` 关掉启动检查。
+
+### 打包与发布
 
 图标在 `packaging/icons/`（深色圆角块 + 六点抓手 + 运行点）。窗口用内嵌的 256px PNG（X11），桌面启动器走 hicolor。
 
 ```sh
 CEF_PATH="$PWD/vendor/cef" cargo build --release -p omd
-packaging/build-deb.sh          # packaging/dist/omd_0.1.0_amd64.deb
+packaging/build-deb.sh          # packaging/dist/omd-desktop_<version>_amd64.deb
 packaging/test-deb.sh           # 不解进系统，抽出包跑一轮冒烟
+packaging/release.sh            # 打 tag + 把 deb/zip 传到 GitHub Releases
 ```
+
+`release.sh` 用 `Cargo.toml` 的版本号发 `v<version>`，产物名必须保持
+`omd-desktop_<version>_amd64.deb` / `omd-windows.zip`——app 内的更新器就是按这两个名字挑资产的。
 
 deb 约 150MB（xz），里面带上 CEF 和 `libghostty-vt`，因为 CEF 在可执行文件旁边找 `icudtl.dat`。dsh 运行时不打进包，仍用 `~/.local/share/omd/runtime`。
 
 Windows exe 可以在这台 Linux 上交叉编译出来（`packaging/windows/build.sh`，产出 `packaging/dist/omd-windows.zip`）。工具链全部免 root：rustup 加 `x86_64-pc-windows-msvc` target、`cargo install cargo-xwin`、apt download 解包 clang-21/lld-21/libclang-common-21-dev、venv 装 cmake+ninja。Windows 版 CEF 已 vendor（`vendor/cef/156.0.26/cef_windows_x86_64`，`packaging/windows/vendor-cef.sh` 刷新），`ghostty-vt.dll` 用 Zig 0.17 从官方 vt-1.0.0 源码交叉编译（构建说明在 `vendor/libghostty-vt/windows/README.md`）。
 
-Windows 版**只做了编译级验证**（导入表检查：除系统 DLL 外只依赖包内自带的 `ghostty-vt.dll`/`libcef.dll`，及 Win10 2004+ 系统自带的 `icuuc.dll`；52 个 ghostty-vt 导入符号全部在 DLL 导出表里），没在真实 Windows 上跑过。已知缺口：控制 socket（`omd block`）没接、浏览器走 CPU 像素上传（D3D11 共享纹理未接）、IME/剪贴板/弹窗未验证。细节见 `packaging/windows/README.md`。
+Windows 版**只做了编译级验证**（导入表检查：除系统 DLL 外只依赖包内自带的 `ghostty-vt.dll`/`libcef.dll`，及 Win10 2004+ 系统自带的 `icuuc.dll`；52 个 ghostty-vt 导入符号全部在 DLL 导出表里），没在真实 Windows 上跑过。已知缺口：控制 socket（`omd-desktop block`）没接、浏览器走 CPU 像素上传（D3D11 共享纹理未接）、IME/剪贴板/弹窗未验证。细节见 `packaging/windows/README.md`。
 
 ### 构建依赖（Linux）
 
