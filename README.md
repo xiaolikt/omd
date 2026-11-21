@@ -81,6 +81,7 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 | **block 头部改版**：活动 block 高亮（左侧色条 + 头部底色/标题提亮，终端绿/聊天蓝/媒体橙）；`⠿` 抓手替换原 ▯/⊟/最大化/关闭按钮 —— 按住拖动换位、点击弹下拉菜单（split right/down × chat/terminal/browser、编辑器加 format/outline、maximize、close），Esc 或点外部关闭 | ✅（debug/release 冒烟 + `OMD_BLOCK_ACTIVE`/`OMD_BLOCK_MENU` 探针） |
 | **浏览器 pane 管理**：浏览器块也有 block 头（橙色色条 + 页面标题，`on_title_change` 维护）；工具条 ←/→ 按导航栈可用态点亮/置灰（`can_go_back/forward`）；⠿ 菜单里 split browser 可继续开多实例（各自 URL/前进后退栈独立） | ✅（`OMD_BROWSER=1` 冒烟：新头 + 置灰按钮渲染正常，0 panic） |
 | **重启终端恢复**：启动后对每个会话跑一次 `terminal/list` 扫描——引擎侧还活着但没挂进 pane 的终端（崩溃/强杀没存上布局）自动补回该会话的 tab；已恢复 pane 的终端退出/不存在则标 dead，body 显示「terminal exited」+ ↻ restart（原地换新终端）/ × close | ✅（实测：spike 建孤儿终端 `omd-orphan-test` → GUI 启动 1s 内 reattach 为 pane 并持久化；engine 侧 close 后重启标记 `dead=true`） |
+| **会话实时状态（session/control）**：worker 订阅 `session/control` 流（baseline 全量 + 逐会话 projection 增量），侧栏标题/blank 实时更新、选中会话权限预设实时纠偏；悬置审批/提问由网关在 `$events` 重连时对 owner 补发（引擎 `openRemoteEvents` 源码验证），GUI 的 waterfall 处理已就位 → 重启不丢审批卡 | ✅（冒烟：`[control] first projection … keys=[sessionStats, turnOutline, userQuestions, tokenUsage, contextPressure, title]`；22/22 测试 + release 干净） |
 
 **dsh 的单写者模型**（踩到的坑）：一个会话同时只能有一个写句柄。
 浏览器里开着这个会话时，GUI 发 `session/prompt` 会得到

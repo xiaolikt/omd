@@ -75,6 +75,106 @@ async fn main() -> Result<()> {
         println!("  - {id}  running={running} cwd={cwd} {title}");
     }
 
+    if std::env::var("DSH_SPIKE_CONTROL").is_ok() {
+        // session/control：基线 + projection 增量（GUI 恢复 running 状态用）
+        let mux2 = Mux::connect(&host.ws_url("api/remote.mux")?, host.cookie_header()).await?;
+        let mut st = mux2.open("session/control", json!({})).await?;
+        println!("CONTROL open");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut n = 0;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), st.recv()).await {
+                Ok(Some(Frame::Item(v))) => {
+                    n += 1;
+                    let text = v.to_string();
+                    println!("CONTROL frame[{n}]: {}", text.chars().take(60000).collect::<String>());
+                }
+                Ok(Some(Frame::End)) => {
+                    println!("CONTROL end");
+                    break;
+                }
+                Ok(Some(Frame::Error(e))) => {
+                    println!("CONTROL error: {e:?}");
+                    break;
+                }
+                _ => { println!("CONTROL recv timeout"); break; }
+            }
+        }
+        return Ok(());
+    }
+
+    if std::env::var("DSH_SPIKE_WATERFALL").is_ok() {
+        // 悬着的 approval 能不能在「重连」后补发（GUI 重启恢复的关键）：
+        // 1) 建会话（默认 read-only，跑命令要审批）2) events#1 挂着
+        // 3) prompt 让它跑 touch → 等 approval 4) 开 events#2（模拟重启）
+        // 5) 看 waterfall 是否补发 pending approval 6) 收尾 decide
+        let created = rpc.call("session/create", json!({ "request": { "cwd": "/tmp" } })).await?;
+        let sid = created.get("sessionId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        println!("WATERFALL session: {sid}");
+        let mux1 = Mux::connect(&host.ws_url("api/remote.mux")?, host.cookie_header()).await?;
+        let mut ev1 = mux1.open("$events", json!({})).await?;
+        println!("WATERFALL events#1 open");
+        let _ = rpc.call("session/prompt", json!({
+            "request": { "requestId": format!("wf-{sid}"), "sessionId": sid, "mode": "queue",
+                         "content": [ { "type": "text", "text": "Run this exact shell command and show the output: touch /tmp/omd-wf-probe && echo done" } ] }
+        })).await;
+        println!("WATERFALL prompt sent");
+        let mut pending_id = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), ev1.recv()).await {
+                Ok(Some(Frame::Item(v))) => {
+                    let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                    let event = v.get("event").and_then(|t| t.as_str()).unwrap_or("?");
+                    println!("WATERFALL ev1 type={kind} event={event}");
+                    if event == "api-session/error" || event == "api-session/status" {
+                        println!("WATERFALL detail: {}", v.to_string().chars().take(500).collect::<String>());
+                    }
+                    if event == "approval/request" {
+                        pending_id = v.get("eventId").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                        println!("WATERFALL pending approval {pending_id}");
+                        break;
+                    }
+                }
+                _ => { println!("WATERFALL ev1 ended"); break; }
+            }
+        }
+        if pending_id.is_empty() {
+            println!("WATERFALL no approval appeared (agent may be allowed already) — set read-only preset first");
+            return Ok(());
+        }
+        // 模拟 GUI 重启：全新连接、全新 $events
+        let mux2 = Mux::connect(&host.ws_url("api/remote.mux")?, host.cookie_header()).await?;
+        let mut ev2 = mux2.open("$events", json!({})).await?;
+        println!("WATERFALL events#2 open (reconnect)");
+        let mut replayed = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), ev2.recv()).await {
+                Ok(Some(Frame::Item(v))) => {
+                    let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                    let event = v.get("event").and_then(|t| t.as_str()).unwrap_or("?");
+                    let eid = v.get("eventId").and_then(|t| t.as_str()).unwrap_or("");
+                    println!("WATERFALL ev2 type={kind} event={event} id={eid}");
+                    if event == "approval/request" && eid == pending_id {
+                        replayed = true;
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        println!("WATERFALL replayed={replayed}");
+        // 收尾：放行（approval 卡消失，agent 跑完）
+        let client_id = mux2.client_id().unwrap_or_default();
+        let resp = rpc.call("$events/result", json!({
+            "clientId": client_id, "eventId": pending_id,
+            "outcome": { "kind": "result", "value": "allowed-once" }
+        })).await;
+        println!("WATERFALL decide: {resp:?}");
+        return Ok(());
+    }
+
     if std::env::var("DSH_SPIKE_IDLE").is_ok() {
         let created = rpc.call("session/create", json!({ "request": { "cwd": "/tmp" } })).await?;
         let sid = created.get("sessionId").and_then(|v| v.as_str()).unwrap_or("").to_string();

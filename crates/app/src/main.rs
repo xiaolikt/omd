@@ -1064,6 +1064,11 @@ enum Ev {
     Jobs(Value),
     /// workspace/follow 的一帧（baseline / pinned / archived / …）
     Workspace(Value),
+    /// session/control 的一个会话投影更新（title / permissions / inbox / …）
+    ControlProjection {
+        session_id: String,
+        values: Value,
+    },
     Called {
         tag: String,
         endpoint: String,
@@ -1135,6 +1140,7 @@ fn ev_name(ev: &Ev) -> &'static str {
         Ev::QuestionGone => "QuestionGone",
         Ev::InstallSettled { .. } => "InstallSettled",
         Ev::Workspace(_) => "Workspace",
+        Ev::ControlProjection { .. } => "ControlProjection",
         Ev::FileStaged { .. } => "FileStaged",
         Ev::FilesPicked(_) => "FilesPicked",
         Ev::DshInfo { .. } => "DshInfo",
@@ -1424,6 +1430,69 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                     _ => break,
                 }
             }
+        });
+    }
+
+    // session/control：全库会话投影（title/权限预设/收件箱队列）的实时来源。
+    // 重启恢复 + 侧栏活跃状态都靠它：baseline 一次给全量，之后逐会话增量。
+    {
+        let mux = mux.clone();
+        let evs_ctl = evs.clone();
+        tokio::spawn(async move {
+            let Ok(mut stream) = mux.open("session/control", json!({})).await else {
+                eprintln!("[worker] session/control open failed");
+                return;
+            };
+            eprintln!("[worker] session/control open");
+            loop {
+                match stream.recv().await {
+                    Some(Frame::Item(value)) => {
+                        let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        let updates: Vec<(String, Value)> = if kind == "baseline" {
+                            value
+                                .pointer("/value/projections")
+                                .and_then(|v| v.as_object())
+                                .map(|blocks| {
+                                    blocks
+                                        .iter()
+                                        .map(|(sid, block)| {
+                                            (sid.clone(), block.get("values").cloned().unwrap_or(Value::Null))
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        } else if kind == "projection" {
+                            // changes 是 [{ key, val }] 数组
+                            value
+                                .get("sessionId")
+                                .and_then(|v| v.as_str())
+                                .and_then(|sid| {
+                                    let changes = value.get("changes")?.as_array()?;
+                                    let mut map = serde_json::Map::new();
+                                    for change in changes {
+                                        if let (Some(key), Some(val)) = (
+                                            change.get("key").and_then(|k| k.as_str()),
+                                            change.get("val").cloned(),
+                                        ) {
+                                            map.insert(key.to_string(), val);
+                                        }
+                                    }
+                                    Some(vec![(sid.to_string(), Value::Object(map))])
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        for (session_id, values) in updates {
+                            let _ = evs_ctl
+                                .send(Ev::ControlProjection { session_id, values })
+                                .await;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            eprintln!("[worker] session/control ended");
         });
     }
 
@@ -2741,6 +2810,8 @@ struct Root {
     block_menu: Option<u64>,
     /// 重启恢复的终端扫描是否已跑过（terminal/list 一次性）
     term_sweep_done: bool,
+    /// session/control 第一帧到达时间（冒烟验证用）
+    control_first: Option<std::time::Instant>,
     /// 哪些 session 是终端 tab（渲染成整块终端而不是聊天）
     term_tabs: std::collections::HashSet<String>,
     /// 命令面板（Ctrl+K）：搜索 + 命令 / 会话 / 空间。
@@ -4079,6 +4150,7 @@ impl Root {
         .ok()
         .and_then(|v| v.parse::<u64>().ok()),
     term_sweep_done: false,
+    control_first: None,
     focus_pending: None,
     pending_term_meta: std::collections::HashMap::new(),
             chat_snapshots: std::collections::HashMap::new(),
@@ -5475,6 +5547,58 @@ impl Root {
                     _ => {}
                 }
                 cx.notify();
+            }
+            Ev::ControlProjection { session_id, values } => {
+                // 只取关心的键：title（侧栏/会话头）、blank、权限预设（选中的会话）
+                let mut changed = false;
+                if self.control_first.is_none() {
+                    self.control_first = Some(std::time::Instant::now());
+                    stamp(format!(
+                        "[control] first projection for {session_id}: keys={:?}",
+                        values
+                            .as_object()
+                            .map(|map| map.keys().take(6).cloned().collect::<Vec<_>>())
+                            .unwrap_or_default()
+                    ));
+                }
+                let new_title = values.get("title").and_then(|v| v.as_str());
+                let new_blank = values
+                    .pointer("/sessionListMetadata/blank")
+                    .and_then(|v| v.as_bool());
+                if let Some(row) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|row| row.id == session_id)
+                {
+                    if let Some(title) = new_title {
+                        let title = title.trim().to_string();
+                        if !title.is_empty() && row.title != title {
+                            row.title = title;
+                            changed = true;
+                        }
+                    }
+                    if let Some(blank) = new_blank {
+                        if row.blank != blank {
+                            row.blank = blank;
+                            changed = true;
+                        }
+                    }
+                    // 选中会话的权限预设实时纠偏（permission pill）
+                    if row.id == self.selected.clone().unwrap_or_default() {
+                        if let Some(preset) = values
+                            .pointer("/permissions/currentValue")
+                            .and_then(|v| v.as_str())
+                        {
+                            if self.permission_preset.as_deref() != Some(preset) {
+                                self.permission_preset = Some(preset.to_string());
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if changed {
+                    cx.notify();
+                }
             }
             Ev::FileStaged { attach_id, result } => {
                 if let Some(attachment) = self
