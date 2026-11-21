@@ -1069,6 +1069,11 @@ enum Ev {
         session_id: String,
         values: Value,
     },
+    /// api-session/status emit：会话 running 翻转（args: [sessionId, running]）
+    SessionStatus {
+        session_id: String,
+        running: bool,
+    },
     Called {
         tag: String,
         endpoint: String,
@@ -1141,6 +1146,7 @@ fn ev_name(ev: &Ev) -> &'static str {
         Ev::InstallSettled { .. } => "InstallSettled",
         Ev::Workspace(_) => "Workspace",
         Ev::ControlProjection { .. } => "ControlProjection",
+        Ev::SessionStatus { .. } => "SessionStatus",
         Ev::FileStaged { .. } => "FileStaged",
         Ev::FilesPicked(_) => "FilesPicked",
         Ev::DshInfo { .. } => "DshInfo",
@@ -1337,6 +1343,27 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                                 .map(|a| a.to_string().chars().take(220).collect::<String>())
                                 .unwrap_or_default();
                             let _ = evs.send(Ev::Approval { event_id, label }).await;
+                        }
+                        // 会话运行态（args: [sessionId, running]）——tab 上的活动点
+                        if event == "api-session/status" {
+                            let args = value.get("args").and_then(|a| a.as_array());
+                            let session_id = args
+                                .and_then(|a| a.first())
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let running = args
+                                .and_then(|a| a.get(1))
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            if !session_id.is_empty() {
+                                let _ = evs
+                                    .send(Ev::SessionStatus {
+                                        session_id,
+                                        running,
+                                    })
+                                    .await;
+                            }
                         }
                     }
                     Some("waterfall") => {
@@ -5598,6 +5625,20 @@ impl Root {
                 }
                 if changed {
                     cx.notify();
+                }
+            }
+            Ev::SessionStatus { session_id, running } => {
+                // tab 上的活动点：引擎 emit 的 running 翻转实时落到行
+                if let Some(row) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|row| row.id == session_id)
+                {
+                    if row.running != running {
+                        row.running = running;
+                        stamp(format!("[control] session {session_id} running={running}"));
+                        cx.notify();
+                    }
                 }
             }
             Ev::FileStaged { attach_id, result } => {
@@ -13275,9 +13316,7 @@ fn pane_element(
     editor: Option<Entity<EditorState>>,
     focus: FocusHandle,
     term_id: Option<String>,
-    title: String,
     is_maximized: bool,
-    diag: Option<(usize, usize)>,
     // 悬停中的分屏菜单方向（Some 时把菜单画在这个 pane 上）
     split_menu: Option<SplitDir>,
     media: Option<(String, MediaKind, Option<Arc<RenderImage>>)>,
@@ -13286,7 +13325,7 @@ fn pane_element(
     find: Option<(Entity<InputState>, usize, usize)>,
     // 大纲（当前编辑器；Some 时 body 里画浮层）
     outline_items: Option<Vec<lsp::OutlineItem>>,
-    // 是否是当前活动 block（头部高亮 + 左边色条）
+    // 是否是当前活动 block（头部底色/抓手提亮）
     active: bool,
     // ⠿ 抓手菜单是否展开
     menu_open: bool,
@@ -13294,13 +13333,6 @@ fn pane_element(
     term_dead: bool,
     cx: &mut Context<Root>,
 ) -> AnyElement {
-    let accent = if editor.is_some() {
-        rgb(0x00b4ff)
-    } else if media.is_some() {
-        rgb(0xffa657)
-    } else {
-        rgb(0x00d98a)
-    };
     let is_editor = editor.is_some();
     let el = div()
         .flex()
@@ -13316,9 +13348,6 @@ fn pane_element(
             rgb(0x0d1015)
         });
     let focus_click = focus.clone();
-    // 格式化/大纲按钮用
-    let format_pane_id = pane_id;
-    let outline_pane_id = pane_id;
     // 滚轮回滚用：wheel 监听需要自己的 term_id 拷贝
     let term_id_wheel = term_id.clone();
     let wheel_pane_id = pane_id;
@@ -13343,9 +13372,8 @@ fn pane_element(
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.))
-            .px(px(10.))
-            .h(px(24.))
+            .px(px(4.))
+            .h(px(22.))
             .bg(if active {
                 rgb(0x1b2029)
             } else {
@@ -13357,94 +13385,8 @@ fn pane_element(
             } else {
                 rgb(0x23272f)
             })
-            // 左侧色条：活动 block 亮起，非活动压暗
-            .child(
-                div()
-                    .w(px(2.))
-                    .h(px(12.))
-                    .rounded(px(1.))
-                    .bg(if active { accent } else { rgb(0x2a3038) }),
-            )
-            .child(if editor.is_some() {
-                Icon::new(gpui_kit::assets::IconName::FileText)
-                    .with_size(px(12.))
-                    .text_color(rgb(0x00b4ff))
-                    .into_any_element()
-            } else {
-                Icon::new(gpui_kit::assets::IconName::SquareTerminal)
-                    .with_size(px(12.))
-                    .text_color(rgb(0x00d98a))
-                    .into_any_element()
-            })
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(if active {
-                        rgb(0xe2e7f0)
-                    } else {
-                        rgb(0x9ca3b0)
-                    })
-                    .child(SharedString::from(title)),
-            )
-            .children(diag.and_then(|(errors, warnings)| {
-                if errors == 0 && warnings == 0 {
-                    return None;
-                }
-                let mut row = div().flex().flex_row().items_center().gap(px(4.));
-                if errors > 0 {
-                    row = row.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0xff5663))
-                            .child(SharedString::from(format!("✕{errors}"))),
-                    );
-                }
-                if warnings > 0 {
-                    row = row.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0xc9a15a))
-                            .child(SharedString::from(format!("⚠{warnings}"))),
-                    );
-                }
-                Some(row)
-            }))
-            .children(editor.as_ref().map(|_| {
-                // 大纲按钮（documentSymbol 下拉）
-                div()
-                    .id(SharedString::from(format!("pane-outline-{pane_id}")))
-                    .px(px(5.))
-                    .py(px(1.))
-                    .rounded_sm()
-                    .text_xs()
-                    .text_color(rgb(0x707786))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x23272f)).text_color(rgb(0xd0d4dc)))
-                    .child("☰ outline")
-                    .on_click(cx.listener(move |this, _ev, _win, cx| {
-                        this.focused_pane = Some(outline_pane_id);
-                        this.open_outline(cx);
-                    }))
-                    .into_any_element()
-            }))
-            .children(editor.as_ref().map(|_| {
-                // 格式化按钮（有 LSP 的文件才有效；点了没 server 会提示）
-                div()
-                    .id(SharedString::from(format!("pane-format-{pane_id}")))
-                    .px(px(5.))
-                    .py(px(1.))
-                    .rounded_sm()
-                    .text_xs()
-                    .text_color(rgb(0x707786))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x23272f)).text_color(rgb(0xd0d4dc)))
-                    .child("❏ format")
-                    .on_click(cx.listener(move |this, _ev, _win, cx| {
-                        this.focused_pane = Some(format_pane_id);
-                        this.format_current_editor(cx);
-                    }))
-                    .into_any_element()
-            }))
+            // 头部只留 ⠿ 抓手：icon/标题/诊断/format/outline 全部去掉
+            //（format/outline 在抓手菜单里还有）
             .child(div().flex_1())
             .on_mouse_down(
                 MouseButton::Left,
@@ -13472,6 +13414,8 @@ fn pane_element(
                     .text_sm()
                     .text_color(if menu_open {
                         rgb(0xe2e7f0)
+                    } else if active {
+                        rgb(0x9aa3b5)
                     } else {
                         rgb(0x707786)
                     })
@@ -14051,8 +13995,8 @@ fn block_menu_overlay(
     let mut menu = div()
         .id(SharedString::from(format!("block-menu-{pane_id}")))
         .absolute()
-        .top(px(27.))
-        .right(px(6.))
+        .top(px(23.))
+        .right(px(4.))
         .w(px(198.))
         .flex()
         .flex_col()
@@ -14239,7 +14183,7 @@ fn pane_divider(pane_id: u64, kind: BlockPlacement, dragging: bool, cx: &mut Con
 fn browser_pane_element(
     pane_id: u64,
     index: usize,
-    title: String,
+    _title: String,
     focus: FocusHandle,
     input: Entity<InputState>,
     extra: AnyElement,
@@ -14321,16 +14265,15 @@ fn browser_pane_element(
                 cx.notify();
             }),
         )
-        // block 头：和 terminal / chat / editor 一个样式（抓手 = 拖动 + 菜单）
+        // block 头：只留 ⠿ 抓手（拖动换位 / 点击菜单），活动态提亮
         .child(
             div()
                 .id(SharedString::from(format!("browser-pane-head-{pane_id}")))
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(6.))
-                .px(px(10.))
-                .h(px(24.))
+                .px(px(4.))
+                .h(px(22.))
                 .flex_shrink_0()
                 .bg(if active {
                     rgb(0x1b2029)
@@ -14343,6 +14286,7 @@ fn browser_pane_element(
                 } else {
                     rgb(0x23272f)
                 })
+                .child(div().flex_1())
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
@@ -14354,33 +14298,6 @@ fn browser_pane_element(
                         ));
                         cx.notify();
                     }),
-                )
-                .child(
-                    div()
-                        .w(px(2.))
-                        .h(px(12.))
-                        .rounded(px(1.))
-                        .bg(if active { rgb(0xffa657) } else { rgb(0x2a3038) }),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(0xffa657))
-                        .child("◐"),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .text_xs()
-                        .text_color(if active {
-                            rgb(0xe2e7f0)
-                        } else {
-                            rgb(0x9ca3b0)
-                        })
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(SharedString::from(title)),
                 )
                 // ⠿ 抓手：拖动换位，点击下拉菜单
                 .child(
@@ -14396,6 +14313,8 @@ fn browser_pane_element(
                         .text_sm()
                         .text_color(if menu_open {
                             rgb(0xe2e7f0)
+                        } else if active {
+                            rgb(0x9aa3b5)
                         } else {
                             rgb(0x707786)
                         })
@@ -15038,7 +14957,7 @@ fn block_composer(
 fn chat_pane_element(
     pane_id: u64,
     session_id: String,
-    title: String,
+    _title: String,
     live: bool,
     is_active_panel: bool,
     blocks: Vec<TranscriptBlock>,
@@ -15126,9 +15045,8 @@ fn chat_pane_element(
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(6.))
-                .px(px(10.))
-                .h(px(24.))
+                .px(px(4.))
+                .h(px(22.))
                 .flex_shrink_0()
                 .bg(if active {
                     rgb(0x1b2029)
@@ -15141,32 +15059,8 @@ fn chat_pane_element(
                 } else {
                     rgb(0x23272f)
                 })
-                .child(
-                    div()
-                        .w(px(2.))
-                        .h(px(12.))
-                        .rounded(px(1.))
-                        .bg(if active { rgb(0x00b8ff) } else { rgb(0x2a3038) }),
-                )
-                .child(
-                    Icon::new(gpui_kit::assets::IconName::Bot)
-                        .with_size(px(12.))
-                        .text_color(rgb(0x00b8ff)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .text_xs()
-                        .text_color(if active {
-                            rgb(0xe2e7f0)
-                        } else {
-                            rgb(0x9ca3b0)
-                        })
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(SharedString::from(title)),
-                )
+                // 头部只留 ⠿ 抓手（拖动换位 / 点击菜单）
+                .child(div().flex_1())
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
@@ -15189,6 +15083,8 @@ fn chat_pane_element(
                         .text_sm()
                         .text_color(if menu_open {
                             rgb(0xe2e7f0)
+                        } else if active {
+                            rgb(0x9aa3b5)
                         } else {
                             rgb(0x707786)
                         })
@@ -16272,7 +16168,7 @@ impl Render for Root {
         let tab_drag = self.tab_drag.clone();
         // 三层：space → tab → panel
         let pinned_sessions = self.pinned_sessions.clone();
-        let tab_chips: Vec<(String, String, bool)> = current_space
+        let tab_chips: Vec<(String, String, bool, bool)> = current_space
             .as_ref()
             .map(|space| {
                 let active_panel = space.active_panel.clone();
@@ -16291,10 +16187,19 @@ impl Render for Root {
                         {
                             title = format!("📌 {title}");
                         }
+                        // 会话在跑（api-session/status 实时维护）→ tab 上亮点
+                        let running = session.is_some_and(|session| {
+                            !is_file_panel(session)
+                                && self
+                                    .sessions
+                                    .iter()
+                                    .any(|row| row.id == session && row.running)
+                        });
                         (
                             tab.id.clone(),
                             title,
                             active_panel.as_deref() == Some(tab.id.as_str()),
+                            running,
                         )
                     })
                     .collect()
@@ -16326,7 +16231,7 @@ impl Render for Root {
         let tab_strip_viewport = f32::from(self.tab_scroll.bounds().size.width);
         let tab_widths: Vec<f32> = tab_chips
             .iter()
-            .map(|(_, title, _)| est_tab_width(title))
+            .map(|(_, title, _, _)| est_tab_width(title))
             .collect();
         self.tab_widths = tab_widths.clone();
         let tab_content_w: f32 =
@@ -17051,17 +16956,12 @@ impl Render for Root {
         let chat_menu_open = self.block_menu == Some(0);
         // 聊天 panel 自己的头（和 terminal / editor panel 一个样式）
         let chat_panel_head = {
-            let title = selected
-                .as_deref()
-                .map(|id| self.session_title(id))
-                .unwrap_or_else(|| "new panel".to_string());
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(6.))
-                .px(px(10.))
-                .h(px(24.))
+                .px(px(4.))
+                .h(px(22.))
                 .flex_shrink_0()
                 .bg(if chat_active {
                     rgb(0x1b2029)
@@ -17074,42 +16974,8 @@ impl Render for Root {
                 } else {
                     rgb(0x23272f)
                 })
-                .child(
-                    div()
-                        .w(px(2.))
-                        .h(px(12.))
-                        .rounded(px(1.))
-                        .bg(if chat_active { rgb(0x00b8ff) } else { rgb(0x2a3038) }),
-                )
-                .child(
-                    Icon::new(gpui_kit::assets::IconName::Bot)
-                        .with_size(px(12.))
-                        .text_color(rgb(0x00b4ff)),
-                )
-                .child(
-                    div()
-                        .flex_shrink_1()
-                        .min_w(px(0.))
-                        .text_xs()
-                        .text_color(if chat_active {
-                            rgb(0xe2e7f0)
-                        } else {
-                            rgb(0x9ca3b0)
-                        })
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(SharedString::from(title)),
-                )
+                // 头部只留 ⠿ 抓手（拖动换位 / 点击菜单）
                 .child(div().flex_1())
-                .child(
-                    div()
-                        .max_w(px(200.))
-                        .text_xs()
-                        .text_color(rgb(0x5a6070))
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(SharedString::from(short_path(&space_cwd))),
-                )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, ev: &MouseDownEvent, _win, cx| {
@@ -17137,6 +17003,8 @@ impl Render for Root {
                         .text_sm()
                         .text_color(if chat_menu_open {
                             rgb(0xe2e7f0)
+                        } else if chat_active {
+                            rgb(0x9aa3b5)
                         } else {
                             rgb(0x707786)
                         })
@@ -22450,17 +22318,6 @@ impl Render for Root {
                 }
                 continue;
             }
-            let title = media
-                .as_ref()
-                .map(|(path, _, _)| path.clone())
-                .or(editor_path.clone())
-                .as_deref()
-                .and_then(|path| {
-                    PathBuf::from(path)
-                        .file_name()
-                        .map(|name| name.to_string_lossy().to_string())
-                })
-                .unwrap_or_else(|| "terminal".to_string());
             let term_find_info = self.term_find.as_ref().filter(|find| find.pane_id == pane_id).map(
                 |find| {
                     (
@@ -22489,9 +22346,7 @@ impl Render for Root {
                     editor,
                     focus,
                     term_id,
-                    title,
                     maximized == Some(pane_id),
-                    diag,
                     split_menu,
                     media,
                     images,
@@ -23996,7 +23851,7 @@ impl Render for Root {
                                     .flex_1().min_w(px(0.))
                                     .overflow_x_scroll()
                                     .track_scroll(&self.tab_scroll)
-                                    .children(tab_chips.into_iter().enumerate().map(|(tab_index, (id, title, active))| {
+                                    .children(tab_chips.into_iter().enumerate().map(|(tab_index, (id, title, active, running))| {
                                         let width = tab_widths.get(tab_index).copied().unwrap_or(168.);
                                         let open_id = id.clone();
                                         let close_id = id.clone();
@@ -24070,6 +23925,18 @@ impl Render for Root {
                                                 } else {
                                                     this.activate_tab(open_id.clone(), cx);
                                                 }
+                                            }))
+                                            // 会话运行中：琥珀色活动点
+                                            .children(running.then(|| {
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "tab-live-{id}"
+                                                    )))
+                                                    .w(px(5.))
+                                                    .h(px(5.))
+                                                    .rounded_full()
+                                                    .bg(rgb(0xc9a15a))
+                                                    .flex_shrink_0()
                                             }))
                                             .child(if renaming_this {
                                                 // 改名框必须收在 tab 里面（之前固定 140px 会撑出边框，
