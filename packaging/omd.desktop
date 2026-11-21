@@ -2,7 +2,7 @@
 Name=OMD
 GenericName=DeepSeek Harness
 Comment=Native desktop client for DeepSeek Harness
-Exec=omd
+Exec=omd-desktop
 Icon=omd
 Terminal=false
 Type=Application

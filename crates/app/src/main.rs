@@ -19,6 +19,7 @@ mod browser;
 #[cfg(target_os = "linux")]
 mod x11_embed;
 mod term;
+mod update;
 
 fn uuid_like() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -822,6 +823,28 @@ impl Layout {
     }
 }
 
+/// 应用自更新的界面状态。
+enum AppUpdateState {
+    Idle,
+    Checking,
+    /// 已经是最新
+    UpToDate(String),
+    /// 有新版本
+    Available(Box<update::Release>),
+    Downloading { received: u64, total: u64 },
+    Settled(String),
+    Failed(String),
+}
+
+impl AppUpdateState {
+    fn badge(&self) -> Option<&'static str> {
+        match self {
+            AppUpdateState::Available(_) => Some("update"),
+            _ => None,
+        }
+    }
+}
+
 /// 一个 tab：装若干 panel（panel1-omp / panel2-terminal …），同一时刻显示一个。
 #[derive(Clone, Debug)]
 struct Panel {
@@ -1004,6 +1027,10 @@ enum Cmd {
     Decide { event_id: String, allow: bool },
     AnswerQuestion { event_id: String, answer: Value },
     UpdateDsh,
+    /// 检查 GitHub 上有没有新版本
+    AppUpdateCheck,
+    /// 下载并安装最新版本（asset url + 文件名）
+    AppUpdateInstall { url: String, name: String },
 }
 
 /// 每个 shell 起来时写进环境，terminal-browser 靠它找到 omd 的 socket。
@@ -1135,6 +1162,12 @@ enum Ev {
     FilesPicked(Vec<String>),
     DshInfo { version: String, bundled: bool },
     DshUpdate { done: bool, message: String },
+    /// 应用自更新：检查结果（Err = 网络/无 release）
+    AppUpdateChecked(std::result::Result<update::Release, String>),
+    /// 自更新下载进度
+    AppUpdateProgress { received: u64, total: u64 },
+    /// 自更新落地结果
+    AppUpdateSettled(std::result::Result<update::InstallOutcome, String>),
     Error(String),
 }
 
@@ -1179,6 +1212,9 @@ fn ev_name(ev: &Ev) -> &'static str {
         Ev::FilesPicked(_) => "FilesPicked",
         Ev::DshInfo { .. } => "DshInfo",
         Ev::DshUpdate { .. } => "DshUpdate",
+        Ev::AppUpdateChecked(_) => "AppUpdateChecked",
+        Ev::AppUpdateProgress { .. } => "AppUpdateProgress",
+        Ev::AppUpdateSettled(_) => "AppUpdateSettled",
         Ev::Error(_) => "Error",
     }
 }
@@ -2329,6 +2365,51 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             }
                         });
                     }
+                    Cmd::AppUpdateCheck => {
+                        let evs = evs.clone();
+                        let http = http.clone();
+                        tokio::spawn(async move {
+                            let result = update::fetch_latest(&http)
+                                .await
+                                .map_err(|err| err.to_string());
+                            let _ = evs.send(Ev::AppUpdateChecked(result)).await;
+                        });
+                    }
+                    Cmd::AppUpdateInstall { url, name } => {
+                        let evs = evs.clone();
+                        let http = http.clone();
+                        tokio::spawn(async move {
+                            let dir = update::download_dir();
+                            let (progress_tx, progress_rx) = async_channel::unbounded::<(u64, u64)>();
+                            {
+                                let evs = evs.clone();
+                                tokio::spawn(async move {
+                                    while let Ok((received, total)) = progress_rx.recv().await {
+                                        let _ = evs
+                                            .send(Ev::AppUpdateProgress { received, total })
+                                            .await;
+                                    }
+                                });
+                            }
+                            let result = match update::download(
+                                &http,
+                                &url,
+                                &dir,
+                                &name,
+                                |got, total| {
+                                    // 同步回调，冲掉积压的进度事件也无所谓
+                                    let _ = progress_tx.try_send((got, total));
+                                },
+                            )
+                            .await
+                            {
+                                Ok(path) => update::install(&path)
+                                    .map_err(|err| format!("install failed: {err}")),
+                                Err(err) => Err(format!("download failed: {err}")),
+                            };
+                            let _ = evs.send(Ev::AppUpdateSettled(result)).await;
+                        });
+                    }
                     Cmd::AnswerQuestion { event_id, answer } => {
                         let client_id = mux.client_id().unwrap_or_default();
                         let payload = json!({
@@ -3178,6 +3259,8 @@ struct Root {
     question_input: Entity<InputState>,
     question: Option<PendingQuestion>,
     show_settings: bool,
+    /// 应用自更新状态（GitHub Releases）
+    app_update: AppUpdateState,
     dsh_version: Option<String>,
     dsh_bundled: bool,
     dsh_busy: bool,
@@ -4280,6 +4363,7 @@ impl Root {
             question_input,
             question: None,
             show_settings: false,
+            app_update: AppUpdateState::Idle,
             dsh_version: None,
             dsh_bundled: false,
             dsh_busy: false,
@@ -4457,6 +4541,10 @@ impl Root {
             };
             root.open_settings_tab(tab, window, cx);
             stamp(format!("settings opened ({}) via env", tab.label()));
+        }
+        if std::env::var("OMD_NO_UPDATE_CHECK").is_err() {
+            root.app_update = AppUpdateState::Checking;
+            let _ = root.cmds.send_blocking(Cmd::AppUpdateCheck);
         }
         if std::env::var("OMD_OPEN_MODELS").is_ok() {
             root.show_models = true;
@@ -5800,6 +5888,52 @@ impl Root {
             Ev::DshUpdate { done, message } => {
                 self.dsh_busy = !done;
                 self.dsh_status = Some(message);
+            }
+            Ev::AppUpdateChecked(result) => {
+                match result {
+                    Ok(release) => {
+                        if update::is_newer(&release.version, update::current_version()) {
+                            eprintln!(
+                                "[update] {} available (running {})",
+                                release.tag,
+                                update::current_version()
+                            );
+                            self.app_update = AppUpdateState::Available(Box::new(release));
+                        } else {
+                            eprintln!("[update] up to date ({})", release.tag);
+                            self.app_update = AppUpdateState::UpToDate(release.tag);
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("[update] check failed: {err}");
+                        self.app_update = AppUpdateState::Failed(err);
+                    }
+                }
+                cx.notify();
+            }
+            Ev::AppUpdateProgress { received, total } => {
+                self.app_update = AppUpdateState::Downloading { received, total };
+                cx.notify();
+            }
+            Ev::AppUpdateSettled(result) => {
+                self.app_update = match result {
+                    Ok(outcome) => {
+                        let message = match outcome {
+                            update::InstallOutcome::Installed(text) => text,
+                            update::InstallOutcome::Delegated(text) => text,
+                            update::InstallOutcome::Downloaded(path) => {
+                                format!("downloaded {} — install it manually", path.display())
+                            }
+                        };
+                        eprintln!("[update] {message}");
+                        AppUpdateState::Settled(message)
+                    }
+                    Err(err) => {
+                        eprintln!("[update] install failed: {err}");
+                        AppUpdateState::Failed(err)
+                    }
+                };
+                cx.notify();
             }
             Ev::Error(err) => {
                 self.error = Some(err.clone());
@@ -15478,6 +15612,208 @@ fn term_rows(screen: &[Vec<Span>]) -> Vec<AnyElement> {
         .collect()
 }
 
+/// 设置页的「更新」卡片：当前版本 + 检查/安装按钮 + 发布说明。
+fn app_update_card(
+    state: &AppUpdateState,
+    dsh_version: Option<&str>,
+    cmds: Sender<Cmd>,
+    cx: &mut Context<Root>,
+) -> AnyElement {
+    let current = update::current_version();
+    let checking = matches!(state, AppUpdateState::Checking);
+    let available = match state {
+        AppUpdateState::Available(release) => Some(release.as_ref()),
+        _ => None,
+    };
+    let downloading = matches!(state, AppUpdateState::Downloading { .. });
+
+    let mut check_button = div()
+        .id("app-update-check")
+        .px(px(10.))
+        .py(px(4.))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(rgb(0x2c3340))
+        .text_xs()
+        .text_color(if checking { rgb(0x5a6070) } else { rgb(0xb4bccb) })
+        .child(if checking { "Checking…" } else { "Check now" });
+    if !checking {
+        check_button = check_button
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(0x1a212b)))
+            .on_click(cx.listener(|this, _ev, _win, cx| {
+                this.app_update = AppUpdateState::Checking;
+                let _ = this.cmds.send_blocking(Cmd::AppUpdateCheck);
+                cx.notify();
+            }));
+    }
+
+    let status: (String, u32) = match state {
+        AppUpdateState::Idle => (format!("OMD {current}"), 0x8b93a7),
+        AppUpdateState::Checking => ("contacting github.com…".to_string(), 0x9ca3b0),
+        AppUpdateState::UpToDate(tag) => (format!("up to date ({tag})"), 0x00d98a),
+        AppUpdateState::Available(release) => (
+            format!("{} is available (running {current})", release.tag),
+            0xc9a15a,
+        ),
+        AppUpdateState::Downloading { received, total } => {
+            let percent = if *total > 0 {
+                (*received as f64 / *total as f64 * 100.0).round() as u64
+            } else {
+                0
+            };
+            (
+                format!(
+                    "downloading… {} / {} ({percent}%)",
+                    format_bytes(*received),
+                    if *total > 0 { format_bytes(*total) } else { "?".to_string() }
+                ),
+                0x7fb5e8,
+            )
+        }
+        AppUpdateState::Settled(message) => (message.clone(), 0x00d98a),
+        AppUpdateState::Failed(message) => (message.clone(), 0xff8a97),
+    };
+
+    let mut rows = div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .px(px(16.))
+        .py(px(12.))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0xe8ecf4))
+                        .child(SharedString::from(format!("OMD {current}"))),
+                )
+                .children(dsh_version.map(|version| {
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x5f6878))
+                        .child(SharedString::from(format!("dsh {version}")))
+                }))
+                .child(div().flex_1())
+                .child(check_button),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(status.1))
+                .child(SharedString::from(status.0)),
+        );
+
+    if let Some(release) = available {
+        if !release.notes.trim().is_empty() {
+            rows = rows.child(
+                div()
+                    .id("app-update-notes")
+                    .max_h(px(140.))
+                    .overflow_y_scroll()
+                    .rounded(px(8.))
+                    .bg(rgb(0x0f131b))
+                    .border_1()
+                    .border_color(rgb(0x252b38))
+                    .p(px(10.))
+                    .text_xs()
+                    .text_color(rgb(0x9aa3b4))
+                    .child(SharedString::from(release.notes.clone())),
+            );
+        }
+        if release.has_asset() {
+            let url = release.asset_url.clone();
+            let name = release.asset_name.clone();
+            let size = release.asset_size;
+            let label = format!("Download & install {}", release.tag);
+            rows = rows.child(
+                div()
+                    .id("app-update-install")
+                    .px(px(12.))
+                    .py(px(6.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(rgb(0x2f6fb5))
+                    .text_xs()
+                    .text_color(rgb(0x7fb5e8))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x16222f)))
+                    .child(SharedString::from(label))
+                    .on_click(cx.listener(move |this, _ev, _win, cx| {
+                        this.app_update = AppUpdateState::Downloading {
+                            received: 0,
+                            total: size,
+                        };
+                        let _ = this.cmds.send_blocking(Cmd::AppUpdateInstall {
+                            url: url.clone(),
+                            name: name.clone(),
+                        });
+                        cx.notify();
+                    })),
+            );
+        } else {
+            rows = rows.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x707786))
+                    .child("this release has no build for this platform yet"),
+            );
+        }
+    }
+
+    if downloading {
+        let (received, total) = match state {
+            AppUpdateState::Downloading { received, total } => (*received, *total),
+            _ => (0, 0),
+        };
+        let fraction = if total > 0 {
+            (received as f32 / total as f32).clamp(0., 1.)
+        } else {
+            0.
+        };
+        rows = rows.child(
+            div()
+                .h(px(4.))
+                .w_full()
+                .rounded_full()
+                .bg(rgb(0x20232b))
+                .child(
+                    div()
+                        .h(px(4.))
+                        .w(relative(fraction))
+                        .rounded_full()
+                        .bg(rgb(0x00b4ff)),
+                ),
+        );
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .rounded(px(10.))
+        .bg(rgb(0x151a23))
+        .border_1()
+        .border_color(rgb(0x222836))
+        .overflow_hidden()
+        .child(rows)
+        .into_any_element()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= MB {
+        format!("{:.0} MB", bytes as f64 / MB)
+    } else {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    }
+}
+
 fn render_block(
     block: TranscriptBlock,
     reveal: Option<usize>,
@@ -20949,6 +21285,14 @@ impl Render for Root {
                         ))
                         .into_any_element(),
                 );
+                let update_card = app_update_card(
+                    &self.app_update,
+                    self.dsh_version.as_deref(),
+                    self.cmds.clone(),
+                    cx,
+                );
+                // 放最上面：更新入口不该藏在设置页底部
+                general_rows.insert(0, update_card);
                 let version = std::env::var("DSH_BIN")
                     .ok()
                     .and_then(|path| {
@@ -24545,6 +24889,7 @@ impl Render for Root {
                             .child(
                                 div()
                                     .id("settings")
+                                    .relative()
                                     .w(px(HEAD_BTN)).h(px(HEAD_BTN))
                                     .flex().items_center().justify_center()
                                     .rounded_sm()
@@ -24553,6 +24898,17 @@ impl Render for Root {
                                     .text_color(rgb(0xd0d4dc))
                                     .hover(|style| style.bg(rgb(0x23272f)))
                                     .child("⚙")
+                                    .children(self.app_update.badge().map(|_| {
+                                        // 有新版本：齿轮右上角一个小琥珀点
+                                        div()
+                                            .absolute()
+                                            .top(px(2.))
+                                            .right(px(2.))
+                                            .w(px(5.))
+                                            .h(px(5.))
+                                            .rounded_full()
+                                            .bg(rgb(0xc9a15a))
+                                    }))
                                     .on_click(cx.listener(|this, _ev, _win, cx| {
                                         this.show_settings = true;
                                         this.reload_settings();
@@ -25833,6 +26189,111 @@ fn block_socket_path() -> PathBuf {
 }
 
 #[cfg(unix)]
+/// `omd-desktop update [--check]`：命令行自更新（和设置页同一个实现）。
+fn run_update_cli() -> i32 {
+    let check_only = std::env::args().any(|arg| arg == "--check" || arg == "-n");
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("cannot start a runtime: {err}");
+            return 1;
+        }
+    };
+    runtime.block_on(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+        {
+            Ok(client) => client,
+            Err(err) => {
+                eprintln!("cannot build an http client: {err}");
+                return 1;
+            }
+        };
+        let current = update::current_version();
+        let release = match update::fetch_latest(&client).await {
+            Ok(release) => release,
+            Err(err) => {
+                eprintln!("update check failed: {err}");
+                return 1;
+            }
+        };
+        println!("omd {current} → latest {}", release.tag);
+        if !update::is_newer(&release.version, current) {
+            println!("already up to date");
+            return 0;
+        }
+        if !release.notes.is_empty() {
+            println!("\n{}", release.notes);
+        }
+        if check_only {
+            if release.has_asset() {
+                println!("\npackage: {}", release.asset_name);
+            }
+            return 0;
+        }
+        if !release.has_asset() {
+            eprintln!("\nthis release has no build for this platform");
+            return 1;
+        }
+        let dir = update::download_dir();
+        println!(
+            "\ndownloading {} into {}",
+            release.asset_name,
+            dir.display()
+        );
+        let mut last_reported = 0u64;
+        let path = match update::download(
+            &client,
+            &release.asset_url,
+            &dir,
+            &release.asset_name,
+            |got, total| {
+                // 每 16MB 报一次，别把终端刷满
+                if got - last_reported >= 16 * 1024 * 1024 {
+                    last_reported = got;
+                    if total > 0 {
+                        eprintln!(
+                            "  {:.0}% ({:.0} / {:.0} MB)",
+                            got as f64 / total as f64 * 100.0,
+                            got as f64 / 1048576.0,
+                            total as f64 / 1048576.0
+                        );
+                    } else {
+                        eprintln!("  {:.0} MB", got as f64 / 1048576.0);
+                    }
+                }
+            },
+        )
+        .await
+        {
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!("download failed: {err}");
+                return 1;
+            }
+        };
+        match update::install(&path) {
+            Ok(update::InstallOutcome::Installed(message)) => {
+                println!("{message}");
+                0
+            }
+            Ok(update::InstallOutcome::Delegated(message)) => {
+                println!("{message}");
+                0
+            }
+            Ok(update::InstallOutcome::Downloaded(path)) => {
+                println!("downloaded {} — install it manually", path.display());
+                0
+            }
+            Err(err) => {
+                eprintln!("install failed: {err}");
+                1
+            }
+        }
+    })
+}
+
 fn run_block_cli() -> i32 {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::net::UnixStream;
@@ -25968,6 +26429,31 @@ fn main() {
     #[cfg(unix)]
     if std::env::args().nth(1).as_deref() == Some("block") {
         std::process::exit(run_block_cli());
+    }
+    if std::env::args().nth(1).as_deref() == Some("update") {
+        std::process::exit(run_update_cli());
+    }
+    // --version / --help 不要落进 GUI（不然会莫名其妙弹个窗口出来）
+    if let Some(arg) = std::env::args().nth(1) {
+        match arg.as_str() {
+            "--version" | "-V" | "version" => {
+                println!("omd {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "--help" | "-h" | "help" => {
+                println!(
+                    "omd {} — native desktop client for DeepSeek Harness\n\n\
+                     usage:\n  \
+                     omd                     open the window\n  \
+                     omd update [--check]    update from GitHub Releases\n  \
+                     omd block <list|create|write|read>\n  \
+                     omd --version\n",
+                    env!("CARGO_PKG_VERSION")
+                );
+                std::process::exit(0);
+            }
+            _ => {}
+        }
     }
     stamp("main enter");
     setup_fontconfig();

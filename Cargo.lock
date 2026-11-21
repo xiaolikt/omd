@@ -1735,7 +1735,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-host"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -1747,7 +1747,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-sdk"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "dsh-host",
@@ -1758,7 +1758,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-spike"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "dsh-host",
@@ -1769,7 +1769,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-transport"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -4969,7 +4969,7 @@ dependencies = [
 
 [[package]]
 name = "omd"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-channel",

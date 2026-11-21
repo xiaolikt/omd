@@ -3,3 +3,6 @@
 
 # CEF 二进制（1.6G，按平台放本地）
 /vendor/cef/
+
+# cargo 的构建标记（vendor 里的 patched crate 会留一个）
+*.cargo-ok
