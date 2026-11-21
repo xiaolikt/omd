@@ -13873,11 +13873,17 @@ fn pane_divider(pane_id: u64, kind: BlockPlacement, dragging: bool, cx: &mut Con
 /// 下面整块交给 CEF 子窗口。工具条高度变了，BrowserElement 的布局矩形
 /// 自动跟着变，X11 宿主也就跟着挪。
 fn browser_pane_element(
+    pane_id: u64,
     index: usize,
+    title: String,
     focus: FocusHandle,
     input: Entity<InputState>,
     extra: AnyElement,
     suggestions: Option<AnyElement>,
+    active: bool,
+    menu_open: bool,
+    is_maximized: bool,
+    cx: &mut Context<Root>,
 ) -> AnyElement {
     let mut bar = div()
         .h(px(HEADER_H))
@@ -13890,25 +13896,33 @@ fn browser_pane_element(
         .bg(rgb(0x161a22))
         .border_b_1()
         .border_color(rgb(0x23272f));
-    for (label, action) in [
-        ("←", browser::go_back as fn(usize)),
-        ("→", browser::go_forward),
-        ("⟳", browser::reload),
+    let back_ok = browser::can_go_back(index);
+    let forward_ok = browser::can_go_forward(index);
+    for (label, action, enabled) in [
+        ("←", browser::go_back as fn(usize), back_ok),
+        ("→", browser::go_forward, forward_ok),
+        ("⟳", browser::reload, true),
     ] {
-        bar = bar.child(
-            div()
-                .id(SharedString::from(format!("browser-{label}-{index}")))
-                .px(px(6.))
-                .py(px(2.))
-                .rounded_sm()
+        let mut button = div()
+            .id(SharedString::from(format!("browser-{label}-{index}")))
+            .px(px(6.))
+            .py(px(2.))
+            .rounded_sm()
+            .child(div().text_xs().text_color(rgb(if enabled {
+                0x8b93a7
+            } else {
+                0x3f4757
+            })).child(label));
+        if enabled {
+            button = button
                 .cursor_pointer()
                 .hover(|style| style.bg(rgb(0x20232b)))
-                .child(div().text_xs().text_color(rgb(0x8b93a7)).child(label))
                 .on_mouse_down(MouseButton::Left, move |_ev, _win, cx| {
                     cx.stop_propagation();
                     action(index);
-                }),
-        );
+                });
+        }
+        bar = bar.child(button);
     }
     bar = bar.child(
         div()
@@ -13925,15 +13939,147 @@ fn browser_pane_element(
     );
     bar = bar.child(extra);
     div()
+        .id(SharedString::from(format!("browser-pane-{pane_id}")))
         .size_full()
         .flex()
         .flex_col()
+        .relative()
+        .bg(if active {
+            rgb(0x101319)
+        } else {
+            rgb(0x0d1015)
+        })
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _ev, _win, cx| {
+                this.focused_pane = Some(pane_id);
+                this.block_menu = None;
+                cx.notify();
+            }),
+        )
+        // block 头：和 terminal / chat / editor 一个样式（抓手 = 拖动 + 菜单）
+        .child(
+            div()
+                .id(SharedString::from(format!("browser-pane-head-{pane_id}")))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
+                .px(px(10.))
+                .h(px(24.))
+                .flex_shrink_0()
+                .bg(if active {
+                    rgb(0x1b2029)
+                } else {
+                    rgb(0x15181f)
+                })
+                .border_b_1()
+                .border_color(if active {
+                    rgb(0x2f3846)
+                } else {
+                    rgb(0x23272f)
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
+                        this.block_menu = None;
+                        this.drag_leaf = Some((
+                            pane_id,
+                            f32::from(ev.position.x),
+                            f32::from(ev.position.y),
+                        ));
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(2.))
+                        .h(px(12.))
+                        .rounded(px(1.))
+                        .bg(if active { rgb(0xffa657) } else { rgb(0x2a3038) }),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0xffa657))
+                        .child("◐"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_xs()
+                        .text_color(if active {
+                            rgb(0xe2e7f0)
+                        } else {
+                            rgb(0x9ca3b0)
+                        })
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(SharedString::from(title)),
+                )
+                // ⠿ 抓手：拖动换位，点击下拉菜单
+                .child(
+                    div()
+                        .id(SharedString::from(format!("browser-pane-grip-{pane_id}")))
+                        .w(px(22.))
+                        .h(px(18.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_sm()
+                        .text_color(if menu_open {
+                            rgb(0xe2e7f0)
+                        } else {
+                            rgb(0x707786)
+                        })
+                        .bg(if menu_open {
+                            rgba(0x283140ff)
+                        } else {
+                            rgba(0x00000000)
+                        })
+                        .hover(|style| style.bg(rgb(0x232a36)).text_color(rgb(0xe2e7f0)))
+                        .child("⠿")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, ev: &MouseDownEvent, _win, cx| {
+                                cx.stop_propagation();
+                                this.drag_leaf = Some((
+                                    pane_id,
+                                    f32::from(ev.position.x),
+                                    f32::from(ev.position.y),
+                                ));
+                                cx.notify();
+                            }),
+                        )
+                        .on_click(cx.listener(move |this, _ev, _win, cx| {
+                            this.focused_pane = Some(pane_id);
+                            this.block_menu = if this.block_menu == Some(pane_id) {
+                                None
+                            } else {
+                                Some(pane_id)
+                            };
+                            cx.notify();
+                        })),
+                ),
+        )
         .child(bar)
         // 地址栏聚焦时的历史建议（下拉在工具条和页面之间）。
         .children(suggestions)
         // BrowserElement 自己是 flex 子项（grow=1, basis=0），直接挂在列里；
         // 中间再包一层普通 div 会让它拿不到剩余高度（实测塌成 1px）。
         .child(BrowserElement { index, focus })
+        .children(menu_open.then(|| {
+            block_menu_overlay(
+                pane_id,
+                false,
+                is_maximized,
+                Some(BlockMenuClose::Pane),
+                cx,
+            )
+        }))
         .into_any_element()
 }
 
@@ -21746,6 +21892,19 @@ impl Render for Root {
                         }
                     }
                     let input = self.ensure_browser_input(index, window, cx);
+                    // block 头标题：页面标题（on_title_change），退回 URL host，再退回 "browser"
+                    let title = browser::title_of(index)
+                        .filter(|title| !title.is_empty())
+                        .or_else(|| {
+                            self.browser_urls.get(&index).and_then(|url| {
+                                url.split_once("://")
+                                    .map(|(_, rest)| rest)
+                                    .and_then(|rest| rest.split('/').next())
+                                    .map(str::to_string)
+                                    .filter(|host| !host.is_empty())
+                            })
+                        })
+                        .unwrap_or_else(|| "browser".to_string());
                     // 地址栏跟随页面跳转：正在编辑时不要抢用户的光标。
                     // URL 用 pump 维护的缓存，避免每帧跨 FFI 查询。
                     let current = self
@@ -21905,7 +22064,19 @@ impl Render for Root {
                     };
                     leaf_elements.insert(
                         pane_id,
-                        browser_pane_element(index, focus, input, extra, suggestions),
+                        browser_pane_element(
+                            pane_id,
+                            index,
+                            title,
+                            focus,
+                            input,
+                            extra,
+                            suggestions,
+                            self.focused_pane == Some(pane_id),
+                            self.block_menu == Some(pane_id),
+                            maximized == Some(pane_id),
+                            cx,
+                        ),
                     );
                 }
                 continue;

@@ -882,6 +882,34 @@ fn browser_at(index: usize) -> Option<Browser> {
     slots().get(index).and_then(|slot| slot.browser.clone())
 }
 
+/// 每个浏览器最新一次页面标题（on_title_change 维护，id = CEF browser id）。
+static TITLES: Mutex<Vec<(i32, String)>> = Mutex::new(Vec::new());
+
+/// 页面标题（下拉菜单头/pane 标题用）；没有就 None。
+pub fn title_of(index: usize) -> Option<String> {
+    let id = slots().get(index)?.id?;
+    let titles = TITLES.lock().unwrap_or_else(|e| e.into_inner());
+    titles
+        .iter()
+        .rev()
+        .find(|(slot_id, _)| *slot_id == id)
+        .map(|(_, title)| title.clone())
+}
+
+/// 能否后退（工具条 ← 按钮的可用态）。
+pub fn can_go_back(index: usize) -> bool {
+    browser_at(index)
+        .map(|browser| browser.can_go_back() != 0)
+        .unwrap_or(false)
+}
+
+/// 能否前进（工具条 → 按钮的可用态）。
+pub fn can_go_forward(index: usize) -> bool {
+    browser_at(index)
+        .map(|browser| browser.can_go_forward() != 0)
+        .unwrap_or(false)
+}
+
 pub fn go_back(index: usize) {
     if let Some(browser) = browser_at(index) {
         browser.go_back();
@@ -1398,6 +1426,26 @@ cef::wrap_life_span_handler! {
 cef::wrap_display_handler! {
     struct OmdDisplay {}
     impl DisplayHandler {
+        fn on_title_change(
+            &self,
+            browser: Option<&mut Browser>,
+            title: Option<&CefString>,
+        ) {
+            let (Some(browser), Some(title)) = (browser, title) else {
+                return;
+            };
+            let id = browser.identifier();
+            let text = title.to_string();
+            if text.is_empty() {
+                return;
+            }
+            let mut titles = TITLES.lock().unwrap_or_else(|e| e.into_inner());
+            match titles.iter_mut().rev().find(|(slot_id, _)| *slot_id == id) {
+                Some(entry) => entry.1 = text,
+                None => titles.push((id, text)),
+            }
+        }
+
         fn on_console_message(
             &self,
             browser: Option<&mut Browser>,
