@@ -79,7 +79,7 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 | **编辑器格式化**：❏ format 按钮 / Ctrl+Shift+F → `textDocument/formatting`（缩进按文件嗅探），结果经事件回应用到 open buffer | ✅（rust-analyzer 实测：3 edits → 正确格式化） |
 | **编辑器大纲**：☰ outline 按钮 → `textDocument/documentSymbol`（层级扁平化），浮层列表点击跳转（`set_cursor_position`），Esc 关闭 | ✅（rust-analyzer 实测：Foo/x/main + 行号） |
 | **block 头部改版（Notion 式手柄）**：头部没有常驻控件 —— 指针进入 block 时顶部中间浮出一条细横线，指针压到细线才展开成 `⠿` 六点抓手（按住拖动换位、点击弹下拉菜单：split right/down × chat/terminal/browser、编辑器加 format/outline、maximize、close）；Esc 或点外部关闭。指针离开 block 手柄自动消失 | ✅（debug/release 冒烟 0 panic + `OMD_HOVER_PROBE` 探针：`pane`/`grip` 命中变化正常） |
-| **浏览器 pane 管理**：浏览器块也用同一套 hover 手柄；工具条 ←/→ 按导航栈可用态点亮/置灰（`can_go_back/forward`）；⠿ 菜单里 split browser 可继续开多实例（各自 URL/前进后退栈独立） | ✅（`OMD_BROWSER=1` 冒烟：新头 + 置灰按钮渲染正常，0 panic） |
+| **浏览器 pane 管理**：浏览器块也用同一套 hover 手柄；工具条 ←/→ 按导航栈可用态点亮/置灰（`can_go_back/forward`）；⠿ 菜单里 split browser 可继续开多实例（各自 URL/前进后退栈独立）。恢复布局时每个 browser leaf 也各开一个实例，不再把第二个指到同一个 pane（那会让它永远停在 starting…） | ✅（`OMD_BROWSER=1` 冒烟 + 双 browser leaf 恢复：`pane 1 slot 0` / `pane 2 slot 1`，无 stuck-on-starting） |
 | **重启终端恢复**：启动后对每个会话跑一次 `terminal/list` 扫描——引擎侧还活着但没挂进 pane 的终端（崩溃/强杀没存上布局）自动补回该会话的 tab；已恢复 pane 的终端退出/不存在则标 dead，body 显示「terminal exited」+ ↻ restart（原地换新终端）/ × close | ✅（实测：spike 建孤儿终端 `omd-orphan-test` → GUI 启动 1s 内 reattach 为 pane 并持久化；engine 侧 close 后重启标记 `dead=true`） |
 | **会话实时状态（session/control）**：worker 订阅 `session/control` 流（baseline 全量 + 逐会话 projection 增量），侧栏标题/blank 实时更新、选中会话权限预设实时纠偏；悬置审批/提问由网关在 `$events` 重连时对 owner 补发（引擎 `openRemoteEvents` 源码验证），GUI 的 waterfall 处理已就位 → 重启不丢审批卡 | ✅（冒烟：`[control] first projection … keys=[sessionStats, turnOutline, userQuestions, tokenUsage, contextPressure, title]`；22/22 测试 + release 干净） |
 

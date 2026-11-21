@@ -1090,6 +1090,9 @@ enum Ev {
         session_id: String,
         term_id: String,
     },
+    /// NewTerminal 在 pane 落地前失败了：把已经写进布局的叶子摘掉，
+    /// 否则那个 block 会永远停在 "starting…"。
+    PaneAbandoned(u64),
     Approval { event_id: String, label: String },
     ApprovalGone,
     Question { event_id: String, request: Value },
@@ -1138,6 +1141,7 @@ fn ev_name(ev: &Ev) -> &'static str {
         Ev::Jobs(_) => "Jobs",
         Ev::Called { .. } => "Called",
         Ev::TerminalSession { .. } => "TerminalSession",
+        Ev::PaneAbandoned(_) => "PaneAbandoned",
         Ev::Tb { .. } => "Tb",
         Ev::Approval { .. } => "Approval",
         Ev::ApprovalGone => "ApprovalGone",
@@ -1865,6 +1869,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             let _ = evs
                                 .send(Ev::Error("终端需要先有会话；上面的失败原因就是它".into()))
                                 .await;
+                            let _ = evs.send(Ev::PaneAbandoned(pane_id)).await;
                             continue;
                         };
                         let term_id = format!("omd-term-{}", uuid_like());
@@ -1975,6 +1980,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                                 let _ = evs
                                     .send(Ev::Error(format!("terminal/create failed: {err}")))
                                     .await;
+                                let _ = evs.send(Ev::PaneAbandoned(pane_id)).await;
                             }
                         }
                     }
@@ -5455,6 +5461,23 @@ impl Root {
                 self.save_state();
                 cx.notify();
             }
+            Ev::PaneAbandoned(pane_id) => {
+                if self.panes.iter().any(|pane| pane.id == pane_id) {
+                    eprintln!("[layout] pane {pane_id} abandoned after it was already mounted");
+                } else {
+                    for space in self.spaces.iter_mut() {
+                        for tab in space.panels.iter_mut() {
+                            tab.layout.remove(pane_id);
+                            if tab.maximized == Some(pane_id) {
+                                tab.maximized = None;
+                            }
+                        }
+                    }
+                    eprintln!("[layout] dropped leaf {pane_id} (terminal never started)");
+                    self.save_state();
+                }
+                cx.notify();
+            }
             Ev::AgentRunning(running) => {
                 self.agent_running = running;
             }
@@ -5809,25 +5832,32 @@ impl Root {
                 return Layout::Leaf(id);
             }
             if leaf == "browser" {
-                // 启动桩（OMD_BROWSER=1）可能已经建了浏览器实例；恢复布局时
-                // 复用（已有 pane 直接指过去，只有实例没 pane 就用现有实例），
-                // 避免双实例（两个槽位抢 CEF id，resize/paint 全错位）。
-                if let Some(existing) = self.panes.iter().find(|p| p.browser.is_some()) {
-                    return Layout::Leaf(existing.id);
-                }
-                let reused = browser::primary();
-                let url = value.get("url").and_then(|v| v.as_str());
-                let Some(index) = (match reused {
-                    Some(index) => Some(index),
-                    None => self.spawn_browser(url, cx),
-                }) else {
-                    return Layout::Leaf(0);
+                // 每个 browser leaf 自己一个 pane。以前第二个 leaf 直接复用
+                // 已有 pane id，build_layout 把元素 remove 走之后，另一个 block
+                // 永远停在 "starting…"。启动桩（OMD_BROWSER=1）只领养一次。
+                let url = value
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .filter(|url| !url.is_empty());
+                let stub = browser::primary().filter(|index| {
+                    !self.panes.iter().any(|pane| pane.browser == Some(*index))
+                });
+                let Some(index) = stub.or_else(|| self.spawn_browser(url, cx)) else {
+                    // 不要退回 Leaf(0)：同 tab 里已经有 chat leaf，第二个 Leaf(0)
+                    // 同样会被画成永远的 "starting…"。留一个可关闭的空 pane。
+                    let id = next_pane_id();
+                    let mut pane = Block::new(id, BlockPlacement::Right, cx.focus_handle());
+                    pane.tab_id = Some(tab_id.to_string());
+                    self.panes.push(pane);
+                    eprintln!("[layout] browser leaf failed to spawn, empty pane {id}");
+                    return Layout::Leaf(id);
                 };
                 let id = next_pane_id();
                 let mut pane = Block::new(id, BlockPlacement::Right, cx.focus_handle());
                 pane.tab_id = Some(tab_id.to_string());
                 pane.browser = Some(index);
                 self.panes.push(pane);
+                eprintln!("[layout] browser leaf -> pane {id} slot {index}");
                 return Layout::Leaf(id);
             }
             if leaf == "editor" {
@@ -14630,6 +14660,12 @@ fn build_layout(
 ) -> AnyElement {
     match layout {
         Layout::Leaf(id) => leaf_elements.remove(id).unwrap_or_else(|| {
+            // 叶子还没对应 pane（终端正在拉起）时短暂出现。一直停在这里
+            // 说明这个 id 没有 pane，或同一个 pane id 被两个叶子共用。
+            static STUCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+            if STUCK.swap(*id, std::sync::atomic::Ordering::Relaxed) != *id {
+                eprintln!("[layout] leaf {id} has no element (stuck on starting)");
+            }
             div()
                 .flex()
                 .items_center()
