@@ -504,6 +504,8 @@ struct Block {
     command: Option<String>,
     /// 非空 = 这个 pane 是浏览器块，值是 CEF 的槽位号。
     browser: Option<usize>,
+    /// 引擎侧终端已退出/不存在（重启恢复扫描发现）；body 画重启提示。
+    term_dead: bool,
     focus: FocusHandle,
 }
 
@@ -531,6 +533,7 @@ impl Block {
             cwd: None,
             command: None,
             browser: None,
+            term_dead: false,
             focus,
         }
     }
@@ -2736,6 +2739,8 @@ struct Root {
     drag_leaf: Option<(u64, f32, f32)>,
     /// 点开中的 block 头菜单（pane id；⠿ 抓手点击）
     block_menu: Option<u64>,
+    /// 重启恢复的终端扫描是否已跑过（terminal/list 一次性）
+    term_sweep_done: bool,
     /// 哪些 session 是终端 tab（渲染成整块终端而不是聊天）
     term_tabs: std::collections::HashSet<String>,
     /// 命令面板（Ctrl+K）：搜索 + 命令 / 会话 / 空间。
@@ -4073,6 +4078,7 @@ impl Root {
     block_menu: std::env::var("OMD_BLOCK_MENU")
         .ok()
         .and_then(|v| v.parse::<u64>().ok()),
+    term_sweep_done: false,
     focus_pending: None,
     pending_term_meta: std::collections::HashMap::new(),
             chat_snapshots: std::collections::HashMap::new(),
@@ -4603,6 +4609,25 @@ impl Root {
                     stamp("split_with_dsh(0, Row) via OMD_SPLIT_DSH");
                 }
                 self.save_state();
+                // 重启恢复：枚举引擎侧各会话还活着的终端（terminal/list），
+                // 一次性扫描——没挂进任何 pane 的补回去（崩溃/强杀导致布局
+                // 没存上），已恢复 pane 里终端没了的标成 dead。
+                if !self.term_sweep_done {
+                    self.term_sweep_done = true;
+                    let ids: Vec<String> =
+                        self.sessions.iter().map(|row| row.id.clone()).collect();
+                    for session_id in ids {
+                        let _ = self.cmds.send_blocking(Cmd::Call {
+                            tag: format!("term-sweep/{session_id}"),
+                            endpoint: "terminal/list".to_string(),
+                            args: json!({ "sessionId": session_id }),
+                        });
+                    }
+                    stamp(format!(
+                        "[restore] terminal sweep queued for {} sessions",
+                        self.sessions.len()
+                    ));
+                }
             }
             Ev::FollowStart(session_id) => {
                 eprintln!("[ui] follow {session_id}");
@@ -5134,6 +5159,11 @@ impl Root {
                                 // 写完重新读一遍
                                 self.reload_settings();
                             }
+                            if tag.starts_with("term-sweep/") {
+                                let session_id =
+                                    tag.trim_start_matches("term-sweep/").to_string();
+                                self.apply_terminal_sweep(&session_id, &value, cx);
+                            }
                         }
                     },
                     Err(err) => {
@@ -5273,6 +5303,8 @@ impl Root {
                     pane.session = Some(session_id.clone());
                     pane.term_id = term_id;
                     pane.focus = focus;
+                    // 重启/重挂后终端复活了
+                    pane.term_dead = false;
                     if meta_cwd.is_some() || meta_cmd.is_some() {
                         pane.cwd = meta_cwd.or(space_cwd);
                         pane.command = meta_cmd;
@@ -5651,6 +5683,8 @@ impl Root {
                     pane.tab_id = Some(tab_id.to_string());
                     pane.session = Some(session_id.to_string());
                     pane.term_id = term_id.to_string();
+                    // 重启终端时用（dead 覆盖层的 ↻ restart）
+                    pane.cwd = Some(cwd.to_string());
                     self.panes.push(pane);
                     let _ = self.cmds.send_blocking(Cmd::AttachTerminal {
                         pane_id: id,
@@ -9602,6 +9636,111 @@ impl Root {
         self.mount_browser_pane(index, 0, SplitDir::Row, cx);
     }
 
+    /// terminal/list 扫描结果落地：
+    /// 1) 已恢复 pane 的终端不在 running 列表里 → 标 dead（body 显示重启提示）
+    /// 2) 引擎侧还活着但没挂进任何 pane 的终端 → 补回该会话的 tab
+    fn apply_terminal_sweep(&mut self, session_id: &str, value: &Value, cx: &mut Context<Self>) {
+        let terminals = value.as_array().cloned().unwrap_or_default();
+        let running: Vec<String> = terminals
+            .iter()
+            .filter(|term| term.get("state").and_then(|v| v.as_str()) == Some("running"))
+            .filter_map(|term| term.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        let mut changed = false;
+        for pane in self.panes.iter_mut() {
+            if pane.session.as_deref() == Some(session_id)
+                && !pane.term_id.is_empty()
+                && pane.browser.is_none()
+            {
+                let dead = !running.contains(&pane.term_id);
+                if pane.term_dead != dead {
+                    pane.term_dead = dead;
+                    changed = true;
+                    stamp(format!(
+                        "[restore] pane {} terminal {} dead={dead}",
+                        pane.id, pane.term_id
+                    ));
+                }
+            }
+        }
+        for term in terminals.iter() {
+            if term.get("state").and_then(|v| v.as_str()) != Some("running") {
+                continue;
+            }
+            let Some(term_id) = term.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if self.panes.iter().any(|pane| pane.term_id == term_id) {
+                continue;
+            }
+            changed |= self.attach_orphan_terminal(session_id, term_id, cx);
+        }
+        if changed {
+            self.save_state();
+            cx.notify();
+        }
+    }
+
+    /// 把引擎侧还活着的孤儿终端挂回该会话的 tab（布局里 split 到聊天旁边）。
+    /// 返回是否真的挂上了。
+    fn attach_orphan_terminal(
+        &mut self,
+        session_id: &str,
+        term_id: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // 找包含该会话的 tab（任意空间），锚点优先聊天 leaf 0
+        let mut target: Option<(String, u64)> = None;
+        'outer: for space in self.spaces.iter() {
+            for tab in space.panels.iter() {
+                if tab.blocks.iter().any(|block| block == session_id) {
+                    let mut leaves = Vec::new();
+                    tab.layout.leaves(&mut leaves);
+                    if let Some(anchor) = leaves
+                        .iter()
+                        .find(|leaf| **leaf == 0)
+                        .or_else(|| leaves.first())
+                        .copied()
+                    {
+                        target = Some((tab.id.clone(), anchor));
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        let Some((tab_id, anchor)) = target else {
+            stamp(format!(
+                "[restore] orphan terminal {term_id}: no open tab for {session_id}, skip"
+            ));
+            return false;
+        };
+        let pane_id = next_pane_id();
+        let mut pane = Block::new(pane_id, BlockPlacement::Right, cx.focus_handle());
+        pane.tab_id = Some(tab_id.clone());
+        pane.session = Some(session_id.to_string());
+        pane.term_id = term_id.to_string();
+        self.panes.push(pane);
+        let mut inserted = false;
+        for space in self.spaces.iter_mut() {
+            if let Some(tab) = space.panels.iter_mut().find(|tab| tab.id == tab_id) {
+                if !tab.layout.has(pane_id) {
+                    tab.layout.split(anchor, SplitDir::Row, pane_id);
+                }
+                inserted = true;
+                break;
+            }
+        }
+        let _ = self.cmds.send_blocking(Cmd::AttachTerminal {
+            pane_id,
+            session_id: session_id.to_string(),
+            term_id: term_id.to_string(),
+        });
+        stamp(format!(
+            "[restore] orphan terminal {term_id} reattached as pane {pane_id} (anchor {anchor})"
+        ));
+        inserted
+    }
+
     fn split_pane(&mut self, leaf: u64, dir: SplitDir, cx: &mut Context<Self>) {
         let pane_id = next_pane_id();
         let cwd = self
@@ -13027,6 +13166,8 @@ fn pane_element(
     active: bool,
     // ⠿ 抓手菜单是否展开
     menu_open: bool,
+    // 引擎侧终端已退出/不存在（terminal/list 扫描发现）
+    term_dead: bool,
     cx: &mut Context<Root>,
 ) -> AnyElement {
     let accent = if editor.is_some() {
@@ -13388,6 +13529,105 @@ fn pane_element(
             .p(px(8.))
             .text_color(rgb(0xe8ecf4))
             .relative()
+            // 终端已退出/引擎侧不存在（重启恢复扫描发现）：中央提示 + 原地重启
+            .children(term_dead.then(|| {
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(0x0d1015))
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(10.))
+                            .px(px(18.))
+                            .py(px(14.))
+                            .rounded(px(10.))
+                            .bg(rgb(0x151a23))
+                            .border_1()
+                            .border_color(rgb(0x2c3340))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0x9ca3b0))
+                                    .child("terminal exited"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "term-restart-{pane_id}"
+                                            )))
+                                            .px(px(10.))
+                                            .py(px(4.))
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .bg(rgb(0x16222f))
+                                            .border_1()
+                                            .border_color(rgb(0x2f6fb5))
+                                            .text_xs()
+                                            .text_color(rgb(0x7fb5e8))
+                                            .hover(|style| style.bg(rgb(0x1a2a3d)))
+                                            .child("↻ restart")
+                                            .on_click(cx.listener(
+                                                move |this, _ev, _win, cx| {
+                                                    let cwd = this
+                                                        .panes
+                                                        .iter()
+                                                        .find(|p| p.id == pane_id)
+                                                        .and_then(|p| p.cwd.clone());
+                                                    // 复用同一个 pane id：TerminalSession
+                                                    // 处理器会原地换 term_id 并清 dead 标记
+                                                    let _ = this
+                                                        .cmds
+                                                        .send_blocking(Cmd::NewTerminal {
+                                                            pane_id,
+                                                            kind: BlockPlacement::Right,
+                                                            cwd,
+                                                            run: None,
+                                                        });
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "term-dead-close-{pane_id}"
+                                            )))
+                                            .px(px(10.))
+                                            .py(px(4.))
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .border_1()
+                                            .border_color(rgb(0x3a1f24))
+                                            .text_xs()
+                                            .text_color(rgb(0xff8a97))
+                                            .hover(|style| style.bg(rgb(0x3a1f24)))
+                                            .child("× close")
+                                            .on_click(cx.listener(
+                                                move |this, _ev, win, cx| {
+                                                    this.close_pane(pane_id, win, cx);
+                                                },
+                                            )),
+                                    ),
+                            ),
+                    )
+            }))
             .child(bounds_probe)
             .track_focus(&focus)
             .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, win, cx| {
@@ -21790,6 +22030,11 @@ impl Render for Root {
                 .filter(|_| editor_path.is_none() && !self.panes.iter().any(|pane| {
                     pane.id == pane_id && !pane.term_id.is_empty()
                 }));
+            let pane_term_dead = self
+                .panes
+                .iter()
+                .find(|pane| pane.id == pane_id)
+                .is_some_and(|pane| pane.term_dead);
             if let Some(session_id) = chat_pane {
                 let live = self.selected.as_deref() == Some(session_id.as_str());
                 let is_active_panel = self
@@ -22130,6 +22375,7 @@ impl Render for Root {
                     outline_items,
                     self.focused_pane == Some(pane_id),
                     self.block_menu == Some(pane_id),
+                    pane_term_dead,
                     cx,
                 ),
             );
