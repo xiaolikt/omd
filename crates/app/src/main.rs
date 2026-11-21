@@ -25770,6 +25770,29 @@ fn run_block_cli() -> i32 {
     }
 }
 
+/// Window icon baked into the binary. Desktop launchers use the hicolor
+/// copies installed by the deb; this one is the X11 `_NET_WM_ICON`.
+fn app_icon() -> Option<Arc<image::RgbaImage>> {
+    let bytes = include_bytes!("../../../packaging/icons/omd-256.png");
+    match image::load_from_memory(bytes) {
+        Ok(img) => Some(Arc::new(img.to_rgba8())),
+        Err(err) => {
+            eprintln!("[ui] app icon failed to load: {err}");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    #[test]
+    fn app_icon_is_256_rgba() {
+        let icon = super::app_icon().expect("embedded icon");
+        assert_eq!(icon.width(), 256);
+        assert_eq!(icon.height(), 256);
+    }
+}
+
 fn main() {
     // CEF 的 renderer/gpu 子进程会带着 --type= 重新执行本程序，必须最先接管。
     if let Some(code) = browser::run_subprocess_if_requested() {
@@ -25862,9 +25885,16 @@ fn main() {
                 point(px(40.), px(40.)),
                 size(px(1100.), px(720.)),
             ))),
+            titlebar: Some(gpui_kit::TitlebarOptions {
+                title: Some("OMD".into()),
+                appears_transparent: false,
+                traffic_light_position: None,
+            }),
             // Draw our own dark title row (minimize / maximize / close).
             window_decorations: Some(gpui_kit::WindowDecorations::Client),
             app_id: Some("omd".to_string()),
+            // X11 window icon. Wayland/GNOME uses the desktop file's Icon=omd.
+            icon: app_icon(),
             ..Default::default()
         };
         let handle = gpui_kit::open_window(options, cx, |window, cx| {

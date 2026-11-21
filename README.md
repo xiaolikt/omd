@@ -92,6 +92,20 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 
 - 计划/目标、日程、子代理面板（`goals/*`、`schedule/*`、`subagents/*`）尚未做 UI
 
+### 打包
+
+图标在 `packaging/icons/`（深色圆角块 + 六点抓手 + 运行点）。窗口用内嵌的 256px PNG（X11），桌面启动器走 hicolor。
+
+```sh
+CEF_PATH="$PWD/vendor/cef" cargo build --release -p omd
+packaging/build-deb.sh          # packaging/dist/omd_0.1.0_amd64.deb
+packaging/test-deb.sh           # 不解进系统，抽出包跑一轮冒烟
+```
+
+deb 约 150MB（xz），里面带上 CEF 和 `libghostty-vt`，因为 CEF 在可执行文件旁边找 `icudtl.dat`。dsh 运行时不打进包，仍用 `~/.local/share/omd/runtime`。
+
+Windows exe 现在打不出来：仓库里只有 Linux 的 CEF / ghostty，浏览器嵌入是 `cfg(linux)`，这台机器也没有 MinGW。`packaging/windows/build.sh` 会以退出码 2 说明原因，并留下 `omd.ico` 给以后的 Windows 构建。
+
 ### 构建依赖（Linux）
 
 ```sh

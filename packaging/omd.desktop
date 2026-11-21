@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=OMD
+GenericName=DeepSeek Harness
+Comment=Native desktop client for DeepSeek Harness
+Exec=omd
+Icon=omd
+Terminal=false
+Type=Application
+Categories=Development;Utility;
+StartupWMClass=omd
+Keywords=dsh;deepseek;agent;terminal;
