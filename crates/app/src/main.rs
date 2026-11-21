@@ -4463,6 +4463,22 @@ impl Root {
             let _ = root.cmds.send_blocking(Cmd::ModelCatalog);
             stamp("model picker opened via OMD_OPEN_MODELS");
         }
+        if std::env::var("OMD_OPEN_JOBS").is_ok() {
+            root.show_jobs = true;
+            stamp("jobs panel opened via OMD_OPEN_JOBS");
+        }
+        if std::env::var("OMD_OPEN_SCHEDULES").is_ok() {
+            root.show_schedules = true;
+            root.schedule_expanded = None;
+            root.reload_schedules();
+            stamp("schedules panel opened via OMD_OPEN_SCHEDULES");
+        }
+        if std::env::var("OMD_OPEN_SUBAGENTS").is_ok() {
+            root.show_subagents = true;
+            root.subagent_target = None;
+            let _ = root.cmds.send_blocking(Cmd::Refresh);
+            stamp("subagents panel opened via OMD_OPEN_SUBAGENTS");
+        }
         if let Ok(index) = std::env::var("OMD_CLOSE_TAB") {
             let index: usize = index.parse().unwrap_or(1);
             let target = root
@@ -4583,7 +4599,7 @@ impl Root {
                 self.error = None;
                 let _ = self.cmds.send_blocking(Cmd::ModelCatalog);
                 // A stray startup click must not leave the settings sheet open.
-                self.show_settings = false;
+                self.show_settings = std::env::var("OMD_OPEN_SETTINGS").is_ok();
             }
             Ev::ModelCatalog(value) => {
                 save_model_cache(&value);
@@ -4593,7 +4609,8 @@ impl Root {
             Ev::ModelSelected { provider, model } => {
                 self.current_provider = provider;
                 self.current_model = model;
-                self.show_models = false;
+                // 不要在这里关掉模型选择器：follow 也会推 ModelSelected（启动、
+                // 切 tab 时），会把用户刚打开的浮层拍掉。真正的关闭在点选处。
                 self.save_state();
             }
             Ev::DshSessions(rows) => {
@@ -4662,17 +4679,27 @@ impl Root {
                     self.selected = None;
                 }
 
-                // Keep the persisted/selected tab attached to its space.
-                if let Some(selected) = self.selected.clone() {
-                    if let Some(row) = rows.iter().find(|row| row.id == selected) {
-                        let space_id = space_id_for(&row.cwd);
-                        if let Some(space) =
-                            self.spaces.iter_mut().find(|space| space.id == space_id)
-                        {
-                            space.attach_panel(&selected);
-                            space.activate_panel(&selected);
+                // 只在首次加载时把持久化的 selected 会话挂回 tab。之后的每次
+                // sessions 刷新都这么做会抢焦点（用户正看着 terminal / browser tab
+                // 或另一个 space，一刷新就被拉回聊天 tab），也会把刚关掉的 tab 复活。
+                if !self.followed_once {
+                    if let Some(selected) = self.selected.clone() {
+                        if let Some(row) = rows.iter().find(|row| row.id == selected) {
+                            let space_id = space_id_for(&row.cwd);
+                            if let Some(space) =
+                                self.spaces.iter_mut().find(|space| space.id == space_id)
+                            {
+                                // 上次退出时停在 browser/terminal tab 的话，别把它换成聊天 tab
+                                let keep_active = space.current_tab().is_some_and(|tab| {
+                                    !matches!(tab.layout, Layout::Leaf(0))
+                                });
+                                space.attach_panel(&selected);
+                                if !keep_active {
+                                    space.activate_panel(&selected);
+                                }
+                            }
+                            self.current_space = Some(space_id);
                         }
-                        self.current_space = Some(space_id);
                     }
                 }
 
@@ -4792,11 +4819,15 @@ impl Root {
                     })
                     .unwrap_or_else(|| "/".to_string());
                 let space_id = self.ensure_space(&cwd);
+                // 这里只保证会话有 tab，绝不切 tab / 切 space：follow 在刷新、重连、
+                // 后台 watch 时都会重开，无条件 activate 会把用户正在看的 terminal /
+                // browser tab（或另一个空间的会话）抢走。切 tab 只由用户操作驱动。
                 if let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) {
                     space.attach_panel(&session_id);
-                    space.activate_panel(&session_id);
                 }
-                self.current_space = Some(space_id);
+                if self.current_space.is_none() {
+                    self.current_space = Some(space_id);
+                }
                 // 拉这个会话已有的消息反馈（点赞/点踩的初始高亮 + version）
                 self.feedback.clear();
                 let _ = self.cmds.send_blocking(Cmd::Call {
@@ -5463,8 +5494,10 @@ impl Root {
                     pane.command = meta_cmd;
                     self.panes.push(pane);
                 }
-                // 老的/外来的 pane（没有进过布局树）：默认挂在 chat 右边
-                {
+                // Panel 型终端自己就是那个 tab 的唯一一块，不能塞进当前 tab；
+                // 只有 bottom/right 这种分屏块才挂到当前 tab 的布局里。
+                if kind != BlockPlacement::Panel {
+                    // 老的/外来的 pane（没有进过布局树）：默认挂在 chat 右边
                     let space_id = self.current_space.clone();
                     if let Some(space) = space_id
                         .and_then(|id| self.spaces.iter_mut().find(|space| space.id == id))
@@ -5485,7 +5518,31 @@ impl Root {
                 }
                 if kind == BlockPlacement::Panel {
                     self.term_tabs.insert(session_id.clone());
-                    self.open_tab(session_id, cx);
+                    self.open_tab(session_id.clone(), cx);
+                    // 新建的 tab 默认是 Leaf(0)（= chat），终端 tab 要换成它自己这一块，
+                    // 否则「＋ → terminal」建出来的 tab 里显示的是空聊天面板。
+                    let mut host_tab = None;
+                    if let Some(space) = self
+                        .current_space
+                        .clone()
+                        .and_then(|id| self.spaces.iter_mut().find(|space| space.id == id))
+                    {
+                        if let Some(tab) = space
+                            .panels
+                            .iter_mut()
+                            .find(|tab| tab.blocks.iter().any(|block| block == &session_id))
+                        {
+                            tab.layout = Layout::Leaf(pane_id);
+                            tab.maximized = None;
+                            space.active_panel = Some(tab.id.clone());
+                            host_tab = Some(tab.id.clone());
+                        }
+                    }
+                    if let Some(tab_id) = host_tab {
+                        if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) {
+                            pane.tab_id = Some(tab_id);
+                        }
+                    }
                 }
                 self.save_state();
                 cx.notify();
@@ -6229,7 +6286,6 @@ impl Root {
         let mut panels: Vec<String> = Vec::new();
         let mut next_selected: Option<String> = None;
         let mut space_empty = false;
-        let mut space_cwd = String::new();
         {
             let space = &mut self.spaces[space_index];
             let Some(index) = space.panels.iter().position(|tab| tab.id == tab_id) else {
@@ -6246,7 +6302,6 @@ impl Root {
                     .map(|tab| tab.id.clone());
             }
             space_empty = space.panels.is_empty();
-            space_cwd = space.cwd.clone();
             next_selected = space
                 .current_tab()
                 .and_then(|tab| tab.active.clone().or_else(|| tab.blocks.first().cloned()));
@@ -6308,12 +6363,7 @@ impl Root {
         if self.show_tab_list && self.spaces.iter().all(|space| space.panels.is_empty()) {
             self.show_tab_list = false;
         }
-        // 空间被关空：自动补一个 dsh 会话，别留一块空白
-        if space_empty && self.current_space.as_deref() == Some(self.spaces[space_index].id.as_str()) {
-            let _ = self.cmds.send_blocking(Cmd::NewSession {
-                cwd: Some(space_cwd),
-            });
-        }
+        // 空间可以被关空：留一块空态，用户点 + 再开 tab，不自动补会话
         self.save_state();
         cx.notify();
     }
@@ -6494,46 +6544,17 @@ impl Root {
             return;
         }
 
-        // The space has no open tab yet: adopt its most recent conversation.
-        let best = self
-            .sessions
-            .iter()
-            .filter(|row| space_id_for(&row.cwd) == id)
-            .filter(|row| !row.blank && !row.title.trim().is_empty())
-            .max_by_key(|row| row.updated_at)
-            .or_else(|| {
-                self.sessions
-                    .iter()
-                    .filter(|row| space_id_for(&row.cwd) == id)
-                    .filter(|row| !row.blank)
-                    .max_by_key(|row| row.updated_at)
-            })
-            .or_else(|| {
-                self.sessions
-                    .iter()
-                    .find(|row| space_id_for(&row.cwd) == id)
-            })
-            .cloned();
-        if let Some(row) = best {
-            eprintln!("[ui] switch_space: adopt session {}", row.id);
-            self.open_tab(row.id, cx);
-            return;
-        }
-
-        // Nothing to adopt: start a session in that folder so switching never no-ops.
-        let cwd = self
-            .spaces
-            .iter()
-            .find(|space| space.id == id)
-            .map(|space| space.cwd.clone())
-            .unwrap_or_else(|| id.clone());
-        eprintln!("[ui] switch_space: no session in {cwd}, creating one");
+        // 空间没有 tab：就停在空态（可以一个空间都没有 tab），不自动开会话。
+        eprintln!("[ui] switch_space: {id} has no tabs");
         self.current_space = Some(id);
         self.selected = None;
         self.items.clear();
         self.streaming = None;
+        self.question = None;
+        self.approval = None;
+        self.error = None;
+        self.followed_once = true;
         self.save_state();
-        let _ = self.cmds.send_blocking(Cmd::NewSession { cwd: Some(cwd) });
         cx.notify();
         cx.refresh_windows();
     }
@@ -14113,7 +14134,10 @@ fn block_menu_overlay(
         .id(SharedString::from(format!("block-menu-{pane_id}")))
         .absolute()
         .top(px(23.))
-        .right(px(4.))
+        // 挂在抓手正下方：抓手在 pane 头里水平居中，所以锚点取 pane 宽的 50%，
+        // 再用 -半宽 把菜单自身居中（198 是下面的 .w(...)；之前用 right(4) 会跑到 pane 右边缘）
+        .left(relative(0.5))
+        .ml(px(-99.))
         .w(px(198.))
         .flex()
         .flex_col()
@@ -15472,6 +15496,9 @@ fn render_block(
             .child(
                 div()
                     .max_w(px(CONTENT_MAX_W * 0.72))
+                    // 窄 pane 里气泡要能收缩换行，否则 justify_end 会把它顶出左边被裁
+                    .min_w(px(0.))
+                    .flex_shrink_1()
                     .px(px(14.))
                     .py(px(9.))
                     .rounded(px(10.))
@@ -16163,6 +16190,98 @@ impl Render for Root {
             .map(|space| space.cwd.clone())
             .unwrap_or_else(|| "/".to_string());
         let space_id = current_space.as_ref().map(|space| space.id.clone());
+        let space_has_tabs = current_space
+            .as_ref()
+            .is_some_and(|space| !space.panels.is_empty());
+        // 空间可以为空（所有 tab 都关掉）：给一块空态，不自动补会话
+        let empty_space: AnyElement = {
+            let dsh_cmds = self.cmds.clone();
+            let dsh_cwd = space_cwd.clone();
+            let term_cmds = self.cmds.clone();
+            let term_cwd = space_cwd.clone();
+            let label = if space_label.trim().is_empty() {
+                "space".to_string()
+            } else {
+                space_label.clone()
+            };
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(10.))
+                .size_full()
+                .bg(rgb(0x0d1015))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0x8b93a7))
+                        .child(SharedString::from(label)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x5a6070))
+                        .child("no tabs open"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .id("empty-new-dsh")
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.))
+                                .px(px(12.))
+                                .py(px(6.))
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(rgb(0x2f6fb5))
+                                .text_xs()
+                                .text_color(rgb(0x7fb5e8))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(0x16222f)))
+                                .child("◆ dsh tab")
+                                .on_click(move |_ev, _win, _cx| {
+                                    let _ = dsh_cmds.send_blocking(Cmd::NewSession {
+                                        cwd: Some(dsh_cwd.clone()),
+                                    });
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("empty-new-terminal")
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.))
+                                .px(px(12.))
+                                .py(px(6.))
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(rgb(0x2c3340))
+                                .text_xs()
+                                .text_color(rgb(0x8b93a7))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(0x1a212b)))
+                                .child(">_ terminal tab")
+                                .on_click(move |_ev, _win, _cx| {
+                                    let _ = term_cmds.send_blocking(Cmd::NewTerminal {
+                                        pane_id: next_pane_id(),
+                                        kind: BlockPlacement::Panel,
+                                        cwd: Some(term_cwd.clone()),
+                                        run: None,
+                                    });
+                                }),
+                        ),
+                )
+                .into_any_element()
+        };
         let renaming = self.renaming.clone();
         let tab_drag = self.tab_drag.clone();
         // 三层：space → tab → panel
@@ -16555,6 +16674,9 @@ impl Render for Root {
                             .bg(rgb(0x1b1e26))
                             .border_1()
                             .border_color(rgb(0x2c3340))
+                            // 窄 pane 里 placeholder / 胶囊行比卡片宽，裁在卡片内，
+                            // 不然会画到边框外面去（分屏时很明显）
+                            .overflow_hidden()
                             .child(
                                 div()
                                     .flex()
@@ -16568,6 +16690,7 @@ impl Render for Root {
                                         div()
                                             .flex_1()
                                             .min_w(px(0.))
+                                            .overflow_hidden()
                                             .child(
                                                 Input::new(&self.input)
                                                     .bordered(false)
@@ -16662,6 +16785,7 @@ impl Render for Root {
                                     .flex()
                                     .flex_row()
                                     .items_center()
+                                    .flex_wrap()
                                     .gap(px(10.))
                                     .px(px(12.))
                                     .pb(px(10.))
@@ -21694,7 +21818,8 @@ impl Render for Root {
                             .right(px(0.))
                             .bottom(px(0.))
                             .px(px(16.))
-                            .pb(px(112.))
+                            // 112 正好压在 composer 顶边上，留一点缝
+                            .pb(px(122.))
                             .flex()
                             .flex_col()
                             .items_center()
@@ -24461,7 +24586,11 @@ impl Render for Root {
                             .flex_1()
                             .min_h(px(0.))
                             .min_w(px(0.))
-                            .child(layout_element),
+                            .child(if space_has_tabs {
+                                layout_element
+                            } else {
+                                empty_space
+                            }),
                     ),
             )
             .children(model_picker.map(|picker| {
