@@ -1,5 +1,7 @@
 # OMD — Rust 原生 GUI 的 DeepSeek Harness（dsh）客户端
 
+[中文](README.md) | [English](README.en.md)
+
 > 研究结论文档集。目标：用 Rust 写一个原生 GPU 渲染的 dsh 桌面 App，
 > 支持 dsh 全部功能（会话、工具、审批、终端、文件、插件安装、市场、账号、计划/目标、子代理…），
 > UI 层不出现 Node/浏览器。
@@ -232,6 +234,9 @@ slash 命令面板、附件上传、目标横幅、日程面板、workspace 状�
   `pluginMarket/*` 在未安装市场 bundle 的 profile 里返回 404，UI 会提示未启用而不是报错。
 - tab 上右键：Rename / Fork session / Pin·Unpin / Archive（归档会关闭对应 tab 并刷新列表）。
   转写里带事件 seq 的消息下方有「⎇ fork here」，从那条消息处切开（`atSeq`）。
+- 空间可以有 0 个 tab：关掉最后一个 tab（× 或关掉里面最后一个 block）后停在空态
+  （`no tabs open`，给 dsh / terminal 两个入口），不再自动补一个会话；切到空空间
+  也只停在空态，不接管最近会话。空态会持久化，重启后仍是空空间。
 - assistant 消息下方有 👍/👎（再点撤回），走 `messageFeedback/*`。
 - `Ctrl+K` 命令面板里会列出 `commands/list` 的 slash 命令；输入框里以已知
   `/命令` 开头发送时直接走 `commands/execute`，不再当普通 prompt 发给模型。
