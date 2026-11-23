@@ -81,11 +81,20 @@ EOF
 cat > "$stage/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
-if command -v gtk-update-icon-cache >/dev/null 2>&1; then
-    gtk-update-icon-cache -q /usr/share/icons/hicolor || true
-fi
+# 0.1.2 shipped the launcher and icons as "omd". dpkg leaves files behind
+# that a newer package no longer ships, so the menu showed two OMD entries.
+# Keep anything another package owns.
+for legacy in /usr/share/applications/omd.desktop \
+              /usr/share/icons/hicolor/*/apps/omd.png; do
+    [ -e "$legacy" ] || continue
+    dpkg-query -S "$legacy" >/dev/null 2>&1 || rm -f -- "$legacy"
+done
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database -q /usr/share/applications || true
+fi
+# Adding icons does not touch the theme directory's mtime; force the rebuild.
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -q /usr/share/icons/hicolor || true
 fi
 EOF
 chmod 0755 "$stage/DEBIAN/postinst"

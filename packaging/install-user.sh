@@ -110,11 +110,20 @@ fi
 mv -fT -- "$wrapper" "$bin/omd-desktop"
 mv -fT -- "$desktop" "$apps/omd-desktop.desktop"
 
+# Installs up to 0.1.2 named the launcher and icons `omd`. Left in place they
+# show a second OMD entry; remove only the one this prefix's launcher owns.
+if [ -f "$apps/omd.desktop" ] && grep -qF "Exec=$bin/omd" "$apps/omd.desktop"; then
+    rm -f -- "$apps/omd.desktop"
+fi
+rm -f -- "$share"/icons/hicolor/*/apps/omd.png
+
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database -q "$apps" 2>/dev/null || true
 fi
-if command -v gtk-update-icon-cache >/dev/null 2>&1; then
-    gtk-update-icon-cache -q "$share/icons/hicolor" 2>/dev/null || true
+if [ -d "$share/icons/hicolor" ] && command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    # Adding icons does not touch the theme directory's mtime, so without -f
+    # the existing cache is kept and the new icon name stays unresolvable.
+    gtk-update-icon-cache -f -t -q "$share/icons/hicolor" 2>/dev/null || true
 fi
 
 version=$(dpkg-deb -f "$deb" Version)
