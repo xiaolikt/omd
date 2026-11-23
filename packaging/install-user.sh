@@ -15,6 +15,7 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 prefix=${OMD_PREFIX:-$HOME/.local}
+case "$prefix" in /*) ;; *) prefix=$PWD/$prefix ;; esac
 deb=""
 
 while [ $# -gt 0 ]; do
@@ -32,55 +33,82 @@ if [ -z "$deb" ] || [ ! -f "$deb" ]; then
     exit 1
 fi
 
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+share=$prefix/share
+if [ -z "${OMD_PREFIX:-}" ]; then
+    case "${XDG_DATA_HOME:-}" in /*) share=$XDG_DATA_HOME ;; esac
+fi
+opt=$prefix/opt/omd-desktop
+bin=$prefix/bin
+apps=$share/applications
+backup=$prefix/opt/.omd-desktop.previous
+mkdir -p "$prefix/opt" "$bin" "$apps"
+exec 9>>"$prefix/opt/.omd-desktop.lock"
+flock -n 9 || { echo "another user installation is in progress" >&2; exit 1; }
+work=$(mktemp -d "$prefix/opt/.omd-install.XXXXXXXX")
+wrapper=""
+desktop=""
+cleanup() {
+    if [ -d "$backup" ] && [ ! -e "$opt" ] && [ ! -L "$opt" ]; then
+        mv -T -- "$backup" "$opt" || echo "previous installation kept at $backup" >&2
+    fi
+    rm -rf -- "$work"
+    [ -z "$wrapper" ] || rm -f -- "$wrapper"
+    [ -z "$desktop" ] || rm -f -- "$desktop"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 dpkg-deb -x "$deb" "$work"
 
 payload=$work/usr/lib/omd-desktop
-if [ ! -x "$payload/omd" ]; then
+if [ ! -f "$payload/omd" ] || [ ! -x "$payload/omd" ] || [ -L "$payload/omd" ]; then
     echo "unexpected layout in $deb (no usr/lib/omd-desktop/omd)" >&2
     exit 1
 fi
 
-share=$prefix/share
-opt=$prefix/opt/omd-desktop
-bin=$prefix/bin
-apps=$share/applications
-
-# Flatten the payload into <prefix>/opt/omd-desktop so CEF keeps finding
-# icudtl.dat / *.pak / locales next to the executable.
-rm -rf "$opt"
-mkdir -p "$opt" "$bin" "$apps"
-cp -a "$payload/." "$opt/"
-
-cat > "$bin/omd-desktop" <<EOF
+wrapper=$(mktemp "$bin/.omd-launcher.XXXXXXXX")
+cat > "$wrapper" <<'EOF'
 #!/bin/sh
-export LD_LIBRARY_PATH="$opt\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-exec "$opt/omd" "\$@"
+dir=$(CDPATH= cd -- "$(dirname -- "$0")/../opt/omd-desktop" && pwd) || exit 1
+export LD_LIBRARY_PATH="$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$dir/omd" "$@"
 EOF
-chmod 0755 "$bin/omd-desktop"
+chmod 0755 "$wrapper"
 
-for size in 16 24 32 48 64 128 256 512; do
-    src=$work/usr/share/icons/hicolor/${size}x${size}/apps/omd.png
+for src in "$work"/usr/share/icons/hicolor/*/apps/omd-desktop.png "$work"/usr/share/icons/hicolor/*/apps/omd.png; do
     [ -f "$src" ] || continue
-    dir=$share/icons/hicolor/${size}x${size}/apps
+    size=$(basename -- "$(dirname -- "$(dirname -- "$src")")")
+    dir=$share/icons/hicolor/$size/apps
     mkdir -p "$dir"
-    install -m 0644 "$src" "$dir/omd.png"
+    install -m 0644 "$src" "$dir/omd-desktop.png"
 done
 
-cat > "$apps/omd.desktop" <<EOF
-[Desktop Entry]
-Name=OMD
-GenericName=DeepSeek Harness
-Comment=Native desktop client for DeepSeek Harness
-Exec=$bin/omd-desktop
-Icon=omd
-Terminal=false
-Type=Application
-Categories=Development;Utility;
-StartupWMClass=omd
-Keywords=dsh;deepseek;agent;terminal;
-EOF
+desktop=$(mktemp "$apps/.omd-desktop.XXXXXXXX")
+exec_path=$(printf '%s' "$bin/omd-desktop" | sed 's/\\/\\\\\\\\/g; s/["$`]/\\\\&/g; s/%/%%/g')
+{
+    sed '/^Exec=/d' "$root/packaging/omd.desktop"
+    printf 'Exec="%s"\n' "$exec_path"
+} > "$desktop"
+chmod 0644 "$desktop"
+
+# Even on systems without mv --exchange, never discard the previous payload
+# until the new tree is complete. The trap restores it if activation fails.
+if [ -d "$backup" ] && [ ! -e "$opt" ] && [ ! -L "$opt" ]; then
+    mv -T -- "$backup" "$opt"
+fi
+if [ -e "$opt" ] || [ -L "$opt" ]; then
+    if mv --help | grep -q -- --exchange; then
+        mv --exchange --no-copy -T -- "$payload" "$opt"
+    else
+        rm -rf -- "$backup"
+        mv -T -- "$opt" "$backup"
+        mv -T -- "$payload" "$opt"
+        rm -rf -- "$backup"
+    fi
+else
+    mv -T -- "$payload" "$opt"
+fi
+mv -fT -- "$wrapper" "$bin/omd-desktop"
+mv -fT -- "$desktop" "$apps/omd-desktop.desktop"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database -q "$apps" 2>/dev/null || true
@@ -92,5 +120,5 @@ fi
 version=$(dpkg-deb -f "$deb" Version)
 echo "installed omd-desktop $version"
 echo "  binary:  $bin/omd-desktop"
-echo "  desktop: $apps/omd.desktop"
+echo "  desktop: $apps/omd-desktop.desktop"
 echo "  data:    ${XDG_DATA_HOME:-$HOME/.local/share}/omd (unchanged)"

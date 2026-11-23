@@ -6,7 +6,8 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-version=${OMD_VERSION:-0.1.2}
+version=${OMD_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)}
+[ -n "$version" ] || { echo "cannot read the workspace version" >&2; exit 1; }
 arch=amd64
 dist="$root/packaging/dist"
 stage=$(mktemp -d)
@@ -21,6 +22,12 @@ if [ ! -f "$root/target/release/omd" ]; then
 fi
 if [ ! -f "$cef" ]; then
     echo "missing libcef.so under vendor/cef" >&2
+    exit 1
+fi
+if ! LC_ALL=C grep -aqF 'omd-build:' "$root/target/release/omd" ||
+    ! built=$(timeout 10 env LD_LIBRARY_PATH="$cef_release:$root/vendor/libghostty-vt/lib" \
+    "$root/target/release/omd" --version) || [ "$built" != "omd $version" ]; then
+    echo "release binary does not report OMD $version; rebuild it before packaging" >&2
     exit 1
 fi
 
@@ -48,12 +55,12 @@ export LD_LIBRARY_PATH="/usr/lib/omd-desktop${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH
 exec /usr/lib/omd-desktop/omd "$@"
 EOF
 chmod 0755 "$stage/usr/bin/omd-desktop"
-install -m 0644 "$root/packaging/omd.desktop" "$stage/usr/share/applications/omd.desktop"
+install -m 0644 "$root/packaging/omd.desktop" "$stage/usr/share/applications/omd-desktop.desktop"
 
 for size in 16 24 32 48 64 128 256 512; do
     dir="$stage/usr/share/icons/hicolor/${size}x${size}/apps"
     mkdir -p "$dir"
-    install -m 0644 "$root/packaging/icons/omd-${size}.png" "$dir/omd.png"
+    install -m 0644 "$root/packaging/icons/omd-${size}.png" "$dir/omd-desktop.png"
 done
 
 cat > "$stage/DEBIAN/control" <<EOF
@@ -63,7 +70,6 @@ Section: utils
 Priority: optional
 Architecture: $arch
 Maintainer: OMD <omd@localhost>
-Provides: omd-desktop
 Depends: libc6, libgcc-s1, libx11-6, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libfontconfig1, libfreetype6, libnss3, libnspr4, libdrm2, libgbm1, libpango-1.0-0, libcairo2, libdbus-1-3, libxcomposite1, libxdamage1, libxext6, libxfixes3, libxrandr2, libxi6, libglib2.0-0t64 | libglib2.0-0, libgtk-3-0t64 | libgtk-3-0, libatk1.0-0t64 | libatk1.0-0, libatk-bridge2.0-0t64 | libatk-bridge2.0-0, libasound2t64 | libasound2, libexpat1, libpng16-16t64 | libpng16-16
 Recommends: nodejs
 Description: Native desktop client for DeepSeek Harness

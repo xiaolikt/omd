@@ -120,46 +120,59 @@ treated our deb as an old version of it (`omd 0.1.0 → 1.3.2-2build5`), replace
 `/usr/bin/omd` and deleted `/usr/lib/omd/*` — the app simply vanished. With the
 new name no distro package can collide with it.
 
-Two ways to install:
+Download the Debian package from [GitHub Releases](https://github.com/xiaolikt/omd/releases)
+or build it using the steps below. Then choose one install method:
 
 ```sh
 # 1) user-local (no root, invisible to apt / Software Updater)
 packaging/install-user.sh                 # → ~/.local/{bin,opt,share/applications}
+packaging/install-user.sh --deb /path/to/downloaded.deb
 
 # 2) system deb
 sudo dpkg -i packaging/dist/omd-desktop_<version>_amd64.deb
 ```
 
 Start it from the app menu (**OMD**) or `omd-desktop` on the command line.
+If the old OMD desktop package is still installed as `omd` 0.1.0, remove that
+old package to avoid duplicate menu entries. Do not remove Ubuntu's unrelated `omd`.
 
 **Updating from GitHub**: Settings → General opens with an Updates card (current
 version, status, release notes, *Check now* / *Download & install*, progress bar).
-The app also checks silently on startup and puts an amber dot on the gear when a
-release is waiting. The CLI is equivalent:
+The app checks silently on startup and then every 6 hours, and puts an amber dot
+on the gear when a release is waiting. The CLI is equivalent:
 
 ```sh
 omd-desktop update --check   # is there anything newer?
 omd-desktop update           # download and install (restart the app to apply)
 ```
 
+The card's *Install updates automatically* switch (off by default) downloads and
+installs a new release in the background, then asks you to restart; system
+packages still prompt through `pkexec`. Downloads are verified against the
+GitHub asset's `sha256` digest, and a mismatch aborts the install without
+touching the installed copy.
+
 Where it installs depends on the running binary: a user install under
 `~/.local/opt/omd-desktop` is replaced in place without root, a system package goes
-through `pkexec dpkg -i`, and a dev build (`cargo run`) only downloads into
-`~/.cache/omd/updates/` with a hint. `OMD_UPDATE_API` can point at a local fake
-response for offline testing, and `OMD_NO_UPDATE_CHECK=1` disables the startup check.
+through `pkexec dpkg -i`. Development and Windows builds only download the
+package and show where to find it. `OMD_UPDATE_API` supports an HTTPS mirror or
+a local HTTP fixture (download-only). `OMD_NO_UPDATE_CHECK=1` disables both the
+startup and periodic checks.
 
 ### Packaging and releasing
 
 ```sh
+CEF_PATH="$PWD/vendor/cef" cargo build --locked --release -p omd
 packaging/build-deb.sh   # → packaging/dist/omd-desktop_<version>_amd64.deb
 packaging/test-deb.sh    # unpack and smoke-test without installing
-packaging/release.sh     # tag + upload the deb/zip to GitHub Releases
-packaging/windows/build.sh  # → packaging/dist/omd-windows.zip (cross-compiled on Linux)
+packaging/windows/build.sh  # optional: build omd-windows.zip before publishing
+packaging/release.sh --check  # validate local assets without publishing
 ```
 
-`release.sh` publishes `v<version>` from `Cargo.toml`; the asset names
-(`omd-desktop_<version>_amd64.deb`, `omd-windows.zip`) are what the in-app updater
-looks for.
+Tag the build commit as `v<version>` from `Cargo.toml`, push that tag, then run
+`packaging/release.sh`. It verifies that the remote tag and the binaries in both
+assets match the build commit. If you intentionally want to omit a Windows
+archive left over from a previous build, pass `--linux-only`.
 
 The Windows build is **compile-time verified only** (import table checked, 52 `ghostty-vt` symbols
 present in the DLL export table); it has not been run on real hardware yet.
@@ -173,7 +186,7 @@ present in the DLL export table); it has not been run on real hardware yet.
   browser block is not a security boundary — do not point it at untrusted sites.
 - **Wayland**: browser frames are BGRA read-back uploaded to a shared GPUI texture (no DMA-BUF);
   IME, clipboard and popup menus inside the browser are unverified there.
-- **Windows**: control socket (`omd-desktop block`) and D3D11 shared-texture capture are still missing;
+- **Windows**: control socket (`omd.exe block`) and D3D11 shared-texture capture are still missing;
   browser frames go through CPU upload.
 - Some panels are display-only where the gateway offers no client-side write endpoint
   (for example, reminders are created by the agent's `schedule_create` tool, not by the UI).

@@ -101,7 +101,7 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 （`omd 0.1.0 → 1.3.2-2build5`），直接删掉了 `/usr/lib/omd/*`，app 就这么"消失"了。
 改名之后 distro 再怎么升级都碰不到我们。
 
-两种装法：
+先从 [GitHub Releases](https://github.com/xiaolikt/omd/releases) 下载 deb，或按下文构建，再选择安装方式：
 
 ```sh
 # 1) 用户态（免 root，apt/软件更新器完全看不见，最不会被搞掉）
@@ -113,34 +113,41 @@ sudo dpkg -i packaging/dist/omd-desktop_<version>_amd64.deb
 ```
 
 启动：应用菜单里的 **OMD**，或命令行 `omd-desktop`（用户态在 `~/.local/bin`）。
+如果机器上还装着名为 `omd` 的旧 OMD 0.1.0，可卸载旧包以免应用菜单重复。
+不要卸载 Ubuntu 同名的 Markdown 工具。
 
 **从 GitHub 更新**：设置 → General 顶部有更新卡片（当前版本、状态、release notes、
-「Check now」/「Download & install」、进度条），启动时会自动静默检查一次，有新版本时
-齿轮右上角亮一个琥珀点。命令行等价：
+「Check now」/「Download & install」、进度条）。启动时会静默检查一次，之后每 6 小时
+再查一次；有新版本时齿轮右上角亮一个琥珀点。命令行等价：
 
 ```sh
 omd-desktop update --check     # 只看有没有新版本
 omd-desktop update             # 下载并安装（重启 app 生效）
 ```
 
+卡片里的「Install updates automatically」开关（默认关）会在后台自动下载并安装新版本，
+装好提示重启；系统 deb 仍会弹 `pkexec` 授权。下载内容按 GitHub asset 的 `sha256`
+digest 校验，不一致就放弃安装，已装版本保持不动。
+
 安装方式按当前可执行文件位置分派：`~/.local/opt/omd-desktop` 的副本就地覆盖（免 root），
-`/usr/lib/omd-desktop` 的走 `pkexec dpkg -i`，`cargo run` 之类只下载到
-`~/.cache/omd/updates/` 并提示手动装。`OMD_UPDATE_API` 可指向本地假响应（离线测试），
-`OMD_NO_UPDATE_CHECK=1` 关掉启动检查。
+`/usr/lib/omd-desktop` 的走 `pkexec dpkg -i`，开发构建与 Windows 只下载并提示文件位置。
+`OMD_UPDATE_API` 可指向 HTTPS 镜像或本地 HTTP 测试响应（仅下载），
+`OMD_NO_UPDATE_CHECK=1` 关掉启动及周期检查。
 
 ### 打包与发布
 
 图标在 `packaging/icons/`（深色圆角块 + 六点抓手 + 运行点）。窗口用内嵌的 256px PNG（X11），桌面启动器走 hicolor。
 
 ```sh
-CEF_PATH="$PWD/vendor/cef" cargo build --release -p omd
+CEF_PATH="$PWD/vendor/cef" cargo build --locked --release -p omd
 packaging/build-deb.sh          # packaging/dist/omd-desktop_<version>_amd64.deb
 packaging/test-deb.sh           # 不解进系统，抽出包跑一轮冒烟
-packaging/release.sh            # 打 tag + 把 deb/zip 传到 GitHub Releases
+packaging/windows/build.sh      # 可选：发布前构建 Windows zip
+packaging/release.sh --check    # 离线校验产物，不发布
 ```
 
-`release.sh` 用 `Cargo.toml` 的版本号发 `v<version>`，产物名必须保持
-`omd-desktop_<version>_amd64.deb` / `omd-windows.zip`——app 内的更新器就是按这两个名字挑资产的。
+将构建提交打上 `Cargo.toml` 中的 `v<version>` 标签并推送，再运行 `packaging/release.sh`。
+脚本会核对远端标签与产物中的构建提交。如果只发布 Linux，可用 `--linux-only` 跳过遗留的 Windows zip。
 
 deb 约 150MB（xz），里面带上 CEF 和 `libghostty-vt`，因为 CEF 在可执行文件旁边找 `icudtl.dat`。dsh 运行时不打进包，仍用 `~/.local/share/omd/runtime`。
 

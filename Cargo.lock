@@ -1735,7 +1735,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-host"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "libc",
@@ -1747,7 +1747,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-sdk"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "dsh-host",
@@ -1758,7 +1758,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-spike"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "dsh-host",
@@ -1769,7 +1769,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-transport"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -4969,7 +4969,7 @@ dependencies = [
 
 [[package]]
 name = "omd"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -4985,7 +4985,11 @@ dependencies = [
  "pollster 0.4.0",
  "regex",
  "reqwest",
+ "rustix",
+ "semver",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "url",
  "wgpu",

@@ -9,13 +9,19 @@
 //! - `/usr/lib/omd-desktop/`（deb 装的）→ `pkexec dpkg -i`，走系统授权；
 //! - 其它（`cargo run`、`target/release`）→ 只下载，提示手动安装。
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Context, Result};
+use semver::Version;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use url::{Host, Url};
 
 /// 发布所在的仓库。
-pub const REPO: &str = "xiaolikt/omd";
+const REPO: &str = "xiaolikt/omd";
 
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -28,201 +34,241 @@ fn api_endpoint() -> String {
         .unwrap_or_else(|_| format!("https://api.github.com/repos/{REPO}/releases/latest"))
 }
 
+fn loopback_http(url: &Url) -> bool {
+    url.scheme() == "http"
+        && match url.host() {
+            Some(Host::Domain("localhost")) => true,
+            Some(Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        }
+}
+
+pub fn client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent(format!("omd/{}", current_version()))
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let from = &attempt.previous()[0];
+            let to = attempt.url();
+            if attempt.previous().len() >= 10 {
+                attempt.error("too many update redirects")
+            } else if to.scheme() == "https"
+                || (loopback_http(from) && loopback_http(to) && from.origin() == to.origin())
+            {
+                attempt.follow()
+            } else {
+                attempt.error("insecure update redirect")
+            }
+        }))
+        .build()?)
+}
+
 #[derive(Clone, Debug)]
 pub struct Release {
     pub tag: String,
-    pub version: String,
+    version: Version,
     pub notes: String,
-    pub html_url: String,
-    /// 当前平台的安装包；没有对应产物时为空
-    pub asset_name: String,
-    pub asset_url: String,
-    pub asset_size: u64,
+    pub asset: Option<Asset>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Asset {
+    pub name: String,
+    pub size: Option<u64>,
+    /// 发布页给的 sha256（GitHub release asset 的 `digest` 字段）。
+    digest: Option<[u8; 32]>,
+    /// 允许安装：仅 HTTPS 且带 sha256 的包；其余只能下载。
+    pub installable: bool,
+    url: Url,
+}
+
+/// `sha256:<64 hex>` → 32 字节；格式不对就当没有。
+fn parse_sha256(value: &str) -> Option<[u8; 32]> {
+    let hex = value.strip_prefix("sha256:")?;
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut digest = [0u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(digest)
 }
 
 impl Release {
-    pub fn has_asset(&self) -> bool {
-        !self.asset_url.is_empty()
+    pub fn is_newer(&self) -> bool {
+        self.version
+            .cmp_precedence(&Version::parse(current_version()).expect("Cargo package version"))
+            .is_gt()
     }
 }
 
-/// `v0.1.2` / `0.1.2` → `0.1.2`。
-fn strip_tag(tag: &str) -> String {
-    tag.trim().trim_start_matches(['v', 'V']).to_string()
-}
-
-/// 只比较 `major.minor.patch`（忽略 `-rc.1` 这种后缀），数值逐段比。
-pub fn is_newer(latest: &str, current: &str) -> bool {
-    fn parts(v: &str) -> Vec<u64> {
-        v.split(['-', '+'])
-            .next()
-            .unwrap_or("")
-            .split('.')
-            .map(|p| p.trim().parse::<u64>().unwrap_or(0))
-            .collect()
-    }
-    let (a, b) = (parts(latest), parts(current));
-    for i in 0..a.len().max(b.len()) {
-        let (x, y) = (
-            a.get(i).copied().unwrap_or(0),
-            b.get(i).copied().unwrap_or(0),
-        );
-        if x != y {
-            return x > y;
-        }
-    }
-    false
-}
-
-/// 当前平台该拿哪个产物。
-fn asset_matches(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    if cfg!(windows) {
-        name.ends_with("omd-windows.zip") || name.ends_with("omd.exe")
-    } else {
-        name.ends_with("_amd64.deb") || name.ends_with("_x86_64.deb")
-    }
-}
-
-/// GitHub release JSON → `Release`。抽成纯函数方便用固定 JSON 测。
-pub fn parse_release(value: &Value) -> Result<Release> {
+fn parse_release(value: &Value, endpoint: &Url) -> Result<Release> {
     let tag = value
         .get("tag_name")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
         .to_string();
-    if tag.is_empty() {
-        bail!("release has no tag_name");
-    }
+    let version = Version::parse(tag.strip_prefix(['v', 'V']).unwrap_or(&tag))
+        .context("release tag is not a semantic version")?;
     let notes = value
         .get("body")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
         .to_string();
-    let html_url = value
-        .get("html_url")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let assets = value
-        .get("assets")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut picked: Option<(String, String, u64)> = None;
-    for asset in assets {
-        let name = asset
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if !asset_matches(&name) {
-            continue;
+    let expected = if cfg!(all(windows, target_arch = "x86_64")) {
+        Some("omd-windows.zip".to_owned())
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some(format!("omd-desktop_{version}_amd64.deb"))
+    } else {
+        None
+    };
+    let asset = expected.and_then(|name| {
+        let entry = value
+            .get("assets")?
+            .as_array()?
+            .iter()
+            .find(|asset| asset.get("name").and_then(Value::as_str) == Some(name.as_str()))?;
+        let url = Url::parse(entry.get("browser_download_url")?.as_str()?).ok()?;
+        if url.scheme() != "https"
+            && !(loopback_http(endpoint)
+                && loopback_http(&url)
+                && endpoint.origin() == url.origin())
+        {
+            return None;
         }
-        // 同一平台有多种产物时取最大的（通常就是完整包）
-        let size = asset.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
-        let url = asset
-            .get("browser_download_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if url.is_empty() {
-            continue;
-        }
-        if picked.as_ref().map_or(true, |(_, _, s)| size > *s) {
-            picked = Some((name, url, size));
-        }
-    }
-    let (asset_name, asset_url, asset_size) = picked.unwrap_or_default();
+        let size = entry.get("size").and_then(Value::as_u64).filter(|&n| n > 0);
+        let digest = entry
+            .get("digest")
+            .and_then(Value::as_str)
+            .and_then(parse_sha256);
+        let https = endpoint.scheme() == "https" && url.scheme() == "https";
+        Some(Asset {
+            name,
+            size,
+            digest,
+            installable: https && digest.is_some(),
+            url,
+        })
+    });
     Ok(Release {
-        version: strip_tag(&tag),
+        version,
         tag,
         notes,
-        html_url,
-        asset_name,
-        asset_url,
-        asset_size,
+        asset,
     })
 }
 
 /// 拉最新 release。404 = 还没有发布过任何 release（提示语比错误更适合）。
 pub async fn fetch_latest(client: &reqwest::Client) -> Result<Release> {
+    let endpoint = Url::parse(&api_endpoint()).context("invalid update API URL")?;
+    if endpoint.scheme() != "https" && !loopback_http(&endpoint) {
+        bail!("the update API must use HTTPS or loopback HTTP");
+    }
     let response = client
-        .get(api_endpoint())
+        .get(endpoint.clone())
+        .timeout(Duration::from_secs(30))
         .header("accept", "application/vnd.github+json")
-        .header("user-agent", format!("omd/{}", current_version()))
         .send()
-        .await
-        .map_err(|err| anyhow!("cannot reach github: {err}"))?;
+        .await?;
     let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|err| anyhow!("reading the release failed: {err}"))?;
     if status.as_u16() == 404 {
         bail!("no releases published yet");
     }
     if !status.is_success() {
-        bail!("github returned HTTP {status}: {}", text.chars().take(160).collect::<String>());
+        bail!("update API returned HTTP {status}");
     }
-    let value: Value = serde_json::from_str(&text)
-        .map_err(|err| anyhow!("github sent unexpected json: {err}"))?;
-    parse_release(&value)
+    let text = response.text().await?;
+    let value = serde_json::from_str(&text).context("update API sent unexpected JSON")?;
+    parse_release(&value, &endpoint)
 }
 
 /// 下载目录：`~/.cache/omd/updates`。
 pub fn download_dir() -> PathBuf {
-    let base = std::env::var("XDG_CACHE_HOME")
+    if let Some(base) = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(|_| std::env::temp_dir());
-    let dir = base.join("omd").join("updates");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+        .filter(|base| base.is_absolute())
+        .or_else(|| {
+            std::env::home_dir()
+                .filter(|home| home.is_absolute())
+                .map(|home| {
+                    if cfg!(windows) {
+                        home.join("AppData/Local")
+                    } else {
+                        home.join(".cache")
+                    }
+                })
+        })
+    {
+        base.join("omd").join("updates")
+    } else {
+        std::env::temp_dir()
+    }
 }
 
 /// 流式下载，`on_progress(已下载, 总大小)` 每块都会调（总大小可能为 0）。
-pub async fn download(
+pub async fn apply(
     client: &reqwest::Client,
-    url: &str,
-    dir: &Path,
-    file_name: &str,
+    asset: Asset,
     mut on_progress: impl FnMut(u64, u64),
-) -> Result<PathBuf> {
+) -> Result<InstallOutcome> {
     use std::io::Write;
 
-    let response = client
-        .get(url)
-        .header("user-agent", format!("omd/{}", current_version()))
-        .send()
-        .await
-        .map_err(|err| anyhow!("download failed: {err}"))?;
-    if !response.status().is_success() {
+    let mut response = client.get(asset.url.clone()).send().await?;
+    if response.status() != reqwest::StatusCode::OK {
         bail!("download failed: HTTP {}", response.status());
     }
-    let total = response.content_length().unwrap_or(0);
-    let dest = dir.join(file_name);
-    let tmp = dest.with_extension("part");
-    let mut file = std::fs::File::create(&tmp)
-        .map_err(|err| anyhow!("cannot write {}: {err}", tmp.display()))?;
-    let mut response = response;
+    let total = asset.size.or(response.content_length());
+    let dir = download_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let stage = tempfile::Builder::new().prefix("omd-").tempdir_in(dir)?;
+    let dest = stage.path().join(&asset.name);
+    let mut file = std::fs::File::create_new(&dest)?;
+    let mut hasher = Sha256::new();
     let mut got: u64 = 0;
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|err| anyhow!("download interrupted: {err}"))?
-    {
-        file.write_all(&chunk)
-            .map_err(|err| anyhow!("cannot write {}: {err}", tmp.display()))?;
+    while let Some(chunk) = response.chunk().await.context("download interrupted")? {
         got += chunk.len() as u64;
-        on_progress(got, total);
+        if total.is_some_and(|total| got > total) {
+            bail!("download exceeds the expected size");
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk)?;
+        on_progress(got, total.unwrap_or(0));
     }
-    file.flush().ok();
+    if got == 0 || total.is_some_and(|total| got != total) {
+        bail!("download did not match the expected size");
+    }
+    let actual: [u8; 32] = hasher.finalize().into();
+    verify_digest(actual, asset.digest, asset.installable)?;
+    file.sync_all()?;
     drop(file);
-    std::fs::rename(&tmp, &dest)?;
-    Ok(dest)
+    tokio::task::spawn_blocking(move || {
+        // Keep loopback HTTP fixtures and Windows ZIPs download-only.
+        let outcome = if asset.installable && cfg!(target_os = "linux") {
+            install(&dest)
+        } else {
+            Ok(InstallOutcome::Downloaded(dest.clone()))
+        };
+        if !matches!(outcome, Ok(InstallOutcome::Installed(_))) {
+            let _ = stage.keep();
+        }
+        outcome
+    })
+    .await?
+}
+
+/// 只有摘要对上（或本来就只能手动下载）才允许继续。
+fn verify_digest(actual: [u8; 32], expected: Option<[u8; 32]>, installable: bool) -> Result<()> {
+    match expected {
+        Some(expected) if actual != expected => bail!("download failed the sha256 check"),
+        Some(_) => Ok(()),
+        None if installable => bail!("release asset has no sha256 digest"),
+        None => Ok(()),
+    }
 }
 
 /// 更新怎么落地。
@@ -245,48 +291,46 @@ fn which(binary: &str) -> Option<PathBuf> {
 
 fn run(cmd: &mut std::process::Command) -> Result<std::process::ExitStatus> {
     cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
         .status()
-        .map_err(|err| anyhow!("cannot run {:?}: {err}", cmd))
+        .with_context(|| format!("cannot run {cmd:?}"))
 }
 
 /// 用户态安装：把 deb 里的 payload 覆盖到 `opt_dir`。
 ///
-/// 运行中的进程映射的是旧 inode，`rm -rf` + 重新落盘不会影响它；
-/// 下一次启动就是新版本。
+#[cfg(target_os = "linux")]
 fn install_into(deb: &Path, opt_dir: &Path) -> Result<InstallOutcome> {
-    let stage = std::env::temp_dir().join(format!("omd-update-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&stage);
-    std::fs::create_dir_all(&stage)?;
-    let status = run(
-        std::process::Command::new("dpkg-deb")
-            .arg("-x")
-            .arg(deb)
-            .arg(&stage),
-    );
-    let status = match status {
-        Ok(status) => status,
-        Err(err) => {
-            let _ = std::fs::remove_dir_all(&stage);
-            return Err(err);
-        }
-    };
-    let payload = stage.join("usr/lib/omd-desktop");
-    if !status.success() || !payload.join("omd").exists() {
-        let _ = std::fs::remove_dir_all(&stage);
-        bail!("unexpected package layout (no usr/lib/omd-desktop/omd)");
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = opt_dir.parent().context("missing installation parent")?;
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(parent.join(".omd-desktop.lock"))?;
+    lock.try_lock()
+        .context("another user installation is in progress")?;
+    let stage = tempfile::Builder::new()
+        .prefix(".omd-update-")
+        .tempdir_in(parent)?;
+    let status = run(std::process::Command::new("dpkg-deb")
+        .arg("-x")
+        .arg(deb)
+        .arg(stage.path()))?;
+    if !status.success() {
+        bail!("extracting the update failed ({status}); the installed app was not changed");
     }
-    let _ = std::fs::remove_dir_all(opt_dir);
-    std::fs::create_dir_all(opt_dir)?;
-    let copied = run(
-        std::process::Command::new("cp")
-            .arg("-a")
-            .arg(format!("{}/.", payload.display()))
-            .arg(opt_dir),
-    );
-    let _ = std::fs::remove_dir_all(&stage);
-    copied?;
+    let payload = stage.path().join("usr/lib/omd-desktop");
+    let omd = payload
+        .join("omd")
+        .symlink_metadata()
+        .context("package has no OMD binary")?;
+    if !omd.is_file() || omd.permissions().mode() & 0o111 == 0 {
+        bail!("package has no executable OMD binary");
+    }
+    // Both paths are on the install filesystem. A failed exchange leaves the old tree in place.
+    renameat_with(CWD, &payload, CWD, opt_dir, RenameFlags::EXCHANGE)
+        .context("switching installations; the installed app was not changed")?;
     Ok(InstallOutcome::Installed(format!(
         "installed into {} — restart OMD to use it",
         opt_dir.display()
@@ -294,12 +338,13 @@ fn install_into(deb: &Path, opt_dir: &Path) -> Result<InstallOutcome> {
 }
 
 /// 根据安装位置决定怎么装。
-pub fn install(deb: &Path) -> Result<InstallOutcome> {
+fn install(deb: &Path) -> Result<InstallOutcome> {
     let exe = std::env::current_exe().unwrap_or_default();
     let exe = exe.canonicalize().unwrap_or(exe);
     let exe_dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
 
     // 1) 用户态安装（install-user.sh / 自更新装出来的）
+    #[cfg(target_os = "linux")]
     if exe_dir
         .file_name()
         .is_some_and(|name| name == "omd-desktop")
@@ -316,25 +361,31 @@ pub fn install(deb: &Path) -> Result<InstallOutcome> {
         if which("pkexec").is_some() {
             let mut cmd = std::process::Command::new("pkexec");
             cmd.arg("dpkg").arg("-i").arg(deb);
-            return match run(&mut cmd) {
-                Ok(status) if status.success() => Ok(InstallOutcome::Installed(
+            return match run(&mut cmd)?.code() {
+                Some(0) => Ok(InstallOutcome::Installed(
                     "system package updated — restart OMD to use it".to_string(),
                 )),
-                _ => Ok(InstallOutcome::Delegated(format!(
-                    "authorization cancelled; install it manually: sudo dpkg -i {}",
+                Some(126) => Ok(InstallOutcome::Downloaded(deb.to_path_buf())),
+                code => bail!(
+                    "system installer failed ({code:?}); package: {}",
                     deb.display()
-                ))),
+                ),
             };
         }
         // 没有 pkexec：把包交给软件中心
         if which("xdg-open").is_some() {
-            let _ = run(std::process::Command::new("xdg-open").arg(deb));
+            let status = run(std::process::Command::new("xdg-open").arg(deb))?;
+            if !status.success() {
+                bail!(
+                    "software installer failed ({status}); package: {}",
+                    deb.display()
+                );
+            }
             return Ok(InstallOutcome::Delegated(format!(
                 "opened {} in the software installer",
                 deb.display()
             )));
         }
-        return Ok(InstallOutcome::Downloaded(deb.to_path_buf()));
     }
 
     // 3) 开发构建：只下载
@@ -348,49 +399,191 @@ mod tests {
 
     #[test]
     fn version_compare() {
-        assert!(is_newer("0.1.2", "0.1.1"));
-        assert!(is_newer("0.2.0", "0.1.9"));
-        assert!(is_newer("1.0.0", "0.9.9"));
-        assert!(!is_newer("0.1.1", "0.1.1"));
-        assert!(!is_newer("0.1.0", "0.1.1"));
-        // tag 前缀与预发布后缀
-        assert!(is_newer("0.1.2-rc.1", "0.1.1"));
-        assert!(!is_newer("v0.1.1", "0.1.1"));
+        let endpoint = Url::parse("https://example.test").unwrap();
+        let running = Version::parse(current_version()).unwrap();
+        let next = format!("v{}.{}.{}", running.major + 1, 0, 0);
+        assert!(parse_release(&json!({"tag_name": next}), &endpoint)
+            .unwrap()
+            .is_newer());
+        assert!(
+            !parse_release(&json!({"tag_name": format!("v{running}")}), &endpoint)
+                .unwrap()
+                .is_newer()
+        );
+        assert!(parse_release(&json!({"tag_name": "v1.bad.0"}), &endpoint).is_err());
+        let rc = Version::parse("1.0.0-rc.1").unwrap();
+        assert!(parse_release(&json!({"tag_name": "v1.0.0"}), &endpoint)
+            .unwrap()
+            .version
+            .cmp_precedence(&rc)
+            .is_gt());
     }
 
     #[test]
     fn parses_release_and_picks_platform_asset() {
         let value = json!({
             "tag_name": "v0.2.0",
-            "html_url": "https://github.com/xiaolikt/omd/releases/tag/v0.2.0",
             "body": "- empty spaces\n- updater\n",
             "assets": [
+                { "name": "omd-desktop-debug_0.2.0_amd64.deb",
+                  "browser_download_url": "https://example.test/debug",
+                  "size": 999000000u64 },
                 { "name": "omd-desktop_0.2.0_amd64.deb",
                   "browser_download_url": "https://example.test/omd-desktop_0.2.0_amd64.deb",
-                  "size": 155000000u64 },
+                  "size": 155000000u64,
+                  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
                 { "name": "omd-windows.zip",
                   "browser_download_url": "https://example.test/omd-windows.zip",
-                  "size": 204000000u64 }
+                  "size": 204000000u64,
+                  "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
             ]
         });
-        let release = parse_release(&value).expect("release");
-        assert_eq!(release.version, "0.2.0");
+        let release =
+            parse_release(&value, &Url::parse("https://example.test").unwrap()).expect("release");
+        assert_eq!(release.version.to_string(), "0.2.0");
         assert_eq!(release.tag, "v0.2.0");
         assert!(release.notes.contains("updater"));
-        assert!(release.has_asset());
-        if cfg!(windows) {
-            assert_eq!(release.asset_name, "omd-windows.zip");
+        if cfg!(all(windows, target_arch = "x86_64")) {
+            let asset = release.asset.unwrap();
+            assert_eq!(asset.name, "omd-windows.zip");
+            assert!(asset.installable);
+        } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            let asset = release.asset.unwrap();
+            assert_eq!(asset.name, "omd-desktop_0.2.0_amd64.deb");
+            assert_eq!(asset.size, Some(155_000_000));
+            assert!(asset.installable);
         } else {
-            assert_eq!(release.asset_name, "omd-desktop_0.2.0_amd64.deb");
-            assert_eq!(release.asset_size, 155_000_000);
+            assert!(release.asset.is_none());
         }
+    }
+
+    #[test]
+    fn parses_sha256_digest() {
+        let hex = "ab".repeat(32);
+        assert_eq!(parse_sha256(&format!("sha256:{hex}")).unwrap(), [0xab; 32]);
+        assert!(parse_sha256(&format!("sha256:{}", "zz".repeat(32))).is_none());
+        assert!(parse_sha256(&format!("sha512:{hex}")).is_none());
+        assert!(parse_sha256("sha256:abc").is_none());
+    }
+
+    #[test]
+    fn digest_mismatch_or_missing_blocks_install() {
+        let actual = [1u8; 32];
+        assert!(verify_digest(actual, Some([1u8; 32]), true).is_ok());
+        assert!(verify_digest(actual, Some([2u8; 32]), true).is_err());
+        assert!(verify_digest(actual, None, true).is_err());
+        // 本来就只能手动下载的包（loopback / Windows）不要求摘要。
+        assert!(verify_digest(actual, None, false).is_ok());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn asset_without_digest_is_download_only() {
+        let release = parse_release(
+            &json!({
+                "tag_name": "v9.0.0",
+                "assets": [{
+                    "name": "omd-desktop_9.0.0_amd64.deb",
+                    "browser_download_url": "https://example.test/package",
+                }],
+            }),
+            &Url::parse("https://example.test").unwrap(),
+        )
+        .unwrap();
+        assert!(!release.asset.unwrap().installable);
     }
 
     #[test]
     fn release_without_asset_still_parses() {
         let value = json!({ "tag_name": "v9.9.9", "assets": [] });
-        let release = parse_release(&value).expect("release");
-        assert!(!release.has_asset());
-        assert_eq!(release.version, "9.9.9");
+        let release =
+            parse_release(&value, &Url::parse("https://example.test").unwrap()).expect("release");
+        assert!(release.asset.is_none());
+        assert_eq!(release.version.to_string(), "9.9.9");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn loopback_metadata_cannot_enable_installation() {
+        let endpoint = Url::parse("http://127.0.0.1:8080/latest").unwrap();
+        let release = |url: &str| {
+            parse_release(
+                &json!({
+                    "tag_name": "v9.0.0",
+                    "assets": [{
+                        "name": "omd-desktop_9.0.0_amd64.deb",
+                        "browser_download_url": url,
+                    }],
+                }),
+                &endpoint,
+            )
+            .unwrap()
+        };
+        assert!(
+            !release("http://127.0.0.1:8080/package")
+                .asset
+                .unwrap()
+                .installable
+        );
+        assert!(
+            !release("https://example.test/package")
+                .asset
+                .unwrap()
+                .installable
+        );
+        assert!(release("http://127.0.0.1:8081/package").asset.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn user_update_keeps_old_payload_until_valid_replacement() {
+        use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+
+        if Command::new("dpkg-deb").arg("--version").output().is_err() {
+            eprintln!("skipping Debian install test: dpkg-deb unavailable");
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let old = work.path().join("omd-desktop");
+        fs::create_dir(&old).unwrap();
+        fs::write(old.join("omd"), "old binary").unwrap();
+        let source = work.path().join("package");
+        let payload = source.join("usr/lib/omd-desktop");
+        fs::create_dir_all(&payload).unwrap();
+        fs::create_dir(source.join("DEBIAN")).unwrap();
+        fs::write(source.join("DEBIAN/control"),
+            "Package: omd-desktop\nVersion: 1.0.0\nArchitecture: all\nMaintainer: Test <test@example.test>\nDescription: updater fixture\n").unwrap();
+        fs::write(payload.join("omd"), "new binary").unwrap();
+        let deb = work.path().join("update.deb");
+        let pack = || {
+            assert!(Command::new("dpkg-deb")
+                .arg("--build")
+                .arg(&source)
+                .arg(&deb)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        pack();
+        assert!(install_into(&deb, &old).is_err());
+        assert_eq!(fs::read_to_string(old.join("omd")).unwrap(), "old binary");
+
+        fs::set_permissions(payload.join("omd"), fs::Permissions::from_mode(0o755)).unwrap();
+        pack();
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .open(work.path().join(".omd-desktop.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        assert!(install_into(&deb, &old).is_err());
+        assert_eq!(fs::read_to_string(old.join("omd")).unwrap(), "old binary");
+        drop(lock);
+
+        assert!(matches!(
+            install_into(&deb, &old).unwrap(),
+            InstallOutcome::Installed(_)
+        ));
+        assert_eq!(fs::read_to_string(old.join("omd")).unwrap(), "new binary");
     }
 }

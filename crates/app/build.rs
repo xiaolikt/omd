@@ -7,6 +7,37 @@ fn main() {
         .parent()
         .unwrap();
 
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let revision = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_owned());
+    println!("cargo:rustc-env=OMD_BUILD_REVISION={revision}");
+    if revision != "unknown" {
+        let branch = git(&["symbolic-ref", "-q", "HEAD"]);
+        for name in ["HEAD", "packed-refs"].into_iter().chain(branch.as_deref()) {
+            if let Some(path) = git(&["rev-parse", "--path-format=absolute", "--git-path", name]) {
+                if std::path::Path::new(&path).exists() {
+                    println!("cargo:rerun-if-changed={path}");
+                } else if name != "packed-refs" {
+                    // A loose ref can be created on top of a packed ref.
+                    if let Some(parent) = std::path::Path::new(&path).parent() {
+                        if parent.exists() {
+                            println!("cargo:rerun-if-changed={}", parent.display());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // libghostty-vt：Linux 用 .so，Windows 用 ghostty-vt.dll + 导入库。
     let vt = root.join("vendor/libghostty-vt");
     if target_os == "windows" {
@@ -64,12 +95,15 @@ fn main() {
                     for platform in platforms.flatten() {
                         for sub in ["Release", "Resources"] {
                             let src = platform.path().join(sub);
-                            let Ok(files) = std::fs::read_dir(&src) else { continue };
+                            let Ok(files) = std::fs::read_dir(&src) else {
+                                continue;
+                            };
                             for file in files.flatten() {
                                 if !file.path().is_file() {
                                     continue;
                                 }
-                                let _ = std::fs::copy(file.path(), target_dir.join(file.file_name()));
+                                let _ =
+                                    std::fs::copy(file.path(), target_dir.join(file.file_name()));
                             }
                             let locales = src.join("locales");
                             if locales.is_dir() {
@@ -78,7 +112,10 @@ fn main() {
                                 if let Ok(paks) = std::fs::read_dir(&locales) {
                                     for pak in paks.flatten() {
                                         if pak.path().is_file() {
-                                            let _ = std::fs::copy(pak.path(), dest.join(pak.file_name()));
+                                            let _ = std::fs::copy(
+                                                pak.path(),
+                                                dest.join(pak.file_name()),
+                                            );
                                         }
                                     }
                                 }

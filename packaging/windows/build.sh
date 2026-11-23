@@ -38,6 +38,9 @@ done
 cp -a "$cef/locales" "$out/"
 cp "$root/vendor/libghostty-vt/windows/ghostty-vt.dll" "$out/"
 
-(cd "$(dirname "$out")" && zip -q -r "$(basename "$out").zip" "$(basename "$out")")
+work=$(mktemp -d "$(dirname "$out")/.omd-windows.XXXXXXXX")
+trap 'rm -rf "$work"' EXIT
+(cd "$(dirname "$out")" && zip -q -r "$work/omd-windows.zip" "$(basename "$out")")
+mv -f -- "$work/omd-windows.zip" "$out.zip"
 echo "wrote $out.zip"
 ls -lh "$out.zip"
