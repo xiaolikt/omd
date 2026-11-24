@@ -20,6 +20,9 @@ mod browser;
 mod x11_embed;
 mod term;
 mod update;
+mod i18n;
+
+use i18n::{tr, trf, trs};
 
 fn uuid_like() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -311,10 +314,10 @@ impl PaletteTab {
 
     fn label(self) -> &'static str {
         match self {
-            PaletteTab::All => "All",
-            PaletteTab::Commands => "Commands",
-            PaletteTab::Tabs => "Panels",
-            PaletteTab::Spaces => "Spaces",
+            PaletteTab::All => tr("All"),
+            PaletteTab::Commands => tr("Commands"),
+            PaletteTab::Tabs => tr("Panels"),
+            PaletteTab::Spaces => tr("Spaces"),
         }
     }
 
@@ -379,7 +382,7 @@ fn read_text_preview(path: &str) -> String {
     match std::fs::read(path) {
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(text) => text,
-            Err(_) => "binary file".to_string(),
+            Err(_) => tr("binary file").to_string(),
         },
         Err(err) => format!("read failed: {err}"),
     }
@@ -1307,7 +1310,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
         let _ = evs
             .send(Ev::DshUpdate {
                 done: false,
-                message: "installing bundled dsh engine…".into(),
+                message: tr("installing bundled dsh engine…").into(),
             })
             .await;
         match dsh_host::install_dsh("latest").await {
@@ -1562,7 +1565,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
         .await;
     let http = host.client().clone();
     let base = host.base().clone();
-    let _ = evs.send(Ev::Line("engine ready".into())).await;
+    let _ = evs.send(Ev::Line(tr("engine ready").into())).await;
     let _ = refresh_sessions(&rpc, &evs).await;
 
     // workspace/follow：置顶/归档状态的唯一来源（baseline + pinned/archived 增量）
@@ -1973,13 +1976,14 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                                 .map(|s| s.to_string()),
                             Err(err) => {
                                 let hint = if format!("{err}").contains("sending request") {
-                                    "（不是 web：这是本地 dsh daemon 的 HTTP API，daemon 可能挂/换端口了，重启 omd 会重新拉起）"
+                                    tr("(this is not the web UI: the local dsh daemon HTTP API may be down or on another port; restarting omd relaunches it)")
                                 } else {
                                     ""
                                 };
                                 let _ = evs
                                     .send(Ev::Error(format!(
-                                        "session/create 失败: {err}{hint}"
+                                        "{}: {err}{hint}",
+                                        tr("session/create failed")
                                     )))
                                     .await;
                                 None
@@ -1987,7 +1991,10 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                         };
                         let Some(session_id) = session_id else {
                             let _ = evs
-                                .send(Ev::Error("终端需要先有会话；上面的失败原因就是它".into()))
+                                .send(Ev::Error(
+                                    tr("The terminal needs a session first; that is the failure above")
+                                        .into(),
+                                ))
                                 .await;
                             let _ = evs.send(Ev::PaneAbandoned(pane_id)).await;
                             continue;
@@ -2398,7 +2405,7 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             let _ = evs
                                 .send(Ev::DshUpdate {
                                     done: false,
-                                    message: "downloading and installing dsh…".into(),
+                                    message: tr("downloading and installing dsh…").into(),
                                 })
                                 .await;
                             match dsh_host::install_dsh("latest").await {
@@ -3172,6 +3179,8 @@ struct Root {
     /// settings/describe 的结果
     settings_doc: Value,
     settings_loading: bool,
+    /// 语言变化后，下一帧统一刷新所有输入框占位文案。
+    lang_refresh: bool,
     settings_error: Option<String>,
     /// 正在编辑的设置项：(ns, path, revision, 是否数字)
     settings_edit: Option<(String, Vec<String>, i64, bool)>,
@@ -4003,28 +4012,28 @@ impl Root {
             browser::set_primary(index);
             browser_index = index;
         }
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Message… Enter to send · Shift+Enter for newline"));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("Message… Enter to send · Shift+Enter for newline")));
         let question_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Custom answer (optional)"));
-        let model_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search models…"));
-        let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Name…"));
-        let commit_input = cx.new(|cx| InputState::new(window, cx).placeholder("Why this change..."));
-        let settings_input = cx.new(|cx| InputState::new(window, cx).placeholder("Value…"));
-        let settings_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search settings"));
-        let model_id_input = cx.new(|cx| InputState::new(window, cx).placeholder("model id"));
-        let model_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("display name"));
-        let model_ctx_input = cx.new(|cx| InputState::new(window, cx).placeholder("context window"));
-        let model_max_input = cx.new(|cx| InputState::new(window, cx).placeholder("max output tokens"));
-        let provider_id_input = cx.new(|cx| InputState::new(window, cx).placeholder("route id"));
-        let provider_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("display name"));
-        let provider_base_input = cx.new(|cx| InputState::new(window, cx).placeholder("Leave blank to use the default endpoint"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("Custom answer (optional)")));
+        let model_input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("Search models…")));
+        let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("Name…")));
+        let commit_input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("Why this change...")));
+        let settings_input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("Value…")));
+        let settings_search = cx.new(|cx| InputState::new(window, cx).placeholder(tr("Search settings")));
+        let model_id_input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("model id")));
+        let model_name_input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("display name")));
+        let model_ctx_input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("context window")));
+        let model_max_input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("max output tokens")));
+        let provider_id_input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("route id")));
+        let provider_name_input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("display name")));
+        let provider_base_input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("Leave blank to use the default endpoint")));
         let provider_keyenv_input = cx.new(|cx| InputState::new(window, cx).placeholder("API_KEY_ENV"));
         let provider_models_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("model ids, comma separated"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("model ids, comma separated")));
         let provider_apikey_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("paste API key (stored in credentials)"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("paste API key (stored in credentials)")));
         let provider_search =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Search providers…"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("Search providers…")));
         let mut provider_input_subs = Vec::new();
         for input in [
             &provider_id_input,
@@ -4048,15 +4057,15 @@ impl Root {
                 }
             }));
         }
-        let plugins_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter plugins…"));
-        let market_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search the plugin market…"));
+        let plugins_input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("Filter plugins…")));
+        let market_input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("Search the plugin market…")));
         let plugin_spec_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("npm name, git URL, path or tarball…")
+            InputState::new(window, cx).placeholder(tr("npm name, git URL, path or tarball…"))
         });
         let goal_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("What should this session achieve?"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("What should this session achieve?")));
         let goal_rounds_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("rounds cap (optional)")
+            InputState::new(window, cx).placeholder(tr("rounds cap (optional)"))
         });
         let goal_sub = cx.subscribe(&goal_input, |this, _entity, ev: &InputEvent, cx| {
             if let InputEvent::PressEnter { shift, .. } = ev {
@@ -4066,10 +4075,10 @@ impl Root {
             }
         });
         let subagent_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Message the selected subagent…")
+            InputState::new(window, cx).placeholder(tr("Message the selected subagent…"))
         });
-        let schedule_title_input = cx.new(|cx| InputState::new(window, cx).placeholder("Title"));
-        let schedule_prompt_input = cx.new(|cx| InputState::new(window, cx).placeholder("Prompt"));
+        let schedule_title_input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("Title")));
+        let schedule_prompt_input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("Prompt")));
         let subagent_sub = cx.subscribe(&subagent_input, |this, _entity, ev: &InputEvent, cx| {
             if let InputEvent::PressEnter { shift, .. } = ev {
                 if !*shift {
@@ -4101,7 +4110,7 @@ impl Root {
             cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com"));
         let browser_port_input = cx.new(|cx| InputState::new(window, cx).placeholder("9222"));
         let palette_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Run a command or go to a pane…"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("Run a command or go to a pane…")));
         // 启动即聚焦输入框（OMD_COMPACT=1 时故意不聚焦，用来看收起的输入条）
         if std::env::var("OMD_COMPACT").is_ok() {
             cx.focus_handle().focus(window, cx);
@@ -4121,7 +4130,7 @@ impl Root {
         let mut block_input_subs: Vec<Subscription> = Vec::new();
         for slot in 0..64 {
             let block_input = cx.new(|cx| {
-                InputState::new(window, cx).placeholder("Message… Enter to send")
+                InputState::new(window, cx).placeholder(tr("Message… Enter to send"))
             });
             let sub = cx.subscribe(&block_input, move |this, input_entity, ev: &InputEvent, cx| {
                 if let InputEvent::Change = ev {
@@ -4186,6 +4195,9 @@ impl Root {
         .detach();
 
         let state = load_ui_state();
+        if !state.language.is_empty() {
+            i18n::set_preference(&state.language);
+        }
         let (spaces, current_space, selected, saved_model, saved_provider) = (
             state.spaces,
             state.current_space,
@@ -4208,7 +4220,7 @@ impl Root {
         let mut root = Self {
             cmds: cmd_tx,
             evs: ev_rx,
-            host: "starting dsh…".into(),
+            host: tr("starting dsh…").into(),
             sessions: Vec::new(),
             selected,
             spaces,
@@ -4350,6 +4362,7 @@ impl Root {
             _edits_sub: None,
             settings_doc: Value::Null,
             settings_loading: false,
+            lang_refresh: false,
             settings_error: None,
             settings_edit: None,
             settings_input,
@@ -4722,6 +4735,8 @@ impl Root {
                 self.host = base;
                 self.error = None;
                 let _ = self.cmds.send_blocking(Cmd::ModelCatalog);
+                // 启动时就读一次设置：界面语言来自 locale.preference。
+                self.reload_settings();
                 // A stray startup click must not leave the settings sheet open.
                 self.show_settings = std::env::var("OMD_OPEN_SETTINGS").is_ok();
             }
@@ -5447,6 +5462,29 @@ impl Root {
                                 .unwrap_or_default();
                             eprintln!("[ui] settings namespaces: {}", names.join(", "));
                             self.settings_doc = value;
+                            let preference = self
+                                .ns_get("locale", "preference")
+                                .as_str()
+                                .map(str::to_string);
+                            if let Some(preference) = preference {
+                                i18n::set_preference(&preference);
+                                self.lang_refresh = true;
+                                // 旧版 omd 写的是 zh-CN / en-US；dsh 的内置语言
+                                // 只有 zh / en，顺手迁移一次。
+                                if let Some(normalized) = match preference.as_str() {
+                                    "zh-CN" => Some("zh"),
+                                    "en-US" => Some("en"),
+                                    _ => None,
+                                } {
+                                    let revision = self.ns_revision("locale");
+                                    self.write_setting(
+                                        "locale",
+                                        vec!["preference".to_string()],
+                                        json!(normalized),
+                                        Some(revision),
+                                    );
+                                }
+                            }
                             self.settings_loading = false;
                             self.settings_error = None;
                             self.reload_credentials();
@@ -5474,7 +5512,7 @@ impl Root {
                             // 市场是可选 bundle：未装时 404，不算错误
                             self.market_indexes.clear();
                             self.market_error = Some(
-                                "plugin market is not enabled in this profile (install dsh-plugin-market)"
+                                tr("plugin market is not enabled in this profile (install dsh-plugin-market)")
                                     .to_string(),
                             );
                         }
@@ -5492,7 +5530,7 @@ impl Root {
                         }
                         if tag == "session/search" {
                             self.search_error = Some(if err.contains("search is disabled") {
-                                "session search is disabled in this deployment".to_string()
+                                tr("session search is disabled in this deployment").to_string()
                             } else {
                                 err.chars().take(120).collect()
                             });
@@ -5745,9 +5783,9 @@ impl Root {
                                     format!(" v{version}")
                                 }
                             ),
-                            "restart-required" => "installed · restart the engine to apply"
+                            "restart-required" => tr("installed · restart the engine to apply")
                                 .to_string(),
-                            "overridden" => "installed (kept disabled)".to_string(),
+                            "overridden" => tr("installed (kept disabled)").to_string(),
                             "cancelled" => "cancelled".to_string(),
                             "failed" => {
                                 let detail = value
@@ -5898,7 +5936,7 @@ impl Root {
                                 }
                                 _ => {
                                     attachment.state = AttachmentState::Failed(
-                                        "upload returned no receipt".to_string(),
+                                        tr("upload returned no receipt").to_string(),
                                     );
                                 }
                             }
@@ -6302,6 +6340,7 @@ impl Root {
             "browser_home": self.browser_home,
             "browser_cdp_port": self.browser_cdp_port,
             "auto_update": self.auto_update,
+            "language": if i18n::is_zh() { "zh" } else { "en" },
             "spaces": spaces,
             "current_space": self.current_space,
             "selected": self.selected,
@@ -6947,7 +6986,7 @@ impl Root {
                 let line = err
                     .lines()
                     .find(|line| !line.trim().is_empty())
-                    .unwrap_or("git failed");
+                    .unwrap_or(tr("git failed"));
                 let line: String = line.chars().take(180).collect();
                 eprintln!("[git] {name} failed: {line}");
                 self.git_error = Some(line);
@@ -6991,7 +7030,7 @@ impl Root {
     fn submit_git_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let value = self.commit_input.read(cx).value().trim().to_string();
         if value.is_empty() {
-            self.git_error = Some("commit message is empty".to_string());
+            self.git_error = Some(tr("commit message is empty").to_string());
             self.focus_commit(window, cx);
             return;
         }
@@ -7764,7 +7803,7 @@ impl Root {
         };
         let path = editor.path.clone();
         if !self.lsp_active.contains(&path) {
-            self.error = Some("no language server for this file".to_string());
+            self.error = Some(tr("no language server for this file").to_string());
             cx.notify();
             return;
         }
@@ -7804,7 +7843,7 @@ impl Root {
         };
         let path = editor.path.clone();
         if !self.lsp_active.contains(&path) {
-            self.error = Some("no language server for this file".to_string());
+            self.error = Some(tr("no language server for this file").to_string());
             cx.notify();
             return;
         }
@@ -7816,7 +7855,7 @@ impl Root {
                 root.outline = items;
                 root.show_outline = !root.outline.is_empty();
                 if root.outline.is_empty() {
-                    root.error = Some("no symbols in this file".to_string());
+                    root.error = Some(tr("no symbols in this file").to_string());
                 }
                 cx.notify();
             });
@@ -8128,7 +8167,7 @@ impl Root {
             }
         }
         let input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Find in scrollback…")
+            InputState::new(window, cx).placeholder(tr("Find in scrollback…"))
         });
         let sub = cx.subscribe(&input, |this, _entity, ev: &InputEvent, cx| {
             if let InputEvent::PressEnter { shift, .. } = ev {
@@ -8872,7 +8911,7 @@ impl Root {
     fn reload_account_details(&mut self) {
         let client = json!({
             "version": env!("CARGO_PKG_VERSION"),
-            "locale": "zh-CN",
+            "locale": if i18n::is_zh() { "zh" } else { "en" },
             "timezoneOffsetSeconds": 0,
         });
         for (tag, endpoint) in [
@@ -8897,7 +8936,7 @@ impl Root {
             args: json!({
                 "client": {
                     "version": env!("CARGO_PKG_VERSION"),
-                    "locale": "en-US",
+                    "locale": if i18n::is_zh() { "zh" } else { "en" },
                     "timezoneOffsetSeconds": 0,
                 },
                 "callbackOrigin": origin,
@@ -9741,7 +9780,7 @@ impl Root {
         // 默认走 OSR；原生子窗口只在显式要求时用。
         let windowless = std::env::var("OMD_BROWSER_CHILD").is_err();
         if !browser::init(port, &cache, windowless) {
-            self.error = Some("浏览器引擎启动失败：没找到 CEF 运行时".into());
+            self.error = Some(tr("Browser engine failed to start: CEF runtime not found").into());
             cx.notify();
             return None;
         }
@@ -9756,7 +9795,7 @@ impl Root {
             .unwrap_or_else(|| self.browser_home.clone());
         let index = browser::create(1000, 700, &url);
         if index.is_none() {
-            self.error = Some("浏览器创建失败".into());
+            self.error = Some(tr("Failed to create browser").into());
         }
         self.start_browser_pump(cx);
         index
@@ -9947,7 +9986,7 @@ impl Root {
         let url = browser::current_url(index).unwrap_or_default();
         let input = cx.new(|cx| {
             let mut state =
-                InputState::new(window, cx).placeholder("Search or enter address…");
+                InputState::new(window, cx).placeholder(tr("Search or enter address…"));
             if !url.is_empty() {
                 state.set_value(url, window, cx);
             }
@@ -10520,53 +10559,53 @@ impl Root {
             let commands: [(PaletteAction, &str, String); 10] = [
                 (
                     PaletteAction::NewSession,
-                    "New panel",
-                    format!("New panel in {space_name}"),
+                    tr("New panel"),
+                    format!("{} {space_name}", tr("New panel in")),
                 ),
                 (
                     PaletteAction::TermPane(BlockPlacement::Bottom),
-                    "Terminal · bottom",
+                    tr("Terminal · bottom"),
                     "stacked".to_string(),
                 ),
                 (
                     PaletteAction::TermPane(BlockPlacement::Right),
-                    "Terminal · right",
-                    "side by side".to_string(),
+                    tr("Terminal · right"),
+                    tr("side by side").to_string(),
                 ),
                 (
                     PaletteAction::BrowserPane,
-                    "Browser",
-                    "open a page next to the chat".to_string(),
+                    tr("Browser"),
+                    tr("open a page next to the chat").to_string(),
                 ),
                 (
                     PaletteAction::OpenModels,
-                    "Switch model",
-                    "pick provider / model".to_string(),
+                    tr("Switch model"),
+                    tr("pick provider / model").to_string(),
                 ),
                 (
                     PaletteAction::OpenFiles,
-                    "Files",
-                    "browse the session working directory".to_string(),
+                    tr("Files"),
+                    tr("browse the session working directory").to_string(),
                 ),
                 (
                     PaletteAction::OpenSettings,
-                    "Settings",
-                    "engine version, status and theme".to_string(),
+                    tr("Settings"),
+                    tr("engine version, status and theme").to_string(),
                 ),
                 (
                     PaletteAction::GitStageAll,
-                    "Git · stage all",
-                    "git add -A in the file root".to_string(),
+                    tr("Git · stage all"),
+                    tr("git add -A in the file root").to_string(),
                 ),
                 (
                     PaletteAction::GitUnstageAll,
-                    "Git · unstage all",
-                    "git reset in the file root".to_string(),
+                    tr("Git · unstage all"),
+                    tr("git reset in the file root").to_string(),
                 ),
                 (
                     PaletteAction::GitCommit,
-                    "Git · commit",
-                    "commit staged changes with a message".to_string(),
+                    tr("Git · commit"),
+                    tr("commit staged changes with a message").to_string(),
                 ),
             ];
             for (action, label, sub) in commands {
@@ -10610,10 +10649,10 @@ impl Root {
                 for tab in &space.panels {
                     let tab_label = tab.label(|panel| self.session_title(panel));
                     entries.push(PaletteEntry {
-                        section: "Tabs",
+                        section: tr("Tabs"),
                         label: format!("{} / {}", space.name, tab_label),
                         tag: space.name.clone(),
-                        sub: format!("{} block(s)", tab.blocks.len()),
+                        sub: format!("{} {}", tab.blocks.len(), tr("block(s)")),
                         badge: None,
                         dot: Some(if self.current_space.as_deref() == Some(space.id.as_str()) {
                             0x00d98a
@@ -10633,12 +10672,13 @@ impl Root {
             for space in &self.spaces {
                 let current = self.current_space.as_deref() == Some(space.id.as_str());
                 entries.push(PaletteEntry {
-                    section: "Spaces",
+                    section: tr("Spaces"),
                     label: space.name.clone(),
                     tag: format!(
-                        "{} panels{}",
+                        "{} {}{}",
                         space.panels.len(),
-                        if current { " · current" } else { "" }
+                        tr("panels"),
+                        if current { tr(" · current") } else { "" }
                     ),
                     sub: short_cwd(&space.cwd),
                     badge: None,
@@ -10687,7 +10727,7 @@ impl Root {
                 entries.push(PaletteEntry {
                     section: "Matches",
                     label: if label.trim().is_empty() {
-                        "(no snippet)".to_string()
+                        tr("(no snippet)").to_string()
                     } else {
                         label
                     },
@@ -11379,7 +11419,10 @@ impl Root {
                     .and_then(|v| v.as_str())
                     .unwrap_or("completed");
                 if reason != "completed" {
-                    self.push_block(TranscriptBlock::Notice(format!("turn ended: {reason}")));
+                    self.push_block(TranscriptBlock::Notice(format!(
+                        "{}: {reason}",
+                        tr("turn ended")
+                    )));
                 }
             }
             "session/title" => {
@@ -11649,7 +11692,7 @@ impl Root {
             .iter()
             .any(|attachment| attachment.state == AttachmentState::Uploading)
         {
-            self.error = Some("attachments are still uploading…".to_string());
+            self.error = Some(tr("attachments are still uploading…").to_string());
             return;
         }
         let extra = self.attachments_content();
@@ -11861,14 +11904,14 @@ impl SettingsTab {
 
     fn label(self) -> &'static str {
         match self {
-            SettingsTab::Account => "Account & balance",
-            SettingsTab::General => "General",
-            SettingsTab::Models => "Models",
-            SettingsTab::Plugins => "Built-in plugins",
-            SettingsTab::Presets => "Agent presets",
-            SettingsTab::Browser => "Browser",
-            SettingsTab::Git => "Git",
-            SettingsTab::File => "File",
+            SettingsTab::Account => tr("Account & balance"),
+            SettingsTab::General => tr("General"),
+            SettingsTab::Models => tr("Models"),
+            SettingsTab::Plugins => tr("Built-in plugins"),
+            SettingsTab::Presets => tr("Agent presets"),
+            SettingsTab::Browser => tr("Browser"),
+            SettingsTab::Git => tr("Git"),
+            SettingsTab::File => tr("File"),
         }
     }
 
@@ -11963,24 +12006,28 @@ fn humanize_choice(value: &str) -> String {
 fn settings_field_copy(ns: &str, key: &str) -> Option<(&'static str, &'static str)> {
     match (ns, key) {
         ("ui-chat", "transcriptView") => Some((
-            "Work details",
-            "Choose how much detail to show for tool calls",
+            tr("Work details"),
+            tr("Choose how much detail to show for tool calls"),
         )),
         ("ui-chat", "collapseTiming") => Some((
-            "When to Collapse Work Details",
-            "Choose when to automatically collapse work details",
+            tr("When to Collapse Work Details"),
+            tr("Choose when to automatically collapse work details"),
         )),
         ("ui-chat", "foldedReplies") => Some((
-            "Replies After Collapse",
-            "Choose which assistant replies stay visible when work details collapse",
+            tr("Replies After Collapse"),
+            tr("Choose which assistant replies stay visible when work details collapse"),
         )),
         ("ui-chat", "performanceUsage") => Some((
-            "Performance & usage",
-            "Choose how much performance and usage information to show",
+            tr("Performance & usage"),
+            tr("Choose how much performance and usage information to show"),
         )),
         ("ui-chat", "linkOpening") => Some((
-            "Open chat links in",
-            "Choose where to open web links",
+            tr("Open chat links in"),
+            tr("Choose where to open web links"),
+        )),
+        ("locale", "preference") => Some((
+            tr("Language"),
+            tr("Choose the language for the interface and server-authored messages"),
         )),
         _ => None,
     }
@@ -11989,18 +12036,20 @@ fn settings_field_copy(ns: &str, key: &str) -> Option<(&'static str, &'static st
 /// 枚举值的按钮文案（同样是网页版的词条）。
 fn settings_choice_copy(ns: &str, key: &str, value: &str) -> Option<&'static str> {
     match (ns, key, value) {
-        ("ui-chat", "transcriptView", "compact") => Some("Compact"),
-        ("ui-chat", "transcriptView", "standard") => Some("Standard"),
-        ("ui-chat", "transcriptView", "detailed") => Some("Detailed"),
-        ("ui-chat", "transcriptView", "verbose") => Some("Verbose"),
-        ("ui-chat", "collapseTiming", "completion") => Some("On completion"),
-        ("ui-chat", "collapseTiming", "next-input") => Some("On next message"),
-        ("ui-chat", "foldedReplies", "all") => Some("All replies"),
-        ("ui-chat", "foldedReplies", "final") => Some("Final answer only"),
-        ("ui-chat", "performanceUsage", "compact") => Some("Compact"),
-        ("ui-chat", "performanceUsage", "detailed") => Some("Detailed"),
-        ("ui-chat", "linkOpening", "sidebar") => Some("In-App Sidebar"),
-        ("ui-chat", "linkOpening", "new-tab") => Some("Default Browser"),
+        ("ui-chat", "transcriptView", "compact") => Some(tr("Compact")),
+        ("ui-chat", "transcriptView", "standard") => Some(tr("Standard")),
+        ("ui-chat", "transcriptView", "detailed") => Some(tr("Detailed")),
+        ("ui-chat", "transcriptView", "verbose") => Some(tr("Verbose")),
+        ("ui-chat", "collapseTiming", "completion") => Some(tr("On completion")),
+        ("ui-chat", "collapseTiming", "next-input") => Some(tr("On next message")),
+        ("ui-chat", "foldedReplies", "all") => Some(tr("All replies")),
+        ("ui-chat", "foldedReplies", "final") => Some(tr("Final answer only")),
+        ("ui-chat", "performanceUsage", "compact") => Some(tr("Compact")),
+        ("ui-chat", "performanceUsage", "detailed") => Some(tr("Detailed")),
+        ("ui-chat", "linkOpening", "sidebar") => Some(tr("In-App Sidebar")),
+        ("ui-chat", "linkOpening", "new-tab") => Some(tr("Default Browser")),
+        ("locale", "preference", "en") => Some("English"),
+        ("locale", "preference", "zh") => Some("中文"),
         _ => None,
     }
 }
@@ -12008,28 +12057,28 @@ fn settings_choice_copy(ns: &str, key: &str, value: &str) -> Option<&'static str
 /// 命名空间的显示名（dsh 自己的 schema 没有 title，这里补一张小表）。
 fn settings_ns_title(ns: &str) -> &'static str {
     match ns {
-        "ui-settings-general" => "General",
-        "ui-settings" => "Settings panel",
-        "ui-conversation" => "Composer",
-        "locale" => "Language",
-        "ui-theme" => "Theme",
-        "ui-chat" => "Transcript",
-        "llm-deepseek" => "DeepSeek API",
-        "llm-deepseek-account" => "DeepSeek account limits",
-        "agent-default-model" => "Advanced model options",
-        "subagent-model-selection-settings" => "Subagent models",
-        "llm-pi-ai" => "Other providers",
-        "agent-loop" => "Agent loop",
-        "subagent" => "Subagents",
-        "permission" => "Permissions",
-        "agent-preset-registry" => "Agent presets",
-        "bash-sandbox" => "Shell sandbox",
-        "web" => "Web tools",
-        "web-search-deepseek" => "Web search",
-        "web-deepseek-api" => "DeepSeek web API",
-        "session-log-deepseek" => "Session log",
-        "ui-settings-account" => "Account onboarding",
-        _ => "Settings",
+        "ui-settings-general" => tr("General"),
+        "ui-settings" => tr("Settings panel"),
+        "ui-conversation" => tr("Composer"),
+        "locale" => tr("Language"),
+        "ui-theme" => tr("Theme"),
+        "ui-chat" => tr("Transcript"),
+        "llm-deepseek" => tr("DeepSeek API"),
+        "llm-deepseek-account" => tr("DeepSeek account limits"),
+        "agent-default-model" => tr("Advanced model options"),
+        "subagent-model-selection-settings" => tr("Subagent models"),
+        "llm-pi-ai" => tr("Other providers"),
+        "agent-loop" => tr("Agent loop"),
+        "subagent" => tr("Subagents"),
+        "permission" => tr("Permissions"),
+        "agent-preset-registry" => tr("Agent presets"),
+        "bash-sandbox" => tr("Shell sandbox"),
+        "web" => tr("Web tools"),
+        "web-search-deepseek" => tr("Web search"),
+        "web-deepseek-api" => tr("DeepSeek web API"),
+        "session-log-deepseek" => tr("Session log"),
+        "ui-settings-account" => tr("Account onboarding"),
+        _ => tr("Settings"),
     }
 }
 
@@ -12086,8 +12135,8 @@ fn credential_ref_of(schema: &Value, value: &Value) -> Option<String> {
 /// 复杂值只显示个摘要（数组/对象不在这里编辑）。
 fn other_preview(value: &Value) -> String {
     match value {
-        Value::Array(items) => format!("[{} items]", items.len()),
-        Value::Object(map) => format!("{{{} fields}}", map.len()),
+        Value::Array(items) => format!("[{} {}]", items.len(), tr("items")),
+        Value::Object(map) => format!("{{{} {}}}", map.len(), tr("fields")),
         other => other.to_string(),
     }
 }
@@ -12145,14 +12194,17 @@ fn section_header(title: &str, sub: &str) -> AnyElement {
         .into_any_element()
 }
 
-/// LocalizedText：字符串或 {en: …, zh: …}。优先中文，其次 en，其次任意。
+/// LocalizedText：字符串或 {en: …, zh: …}。按当前 UI 语言优先，
+/// 其次另一种语言，最后任意一种。
 fn localized_text(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => Some(text.clone()),
         Value::Object(map) => {
+            let preferred = if i18n::is_zh() { "zh" } else { "en" };
+            let other = if i18n::is_zh() { "en" } else { "zh" };
             let pick = map
-                .get("zh")
-                .or_else(|| map.get("en"))
+                .get(preferred)
+                .or_else(|| map.get(other))
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
             pick.or_else(|| {
@@ -12679,17 +12731,17 @@ fn git_panel_element(
 
     let mut list: Vec<AnyElement> = Vec::new();
     if !repo {
-        list.push(git_hint("not a git repository"));
+        list.push(git_hint(tr("not a git repository")));
     } else if changes.is_empty() {
-        list.push(git_hint("working tree clean"));
+        list.push(git_hint(tr("working tree clean")));
     } else {
         if !staged.is_empty() {
             list.push(git_section_head(
                 "git-check-staged",
-                "Staged",
+                tr("Staged"),
                 staged.len(),
                 "git-unstage-all",
-                "Unstage",
+                tr("Unstage"),
                 cx,
                 |this, _, cx| {
                     this.run_git(&["reset"]);
@@ -12707,10 +12759,10 @@ fn git_panel_element(
         if !unstaged.is_empty() {
             list.push(git_section_head(
                 "git-check-unstaged",
-                "Unstaged",
+                tr("Unstaged"),
                 unstaged.len(),
                 "git-stage-all",
-                "Stage all",
+                tr("Stage all"),
                 cx,
                 |this, _, cx| {
                     this.run_git(&["add", "-A"]);
@@ -12748,7 +12800,7 @@ fn git_panel_element(
                     div()
                         .text_sm()
                         .text_color(rgb(0xe8ecf4))
-                        .child("Working tree"),
+                        .child(tr("Working tree")),
                 )
                 .child(div().flex_1())
                 .child(
@@ -12799,7 +12851,7 @@ fn git_panel_element(
                 .pb(px(8.))
                 .border_t_1()
                 .border_color(rgb(0x23272f))
-                .child(div().text_xs().text_color(rgb(0x8b93a7)).child("Summary"))
+                .child(div().text_xs().text_color(rgb(0x8b93a7)).child(tr("Summary")))
                 .child(
                     div()
                         .mt(px(4.))
@@ -12828,7 +12880,7 @@ fn git_panel_element(
                                 .text_xs()
                                 .text_color(rgb(0x8eb4ff))
                                 .cursor_pointer()
-                                .child("✦  Write it")
+                                .child(tr("✦  Write it"))
                                 .on_click(cx.listener(|this, _ev, win, cx| {
                                     this.submit_git_commit(win, cx);
                                 })),
@@ -12839,7 +12891,7 @@ fn git_panel_element(
                                 .text_xs()
                                 .text_color(rgb(if amend { 0xd4a054 } else { 0x8b93a7 }))
                                 .cursor_pointer()
-                                .child("Amend")
+                                .child(tr("Amend"))
                                 .on_click(cx.listener(|this, _ev, _win, cx| {
                                     this.git_amend = !this.git_amend;
                                     cx.notify();
@@ -12861,7 +12913,7 @@ fn git_panel_element(
                         .text_color(rgb(0xe8ecf4))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(0x343b4a)))
-                        .child("Generate message")
+                        .child(tr("Generate message"))
                         .on_click(cx.listener(|this, _ev, win, cx| {
                             this.draft_git_message(win, cx);
                         })),
@@ -12979,7 +13031,7 @@ fn git_mix_line(untracked: usize, modified: usize, added: u32, deleted: u32) -> 
                 div()
                     .text_xs()
                     .text_color(rgb(0x3dcc8e))
-                    .child(SharedString::from(format!("{untracked} untracked"))),
+                    .child(SharedString::from(format!("{untracked} {}", tr("untracked")))),
             )
         } else {
             None
@@ -13000,7 +13052,7 @@ fn git_mix_line(untracked: usize, modified: usize, added: u32, deleted: u32) -> 
                 div()
                     .text_xs()
                     .text_color(rgb(0xd4a054))
-                    .child(SharedString::from(format!("{modified} modified"))),
+                    .child(SharedString::from(format!("{modified} {}", tr("modified")))),
             )
         } else {
             None
@@ -13115,7 +13167,7 @@ fn files_sidebar_element(
                 .py(px(8.))
                 .text_xs()
                 .text_color(rgb(0x5a6070))
-                .child("(empty)")
+                .child(tr("(empty)"))
                 .into_any_element(),
         );
     }
@@ -13405,7 +13457,7 @@ fn files_sidebar_element(
                     .text_xs()
                     .text_color(rgb(0x8b93a7))
                     .child(SharedString::from(if branch.is_empty() {
-                        "not a git repository".to_string()
+                        tr("not a git repository").to_string()
                     } else {
                         branch.to_string()
                     })),
@@ -13489,19 +13541,19 @@ fn files_more_menu(cx: &mut Context<Root>) -> AnyElement {
         .border_1()
         .border_color(rgb(0x2c3340))
         .shadow_lg()
-        .child(row("files-new-file", "New file").on_click(cx.listener(|this, _ev, win, cx| {
+        .child(row("files-new-file", tr("New file")).on_click(cx.listener(|this, _ev, win, cx| {
             cx.stop_propagation();
             this.files_menu = false;
             let dir = this.file_op_dir();
             this.begin_rename(RenameTarget::NewFile(dir), win, cx);
         })))
-        .child(row("files-new-dir", "New folder").on_click(cx.listener(|this, _ev, win, cx| {
+        .child(row("files-new-dir", tr("New folder")).on_click(cx.listener(|this, _ev, win, cx| {
             cx.stop_propagation();
             this.files_menu = false;
             let dir = this.file_op_dir();
             this.begin_rename(RenameTarget::NewDir(dir), win, cx);
         })))
-        .child(row("files-refresh", "Refresh").on_click(cx.listener(|this, _ev, _win, cx| {
+        .child(row("files-refresh", tr("Refresh")).on_click(cx.listener(|this, _ev, _win, cx| {
             cx.stop_propagation();
             this.files_menu = false;
             this.files_cache.clear();
@@ -13543,7 +13595,7 @@ fn media_pane_body(
                 .size_full()
                 .text_xs()
                 .text_color(rgb(0xff5663))
-                .child("Cannot decode image")
+                .child(tr("Cannot decode image"))
                 .into_any_element()
         };
         return div()
@@ -13585,9 +13637,9 @@ fn media_pane_body(
                 .text_xs()
                 .text_color(rgb(0x707786))
                 .child(SharedString::from(match kind {
-                    MediaKind::Video => "Video · system player",
-                    MediaKind::Audio => "Audio · system player",
-                    _ => "Media",
+                    MediaKind::Video => tr("Video · system player"),
+                    MediaKind::Audio => tr("Audio · system player"),
+                    _ => tr("Media"),
                 })),
         )
         .child(
@@ -13601,7 +13653,7 @@ fn media_pane_body(
                 .text_color(rgb(0xe8ecf4))
                 .cursor_pointer()
                 .hover(|style| style.bg(rgb(0x28607d)))
-                .child("Open with system player")
+                .child(tr("Open with system player"))
                 .on_click(move |_ev, _win, _cx| {
                     open_media_external(&open_path);
                 }),
@@ -13822,7 +13874,7 @@ fn pane_element(
                                 div()
                                     .text_xs()
                                     .text_color(rgb(0x51637e))
-                                    .child("outline"),
+                                    .child(tr("outline")),
                             )
                             .child(div().flex_1())
                             .child(
@@ -13950,7 +14002,7 @@ fn pane_element(
                                 div()
                                     .text_sm()
                                     .text_color(rgb(0x9ca3b0))
-                                    .child("terminal exited"),
+                                    .child(tr("terminal exited")),
                             )
                             .child(
                                 div()
@@ -13972,7 +14024,7 @@ fn pane_element(
                                             .text_xs()
                                             .text_color(rgb(0x7fb5e8))
                                             .hover(|style| style.bg(rgb(0x1a2a3d)))
-                                            .child("↻ restart")
+                                            .child(tr("↻ restart"))
                                             .on_click(cx.listener(
                                                 move |this, _ev, _win, cx| {
                                                     let cwd = this
@@ -14008,7 +14060,7 @@ fn pane_element(
                                             .text_xs()
                                             .text_color(rgb(0xff8a97))
                                             .hover(|style| style.bg(rgb(0x3a1f24)))
-                                            .child("× close")
+                                            .child(tr("× close"))
                                             .on_click(cx.listener(
                                                 move |this, _ev, win, cx| {
                                                     this.close_pane(pane_id, win, cx);
@@ -14185,7 +14237,7 @@ fn pane_element(
                             .flex()
                             .justify_center()
                             .child(SharedString::from(if total == 0 {
-                                "no hits".to_string()
+                                tr("no hits").to_string()
                             } else {
                                 format!("{index}/{total}")
                             })),
@@ -14336,12 +14388,12 @@ fn block_menu_overlay(
         .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
             cx.stop_propagation();
         })
-        .child(section("split right"));
+        .child(section(tr("split right")));
 
     for (i, (glyph, color, label)) in [
-        ("◆", 0x00b4ff, "chat block"),
-        (">", 0x00d98a, "terminal block"),
-        ("◐", 0xffa657, "browser block"),
+        ("◆", 0x00b4ff, tr("chat block")),
+        (">", 0x00d98a, tr("terminal block")),
+        ("◐", 0xffa657, tr("browser block")),
     ]
     .into_iter()
     .enumerate()
@@ -14364,11 +14416,11 @@ fn block_menu_overlay(
         ));
     }
 
-    menu = menu.child(section("split down"));
+    menu = menu.child(section(tr("split down")));
     for (i, (glyph, color, label)) in [
-        ("◆", 0x00b4ff, "chat block"),
-        (">", 0x00d98a, "terminal block"),
-        ("◐", 0xffa657, "browser block"),
+        ("◆", 0x00b4ff, tr("chat block")),
+        (">", 0x00d98a, tr("terminal block")),
+        ("◐", 0xffa657, tr("browser block")),
     ]
     .into_iter()
     .enumerate()
@@ -14399,7 +14451,7 @@ fn block_menu_overlay(
                     format!("block-menu-format-{pane_id}"),
                     "❏",
                     0x00b4ff,
-                    "format document".to_string(),
+                    tr("format document").to_string(),
                 )
                 .on_click(cx.listener(move |this, _ev, _win, cx| {
                     this.block_menu = None;
@@ -14431,7 +14483,7 @@ fn block_menu_overlay(
                 format!("block-menu-max-{pane_id}"),
                 if is_maximized { "⤡" } else { "⤢" },
                 0x9ca3b0,
-                if is_maximized { "restore block" } else { "maximize block" }.to_string(),
+                if is_maximized { tr("restore block") } else { tr("maximize block") }.to_string(),
             )
             .on_click(cx.listener(move |this, _ev, _win, cx| {
                 this.block_menu = None;
@@ -14446,7 +14498,7 @@ fn block_menu_overlay(
                 format!("block-menu-close-{pane_id}"),
                 "×",
                 0xff5663,
-                "close block".to_string(),
+                tr("close block").to_string(),
             )
             .on_click(cx.listener(move |this, _ev, win, cx| {
                 this.block_menu = None;
@@ -14909,7 +14961,7 @@ fn build_layout(
                 .justify_center()
                 .size_full()
                 .bg(rgb(0x101319))
-                .child(div().text_xs().text_color(rgb(0x5a6070)).child("starting…"))
+                .child(div().text_xs().text_color(rgb(0x5a6070)).child(tr("starting…")))
                 .into_any_element()
         }),
         Layout::Split {
@@ -14998,7 +15050,7 @@ fn block_composer(
     if !focused {
         let hint = {
             let value = input.read(cx).value().trim().to_string();
-            if value.is_empty() { "Ask dsh…".to_string() } else { value }
+            if value.is_empty() { tr("Ask dsh…").to_string() } else { value }
         };
         let focus_input = input.clone();
         return div()
@@ -15081,7 +15133,7 @@ fn block_composer(
                         .flex_row()
                         .items_center()
                         .px(px(6.))
-                        .child(div().text_xs().text_color(rgb(0x5a6070)).child("context"))
+                        .child(div().text_xs().text_color(rgb(0x5a6070)).child(tr("context")))
                         .child(div().flex_1())
                         .child(
                             div()
@@ -15246,7 +15298,7 @@ fn chat_pane_element(
                 .flex()
                 .flex_col()
                 .gap(px(2.))
-                .child(div().text_xs().text_color(rgb(0x707786)).child("you"))
+                .child(div().text_xs().text_color(rgb(0x707786)).child(tr("you")))
                 .child(div().text_sm().text_color(rgb(0xd0d4dc)).child(SharedString::from(text.clone()))),
             TranscriptBlock::Assistant { text, .. } => div()
                 .text_sm()
@@ -15287,7 +15339,7 @@ fn chat_pane_element(
                 .text_xs()
                 .text_color(rgb(0x707786))
                 .child(SharedString::from(text.clone())),
-            TranscriptBlock::Image(_) => div().text_xs().text_color(rgb(0x707786)).child("[image]"),
+            TranscriptBlock::Image(_) => div().text_xs().text_color(rgb(0x707786)).child(tr("[image]")),
         };
         rows.push(el.into_any_element());
     }
@@ -15341,13 +15393,13 @@ fn chat_pane_element(
                             div()
                                 .text_lg()
                                 .text_color(rgb(0x707786))
-                                .child("New session"),
+                                .child(tr("New session")),
                         )
                         .child(
                             div()
                                 .text_sm()
                                 .text_color(rgb(0x5a6070))
-                                .child("Type a message below to get started"),
+                                .child(tr("Type a message below to get started")),
                         )
                         .into_any_element()]
                 } else {
@@ -15446,8 +15498,8 @@ fn split_hover_menu(leaf: u64, dir: SplitDir, cx: &mut Context<Root>) -> AnyElem
                 format!("split-hover-dsh-{leaf}"),
                 "◆",
                 0x00b4ff,
-                "chat block",
-                if dir == SplitDir::Row { "split right" } else { "split down" },
+                tr("chat block"),
+                if dir == SplitDir::Row { tr("split right") } else { tr("split down") },
             )
             .on_click(move |_ev, _win, cx| {
                 let _ = weak_dsh.update(cx, |root, cx| {
@@ -15461,11 +15513,11 @@ fn split_hover_menu(leaf: u64, dir: SplitDir, cx: &mut Context<Root>) -> AnyElem
                 format!("split-hover-term-{leaf}"),
                 ">",
                 0x00d98a,
-                "terminal block",
+                tr("terminal block"),
                 if dir == SplitDir::Row {
-                    "split right"
+                    tr("split right")
                 } else {
-                    "split down"
+                    tr("split down")
                 },
             )
             .on_click(move |_ev, _win, cx| {
@@ -15480,11 +15532,11 @@ fn split_hover_menu(leaf: u64, dir: SplitDir, cx: &mut Context<Root>) -> AnyElem
                 format!("split-hover-browser-{leaf}"),
                 "◐",
                 0xffa657,
-                "browser block",
+                tr("browser block"),
                 if dir == SplitDir::Row {
-                    "split right"
+                    tr("split right")
                 } else {
-                    "split down"
+                    tr("split down")
                 },
             )
             .on_click(move |_ev, _win, cx| {
@@ -15616,7 +15668,7 @@ fn split_button(
                             .text_color(rgb(0x00d98a))
                             .child(">_"),
                     )
-                    .child(div().text_sm().text_color(rgb(0xe8ecf4)).child("terminal"))
+                    .child(div().text_sm().text_color(rgb(0xe8ecf4)).child(tr("terminal")))
                     .child(div().flex_1())
                     .child(div().text_xs().text_color(rgb(0x707786)).child(label))
                     .on_click({
@@ -15685,7 +15737,7 @@ fn app_update_card(
         .border_color(rgb(0x2c3340))
         .text_xs()
         .text_color(if state.busy() { rgb(0x5a6070) } else { rgb(0xb4bccb) })
-        .child(if checking { "Checking…" } else { "Check now" });
+        .child(if checking { tr("Checking…") } else { tr("Check now") });
     if !state.busy() {
         check_button = check_button
             .cursor_pointer()
@@ -15698,10 +15750,10 @@ fn app_update_card(
 
     let status: (String, u32) = match state {
         AppUpdateState::Idle => (format!("OMD {current}"), 0x8b93a7),
-        AppUpdateState::Checking => ("contacting github.com…".to_string(), 0x9ca3b0),
-        AppUpdateState::UpToDate(tag) => (format!("up to date ({tag})"), 0x00d98a),
+        AppUpdateState::Checking => (tr("contacting github.com…").to_string(), 0x9ca3b0),
+        AppUpdateState::UpToDate(tag) => (format!("{} ({tag})", tr("up to date")), 0x00d98a),
         AppUpdateState::Available(release) => (
-            format!("{} is available (running {current})", release.tag),
+            trf("{} is available (running {})", &[release.tag.as_str(), current]),
             0xc9a15a,
         ),
         AppUpdateState::Downloading { received, total } => {
@@ -15770,9 +15822,9 @@ fn app_update_card(
         }
         if let Some(asset) = release.asset.clone() {
             let action = if cfg!(windows) || !asset.installable {
-                "Download"
+                tr("Download")
             } else {
-                "Download & install"
+                tr("Download & install")
             };
             let label = format!("{action} {}", release.tag);
             rows = rows.child(
@@ -15798,7 +15850,7 @@ fn app_update_card(
                 div()
                     .text_xs()
                     .text_color(rgb(0x707786))
-                    .child("this release has no build for this platform yet"),
+                    .child(tr("this release has no build for this platform yet")),
             );
         }
     }
@@ -15872,13 +15924,13 @@ fn app_update_card(
                         div()
                             .text_xs()
                             .text_color(rgb(0xd0d4dc))
-                            .child("Install updates automatically"),
+                            .child(tr("Install updates automatically")),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(rgb(0x707786))
-                            .child("Downloads and installs in the background; restart OMD to apply."),
+                            .child(tr("Downloads and installs in the background; restart OMD to apply.")),
                     ),
             )
             .child(auto_switch),
@@ -15963,8 +16015,8 @@ fn render_block(
                 let id = format!("copy-{:x}", hasher.finish());
                 let code_for_click = code.clone();
                 let label = match block.lang() {
-                    Some(lang) => format!("{lang} · copy"),
-                    None => "copy".to_string(),
+                    Some(lang) => format!("{lang} · {}", tr("copy")),
+                    None => tr("copy").to_string(),
                 };
                 div()
                     .id(SharedString::from(id))
@@ -15995,7 +16047,7 @@ fn render_block(
                         .text_color(rgb(0x51637e))
                         .cursor_pointer()
                         .hover(|style| style.text_color(rgb(0x7fb5e8)).bg(rgb(0x161a21)))
-                        .child("⎇ fork here")
+                        .child(tr("⎇ fork here"))
                         .on_click(cx.listener(move |this, _ev, _win, cx| {
                             this.fork_session(&fork_sid, Some(seq));
                             cx.notify();
@@ -16172,14 +16224,14 @@ fn render_block(
                 );
             let card = if expanded {
                 let mut status_label = if running {
-                    "running".to_string()
+                    tr("running").to_string()
                 } else if is_error {
-                    "error".to_string()
+                    tr("error").to_string()
                 } else {
-                    "done".to_string()
+                    tr("done").to_string()
                 };
                 if let Some(code) = exit_code {
-                    status_label.push_str(&format!(" · exit {code}"));
+                    status_label.push_str(&format!(" · {} {code}", tr("exit")));
                 }
                 if let Some(ms) = duration_ms {
                     let human = if ms >= 1000 {
@@ -16331,7 +16383,7 @@ fn render_question(
                 div()
                     .text_xs()
                     .text_color(rgb(0x9ca3b0))
-                    .child("multi-select")
+                    .child(tr("multi-select"))
                     .into_any_element(),
             );
         }
@@ -16401,7 +16453,7 @@ fn render_question(
             div()
                 .text_sm()
                 .text_color(rgb(0x00b4ff))
-                .child("❓ Needs your input"),
+                .child(tr("❓ Needs your input")),
         )
         .children(body)
         .child(Input::new(input))
@@ -16414,12 +16466,75 @@ fn render_question(
                 .bg(rgb(0x1e4a63))
                 .text_sm()
                 .cursor_pointer()
-                .child("Submit")
+                .child(tr("Submit"))
                 .on_click(cx.listener(|this, _ev, _win, cx| this.submit_question(cx))),
         )
         .into_any_element()
 }
 
+
+impl Root {
+    /// 语言切换后刷新占位文案（InputState 的 placeholder 是创建时捕获的）。
+    fn refresh_placeholders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut entries: Vec<(Entity<InputState>, &'static str)> = vec![
+            (
+                self.input.clone(),
+                tr("Message… Enter to send · Shift+Enter for newline"),
+            ),
+            (self.question_input.clone(), tr("Custom answer (optional)")),
+            (self.model_input.clone(), tr("Search models…")),
+            (self.rename_input.clone(), tr("Name…")),
+            (self.commit_input.clone(), tr("Why this change...")),
+            (self.settings_input.clone(), tr("Value…")),
+            (self.settings_search.clone(), tr("Search settings")),
+            (self.model_id_input.clone(), tr("model id")),
+            (self.model_name_input.clone(), tr("display name")),
+            (self.model_ctx_input.clone(), tr("context window")),
+            (self.model_max_input.clone(), tr("max output tokens")),
+            (self.provider_id_input.clone(), tr("route id")),
+            (self.provider_name_input.clone(), tr("display name")),
+            (
+                self.provider_base_input.clone(),
+                tr("Leave blank to use the default endpoint"),
+            ),
+            (
+                self.provider_models_input.clone(),
+                tr("model ids, comma separated"),
+            ),
+            (
+                self.provider_apikey_input.clone(),
+                tr("paste API key (stored in credentials)"),
+            ),
+            (self.provider_search.clone(), tr("Search providers…")),
+            (self.plugins_input.clone(), tr("Filter plugins…")),
+            (self.market_input.clone(), tr("Search the plugin market…")),
+            (
+                self.plugin_spec_input.clone(),
+                tr("npm name, git URL, path or tarball…"),
+            ),
+            (
+                self.goal_input.clone(),
+                tr("What should this session achieve?"),
+            ),
+            (self.goal_rounds_input.clone(), tr("rounds cap (optional)")),
+            (
+                self.subagent_input.clone(),
+                tr("Message the selected subagent…"),
+            ),
+            (self.schedule_title_input.clone(), tr("Title")),
+            (self.schedule_prompt_input.clone(), tr("Prompt")),
+            (self.palette_input.clone(), tr("Run a command or go to a pane…")),
+        ];
+        for input in &self.block_inputs {
+            entries.push((input.clone(), tr("Message… Enter to send")));
+        }
+        for (entity, text) in entries {
+            entity.update(cx, |state, cx| {
+                state.set_placeholder(text, window, cx);
+            });
+        }
+    }
+}
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -16431,6 +16546,10 @@ impl Render for Root {
             let index = browser::primary().unwrap();
             self.open_browser_pane(index, cx);
             cx.notify();
+        }
+        if self.lang_refresh {
+            self.lang_refresh = false;
+            self.refresh_placeholders(window, cx);
         }
         if let Some(id) = self.focus_pending.take() {
             if let Some(pane) = self.panes.iter().find(|pane| pane.id == id) {
@@ -16628,7 +16747,7 @@ impl Render for Root {
             let term_cmds = self.cmds.clone();
             let term_cwd = space_cwd.clone();
             let label = if space_label.trim().is_empty() {
-                "space".to_string()
+                tr("space").to_string()
             } else {
                 space_label.clone()
             };
@@ -16650,7 +16769,7 @@ impl Render for Root {
                     div()
                         .text_xs()
                         .text_color(rgb(0x5a6070))
-                        .child("no tabs open"),
+                        .child(tr("no tabs open")),
                 )
                 .child(
                     div()
@@ -16674,7 +16793,7 @@ impl Render for Root {
                                 .text_color(rgb(0x7fb5e8))
                                 .cursor_pointer()
                                 .hover(|style| style.bg(rgb(0x16222f)))
-                                .child("◆ dsh tab")
+                                .child(tr("◆ dsh tab"))
                                 .on_click(move |_ev, _win, _cx| {
                                     let _ = dsh_cmds.send_blocking(Cmd::NewSession {
                                         cwd: Some(dsh_cwd.clone()),
@@ -16697,7 +16816,7 @@ impl Render for Root {
                                 .text_color(rgb(0x8b93a7))
                                 .cursor_pointer()
                                 .hover(|style| style.bg(rgb(0x1a212b)))
-                                .child(">_ terminal tab")
+                                .child(tr(">_ terminal tab"))
                                 .on_click(move |_ev, _win, _cx| {
                                     let _ = term_cmds.send_blocking(Cmd::NewTerminal {
                                         pane_id: next_pane_id(),
@@ -16803,7 +16922,7 @@ impl Render for Root {
             .streaming
             .as_ref()
             .filter(|state| state.text.trim().is_empty() && !state.reasoning.trim().is_empty())
-            .map(|_| "thinking…".to_string());
+            .map(|_| tr("thinking…").to_string());
 
         let approval_card = self.approval.clone().map(|(event_id, label)| {
             let cmds_allow = cmds.clone();
@@ -16822,7 +16941,7 @@ impl Render for Root {
                     div()
                         .text_sm()
                         .text_color(rgb(0xc9a15a))
-                        .child("⚠ Approval required"),
+                        .child(tr("⚠ Approval required")),
                 )
                 .child(
                     div()
@@ -16840,7 +16959,7 @@ impl Render for Root {
                             .bg(rgb(0x14402c))
                             .text_sm()
                             .cursor_pointer()
-                            .child("Allow")
+                            .child(tr("Allow"))
                             .on_click(move |_ev, _win, _cx| {
                                 let _ = cmds_allow.send_blocking(Cmd::Decide {
                                     event_id: id_allow.clone(),
@@ -16857,7 +16976,7 @@ impl Render for Root {
                             .bg(rgb(0x3a1f24))
                             .text_sm()
                             .cursor_pointer()
-                            .child("Deny")
+                            .child(tr("Deny"))
                             .on_click(move |_ev, _win, _cx| {
                                 let _ = cmds_reject.send_blocking(Cmd::Decide {
                                     event_id: id_reject.clone(),
@@ -16870,14 +16989,14 @@ impl Render for Root {
                     div()
                         .text_xs()
                         .text_color(rgb(0x8a7a55))
-                        .child("引擎按单次审批裁决；要减少审批，切换权限预设 →"),
+                        .child(tr("The engine decides each approval on its own; switch the permission preset to reduce them →")),
                 )
                 .child(
                     div().flex().flex_row().gap(px(8.)).children(
                         [
-                            ("always: read-only", "read-only"),
-                            ("always: workspace-write", "workspace-write"),
-                            ("always: danger-full-access", "danger-full-access"),
+                            (tr("always: read-only"), "read-only"),
+                            (tr("always: workspace-write"), "workspace-write"),
+                            (tr("always: danger-full-access"), "danger-full-access"),
                         ]
                         .into_iter()
                         .map(|(label, preset)| {
@@ -16945,9 +17064,9 @@ impl Render for Root {
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(0x1b1e26)))
                         .child(if self.history_loading {
-                            "loading…"
+                            tr("loading…")
                         } else {
-                            "load older messages"
+                            tr("load older messages")
                         })
                         .on_click(cx.listener(|this, _ev, _win, cx| {
                             this.load_older_messages(cx);
@@ -17006,11 +17125,11 @@ impl Render for Root {
                                 .text_lg()
                                 .text_color(rgb(0x707786))
                                 .child(if self.selected.is_some() {
-                                    "New session"
+                                    tr("New session")
                                 } else if space_id.is_some() {
-                                    "No panel open in this session"
+                                    tr("No panel open in this session")
                                 } else {
-                                    "No session"
+                                    tr("No session")
                                 }),
                         )
                         .child(
@@ -17018,11 +17137,11 @@ impl Render for Root {
                                 .text_sm()
                                 .text_color(rgb(0x5a6070))
                                 .child(if self.selected.is_some() {
-                                    "Type a message below to get started"
+                                    tr("Type a message below to get started")
                                 } else if space_id.is_some() {
-                                    "Ctrl+K to pick a panel, or ＋ to create one"
+                                    tr("Ctrl+K to pick a panel, or ＋ to create one")
                                 } else {
-                                    "Click ＋ to create a panel"
+                                    tr("Click ＋ to create a panel")
                                 }),
                         ),
                 )
@@ -17083,7 +17202,7 @@ impl Render for Root {
                             .flex_row()
                             .items_center()
                             .px(px(6.))
-                            .child(div().text_xs().text_color(rgb(0x5a6070)).child("context"))
+                            .child(div().text_xs().text_color(rgb(0x5a6070)).child(tr("context")))
                             .child(div().flex_1())
                             .children(if context_label.is_empty() {
                                 None
@@ -17407,7 +17526,7 @@ impl Render for Root {
             let hint = {
                 let value = self.input.read(cx).value().trim().to_string();
                 if value.is_empty() {
-                    "Ask dsh…".to_string()
+                    tr("Ask dsh…").to_string()
                 } else {
                     value
                 }
@@ -17522,7 +17641,7 @@ impl Render for Root {
 
         // size_full 而不是 flex_1：外层 split 的子容器不是 flex，
         // flex_1 在里面不生效，高度会塌成内容高度（正文只画几行）。
-        // goal 横幅：有 goal 显示目标/阶段/轮次 + 操作；没有就给一个 "＋ goal"
+        // goal 横幅：有 goal 显示目标/阶段/轮次 + 操作；没有就给一个 tr("＋ goal")
         let goal_banner: AnyElement = {
             let goal = self.goal_doc.clone();
             let objective = goal
@@ -17557,7 +17676,7 @@ impl Render for Root {
                     .bg(rgb(0x151a23))
                     .border_1()
                     .border_color(rgb(0x2f6fb5))
-                    .child(div().text_xs().text_color(rgb(0x7fb5e8)).child("goal"))
+                    .child(div().text_xs().text_color(rgb(0x7fb5e8)).child(tr("goal")))
                     .child(
                         div()
                             .flex_1()
@@ -17590,7 +17709,7 @@ impl Render for Root {
                             .text_color(rgb(0x9ca3b0))
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(0x20232b)))
-                            .child("Cancel")
+                            .child(tr("Cancel"))
                             .on_click(cx.listener(|this, _ev, win, cx| {
                                 this.goal_editing = false;
                                 this.input.read(cx).focus_handle(cx).focus(win, cx);
@@ -17609,7 +17728,7 @@ impl Render for Root {
                             .text_color(rgb(0x7fb5e8))
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(0x16222f)))
-                            .child("Save")
+                            .child(tr("Save"))
                             .on_click(cx.listener(move |this, _ev, win, cx| {
                                 this.commit_goal_edit(cx);
                                 this.input.read(cx).focus_handle(cx).focus(win, cx);
@@ -17637,7 +17756,7 @@ impl Render for Root {
                             .text_color(rgb(0x6b7386))
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(0x1b1e26)).text_color(rgb(0xc9d1de)))
-                            .child("◎ goal")
+                            .child(tr("◎ goal"))
                             .on_click(cx.listener(|this, _ev, win, cx| {
                                 this.open_goal_edit(win, cx);
                             })),
@@ -17851,7 +17970,7 @@ impl Render for Root {
                     div()
                         .text_xs()
                         .text_color(rgb(0x9ca3b0))
-                        .child("Loading settings…")
+                        .child(tr("Loading settings…"))
                         .into_any_element(),
                 );
             } else if let Some(err) = self.settings_error.clone() {
@@ -17915,7 +18034,7 @@ impl Render for Root {
                                 } else {
                                     rgb(0x6b7386)
                                 })
-                                .child(if configured { "••••••••" } else { "Not set" }),
+                                .child(if configured { "••••••••" } else { tr("Not set") }),
                         )
                         .on_click(move |_ev, win, cx| {
                             if !writable || ref_click.is_empty() {
@@ -17945,7 +18064,7 @@ impl Render for Root {
                             .text_color(rgb(0x8b93a7))
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(0x1a212b)))
-                            .child("Clear")
+                            .child(tr("Clear"))
                             .on_click(move |_ev, _win, cx| {
                                 let _ = weak_clear.update(cx, |root, cx| {
                                     root.unset_credential(ref_clear.clone());
@@ -18033,7 +18152,7 @@ impl Render for Root {
                     });
                     let (title, description) = match settings_field_copy(&ns, key) {
                         Some((title, description)) => (title.to_string(), description.to_string()),
-                        None => (humanize_key(key), format!("{ns}.{key}")),
+                        None => (trs(&humanize_key(key)), format!("{ns}.{key}")),
                     };
                     if !query.is_empty() {
                         let hay = format!(
@@ -18053,7 +18172,13 @@ impl Render for Root {
                         .settings_edit
                         .as_ref()
                         .is_some_and(|(e_ns, e_path, _, _)| e_ns == &ns && e_path == &path);
-                    let kind = field_kind(&schema, key);
+                    // locale.preference 的 schema 只是一个字符串 pattern，但语言
+                    // 只有两个内置值，搜索/通用卡片里也按单选渲染。
+                    let kind = if ns == "locale" && key == "preference" {
+                        FieldKind::Choice(vec!["en".to_string(), "zh".to_string()])
+                    } else {
+                        field_kind(&schema, key)
+                    };
                     let control: AnyElement = if editing_this {
                         div()
                             .w(px(240.))
@@ -18080,7 +18205,7 @@ impl Render for Root {
                                     let active = current == opt;
                                     let label = settings_choice_copy(&ns, key, &opt)
                                         .map(str::to_string)
-                                        .unwrap_or_else(|| humanize_choice(&opt));
+                                        .unwrap_or_else(|| trs(&humanize_choice(&opt)));
                                     let ns_arg = ns.clone();
                                     let path_arg = path.clone();
                                     let opt_arg = opt.clone();
@@ -18210,7 +18335,7 @@ impl Render for Root {
                                         } else {
                                             rgb(0x8b93a7)
                                         })
-                                        .child(if set { "Set" } else { "Not set" })
+                                        .child(if set { tr("Set") } else { tr("Not set") })
                                         .into_any_element()
                                 } else {
                                     let shown: String =
@@ -18366,15 +18491,13 @@ impl Render for Root {
                                         div()
                                             .text_sm()
                                             .text_color(rgb(0xe8ecf4))
-                                            .child("API key"),
+                                            .child(tr("API key")),
                                     )
                                     .child(
                                         div()
                                             .text_xs()
                                             .text_color(rgb(0x6b7386))
-                                            .child(SharedString::from(format!(
-                                                "credentials · {reference}"
-                                            ))),
+                                            .child(SharedString::from(trf("credentials · {}", &[&reference]))),
                                     ),
                             )
                             .child(div().flex_shrink_0().child(control))
@@ -18462,7 +18585,7 @@ impl Render for Root {
                         div()
                             .text_xs()
                             .text_color(rgb(0x707786))
-                            .child("No plugins reported")
+                            .child(tr("No plugins reported"))
                             .into_any_element(),
                     );
                 }
@@ -18586,15 +18709,13 @@ impl Render for Root {
                         div()
                             .text_xs()
                             .text_color(rgb(0x5a6070))
-                            .child(SharedString::from(format!(
-                                "{shown_count} of {total} plugins"
-                            )))
+                            .child(SharedString::from(trf("{} of {} plugins", &[&shown_count.to_string(), &total.to_string()])))
                             .into_any_element(),
                     );
                 }
 
                 // ---- Bundles：可安装/已安装的包（pluginManager/listBundles）----
-                plugins_rows.push(section_header("Bundles", "packages managed by the engine"));
+                plugins_rows.push(section_header(tr("Bundles"), tr("packages managed by the engine")));
                 // 手动按 spec 安装：输入 → inspect → 确认安装
                 plugins_rows.push({
                     let inspect_spec = Value::Null; // 占位，下面按输入框读
@@ -18634,7 +18755,7 @@ impl Render for Root {
                                 .text_color(rgb(0x7fb5e8))
                                 .cursor_pointer()
                                 .hover(|style| style.bg(rgb(0x16222f)))
-                                .child("Inspect")
+                                .child(tr("Inspect"))
                                 .on_click(cx.listener(|this, _ev, _win, cx| {
                                     let spec = this
                                         .plugin_spec_input
@@ -18724,7 +18845,7 @@ impl Render for Root {
                                             .text_color(rgb(0x6b7386))
                                             .child(SharedString::from(format!(
                                                 "{kind}{}{}",
-                                                if is_bundle == Some(true) { " · bundle" } else if is_bundle == Some(false) { " · not a bundle" } else { "" },
+                                                if is_bundle == Some(true) { tr(" · bundle") } else if is_bundle == Some(false) { tr(" · not a bundle") } else { "" },
                                                 if description.is_empty() { String::new() } else { format!(" · {description}") }
                                             ))),
                                     ),
@@ -18739,7 +18860,7 @@ impl Render for Root {
                                     .text_color(rgb(0x9ca3b0))
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(0x20232b)))
-                                    .child("Cancel")
+                                    .child(tr("Cancel"))
                                     .on_click(cx.listener(|this, _ev, _win, cx| {
                                         this.inspect_pending = None;
                                         cx.notify();
@@ -18757,7 +18878,7 @@ impl Render for Root {
                                     .text_color(rgb(0x7fb5e8))
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(0x16222f)))
-                                    .child("Install")
+                                    .child(tr("Install"))
                                     .on_click(cx.listener(move |this, _ev, _win, cx| {
                                         this.inspect_pending = None;
                                         let install_spec = spec.clone();
@@ -18778,7 +18899,7 @@ impl Render for Root {
                         div()
                             .text_xs()
                             .text_color(rgb(0x707786))
-                            .child("No bundles reported")
+                            .child(tr("No bundles reported"))
                             .into_any_element(),
                     );
                 }
@@ -18819,7 +18940,7 @@ impl Render for Root {
                                 .any(|entry| entry.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
                         });
                     let badge = if installed {
-                        if official { "official · installed" } else { "installed" }
+                        if official { tr("official · installed") } else { tr("installed") }
                     } else if official {
                         "official"
                     } else {
@@ -18900,7 +19021,7 @@ impl Render for Root {
                                     .text_color(rgb(0xff8a97))
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(0x2a1b20)))
-                                    .child("Remove")
+                                    .child(tr("Remove"))
                                     .on_click(cx.listener(move |this, _ev, _win, cx| {
                                         let _ = this.cmds.send_blocking(Cmd::Call {
                                             tag: "plugins/remove".to_string(),
@@ -18924,7 +19045,7 @@ impl Render for Root {
                                     .text_color(rgb(0x7fb5e8))
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(0x16222f)))
-                                    .child("Install")
+                                    .child(tr("Install"))
                                     .on_click(cx.listener(move |this, _ev, _win, cx| {
                                         this.start_install(&install_name, &spec, None, None);
                                         cx.notify();
@@ -18938,7 +19059,7 @@ impl Render for Root {
                 }
 
                 // ---- Market：市场索引 + 搜索（pluginMarket/*）----
-                plugins_rows.push(section_header("Market", "community plugin index"));
+                plugins_rows.push(section_header(tr("Market"), tr("community plugin index")));
                 if !self.market_indexes.is_empty() {
                     let index_title = self
                         .market_url
@@ -19028,7 +19149,7 @@ impl Render for Root {
                             div()
                                 .text_xs()
                                 .text_color(rgb(0x707786))
-                                .child("No market index configured")
+                                .child(tr("No market index configured"))
                                 .into_any_element(),
                         );
                     }
@@ -19037,7 +19158,7 @@ impl Render for Root {
                         div()
                             .text_xs()
                             .text_color(rgb(0x707786))
-                            .child("No plugins matched")
+                            .child(tr("No plugins matched"))
                             .into_any_element(),
                     );
                 }
@@ -19074,8 +19195,8 @@ impl Render for Root {
                     // 状态徽章颜色
                     let (badge, badge_color) = match status.as_str() {
                         "installed" => ("installed", 0x3f8f5f),
-                        "update-available" => ("update available", 0xb5812f),
-                        "provided" => ("built in", 0x51637e),
+                        "update-available" => (tr("update available"), 0xb5812f),
+                        "provided" => (tr("built in"), 0x51637e),
                         _ => ("", 0),
                     };
                     let action: AnyElement = if let Some(state) = self.install_state.get(&name) {
@@ -19091,7 +19212,7 @@ impl Render for Root {
                                         div()
                                             .text_xs()
                                             .text_color(rgb(0x7fb5e8))
-                                            .child("installing…"),
+                                            .child(tr("installing…")),
                                     )
                                     .child(
                                         div()
@@ -19107,7 +19228,7 @@ impl Render for Root {
                                             .text_color(rgb(0xff8a97))
                                             .cursor_pointer()
                                             .hover(|style| style.bg(rgb(0x2a1b20)))
-                                            .child("Cancel")
+                                            .child(tr("Cancel"))
                                             .on_click(cx.listener(
                                                 move |this, _ev, _win, cx| {
                                                     let _ = this.cmds.send_blocking(
@@ -19145,10 +19266,7 @@ impl Render for Root {
                                         div()
                                             .text_xs()
                                             .text_color(rgb(0xb5812f))
-                                            .child(SharedString::from(format!(
-                                                "build scripts: {}",
-                                                builds.join(", ")
-                                            ))),
+                                            .child(SharedString::from(trf("build scripts: {}", &[&builds.join(", ")]))),
                                     )
                                     .child(
                                         div()
@@ -19164,7 +19282,7 @@ impl Render for Root {
                                             .text_color(rgb(0xd9a441))
                                             .cursor_pointer()
                                             .hover(|style| style.bg(rgb(0x2a2216)))
-                                            .child("Allow & install")
+                                            .child(tr("Allow & install"))
                                             .on_click(cx.listener(
                                                 move |this, _ev, _win, cx| {
                                                     this.start_install(
@@ -19194,7 +19312,7 @@ impl Render for Root {
                             .text_color(rgb(0xd9a441))
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(0x2a2216)))
-                            .child("Update")
+                            .child(tr("Update"))
                             .on_click(cx.listener(move |this, _ev, _win, cx| {
                                 this.start_install(&install_name, &spec, registry.clone(), None);
                                 cx.notify();
@@ -19214,7 +19332,7 @@ impl Render for Root {
                             .text_color(rgb(0x7fb5e8))
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(0x16222f)))
-                            .child("Install")
+                            .child(tr("Install"))
                             .on_click(cx.listener(move |this, _ev, _win, cx| {
                                 this.start_install(&install_name, &spec, registry.clone(), None);
                                 cx.notify();
@@ -19270,9 +19388,7 @@ impl Render for Root {
                                                     div()
                                                         .text_xs()
                                                         .text_color(rgb(0x51637e))
-                                                        .child(SharedString::from(format!(
-                                                            "by {author}"
-                                                        ))),
+                                                        .child(SharedString::from(trf("by {}", &[&author.to_string()]))),
                                                 )
                                             }),
                                     )
@@ -19319,10 +19435,7 @@ impl Render for Root {
                             .text_xs()
                             .text_color(rgb(0x5a6070))
                             .py(px(6.))
-                            .child(SharedString::from(format!(
-                                "{} plugin(s) in this index",
-                                total_market
-                            )))
+                            .child(SharedString::from(trf("{} plugin(s) in this index", &[&total_market.to_string()])))
                             .into_any_element(),
                     );
                 }
@@ -19344,9 +19457,9 @@ impl Render for Root {
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(0x1b1e26)))
                             .child(if self.market_loading {
-                                "loading…"
+                                tr("loading…")
                             } else {
-                                "load more"
+                                tr("load more")
                             })
                             .on_click(cx.listener(move |this, _ev, _win, cx| {
                                 this.market_search_page(
@@ -19433,7 +19546,7 @@ impl Render for Root {
                                         div()
                                             .text_sm()
                                             .text_color(rgb(0xeef2f8))
-                                            .child("DeepSeek account"),
+                                            .child(tr("DeepSeek account")),
                                     )
                                     .child(
                                         div()
@@ -19460,7 +19573,7 @@ impl Render for Root {
                                                     } else {
                                                         rgb(0x8b93a7)
                                                     })
-                                                    .child(if signed_in { "Signed in" } else { "Not signed in" }),
+                                                    .child(if signed_in { tr("Signed in") } else { tr("Not signed in") }),
                                             ),
                                     ),
                             )
@@ -19508,7 +19621,7 @@ impl Render for Root {
                                         rgb(0x8b93a7)
                                     })
                                     .cursor_pointer()
-                                    .child("Third-party providers")
+                                    .child(tr("Third-party providers"))
                                     .on_click(cx.listener(|this, _ev, _win, cx| {
                                         this.provider_add_tab = 0;
                                         cx.notify();
@@ -19532,7 +19645,7 @@ impl Render for Root {
                                         rgb(0x8b93a7)
                                     })
                                     .cursor_pointer()
-                                    .child("Custom model API")
+                                    .child(tr("Custom model API"))
                                     .on_click(cx.listener(|this, _ev, _win, cx| {
                                         this.provider_add_tab = 1;
                                         cx.notify();
@@ -19547,7 +19660,7 @@ impl Render for Root {
                                 .text_color(rgb(0x8b93a7))
                                 .mb(px(8.))
                                 .child(
-                                    "Pick a provider from the built-in catalog and enter its API key.",
+                                    tr("Pick a provider from the built-in catalog and enter its API key."),
                                 )
                                 .into_any_element(),
                         );
@@ -19597,7 +19710,7 @@ impl Render for Root {
                                     div()
                                         .text_xs()
                                         .text_color(rgb(0x8b93a7))
-                                        .child("Enter a route id, base URL and model list for any compatible endpoint."),
+                                        .child(tr("Enter a route id, base URL and model list for any compatible endpoint.")),
                                 )
                                 .child(
                                     div()
@@ -19609,7 +19722,7 @@ impl Render for Root {
                                         .text_xs()
                                         .text_color(rgb(0xffffff))
                                         .cursor_pointer()
-                                        .child("New custom provider")
+                                        .child(tr("New custom provider"))
                                         .on_click(cx.listener(|this, _ev, win, cx| {
                                             this.open_provider_draft(None, win, cx);
                                         })),
@@ -19637,13 +19750,13 @@ impl Render for Root {
                                 div()
                                     .text_sm()
                                     .text_color(rgb(0xe8ecf4))
-                                    .child("DeepSeek API key"),
+                                    .child(tr("DeepSeek API key")),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(rgb(0x8b93a7))
-                                    .child("Stored as DEEPSEEK_API_KEY"),
+                                    .child(tr("Stored as DEEPSEEK_API_KEY")),
                             )
                             .child(
                                 div()
@@ -19676,7 +19789,7 @@ impl Render for Root {
                                             .text_xs()
                                             .text_color(rgb(0xffffff))
                                             .cursor_pointer()
-                                            .child("Save")
+                                            .child(tr("Save"))
                                             .on_click(cx.listener(|this, _ev, _win, cx| {
                                                 this.save_provider_draft(cx);
                                             })),
@@ -19691,7 +19804,7 @@ impl Render for Root {
                                             .text_xs()
                                             .text_color(rgb(0x8b93a7))
                                             .cursor_pointer()
-                                            .child("Cancel")
+                                            .child(tr("Cancel"))
                                             .on_click(cx.listener(|this, _ev, _win, cx| {
                                                 this.provider_draft = None;
                                                 cx.notify();
@@ -19716,11 +19829,11 @@ impl Render for Root {
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
                     let title = if route_now.is_empty() {
-                        if editing { "Edit provider".to_string() } else { "Add provider".to_string() }
+                        if editing { tr("Edit provider").to_string() } else { tr("Add provider").to_string() }
                     } else if editing {
-                        format!("Edit provider · {route_now}")
+                        format!("{} · {route_now}", tr("Edit provider"))
                     } else {
-                        format!("Add provider · {route_now}")
+                        format!("{} · {route_now}", tr("Add provider"))
                     };
                     let field = |label: &str, input: &Entity<InputState>| {
                         div().flex().flex_col().gap(px(4.)).flex_1().min_w(px(0.))
@@ -19737,9 +19850,9 @@ impl Render for Root {
                     };
                     let models = if route_now.is_empty() { Vec::new() } else { self.models_at(model_ns, &model_path) };
                     let mut models_col = div().flex().flex_col().gap(px(6.))
-                        .child(div().text_xs().text_color(rgb(0x7d8695)).child("Models"));
+                        .child(div().text_xs().text_color(rgb(0x7d8695)).child(tr("Models")));
                     if route_now.is_empty() {
-                        models_col = models_col.child(div().text_xs().text_color(rgb(0x6b7386)).child("Enter a route id first, then add models"));
+                        models_col = models_col.child(div().text_xs().text_color(rgb(0x6b7386)).child(tr("Enter a route id first, then add models")));
                     }
                     for (index, model) in models.iter().enumerate() {
                         let id = model.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -19754,13 +19867,13 @@ impl Render for Root {
                                     .child(div().text_xs().text_color(rgb(0x6b7386)).child(SharedString::from(id))))
                                 .child(div().id(SharedString::from(format!("prov-m-edit-{index}")))
                                     .px(px(8.)).py(px(3.)).rounded(px(6.)).text_xs().text_color(rgb(0x8b93a7))
-                                    .cursor_pointer().hover(|s| s.bg(rgb(0x1a212b))).child("Edit")
+                                    .cursor_pointer().hover(|s| s.bg(rgb(0x1a212b))).child(tr("Edit"))
                                     .on_click(cx.listener(move |this, _ev, win, cx| {
                                         this.open_model_draft_at(model_ns, path_edit.clone(), Some(index), win, cx);
                                     })))
                                 .child(div().id(SharedString::from(format!("prov-m-del-{index}")))
                                     .px(px(8.)).py(px(3.)).rounded(px(6.)).text_xs().text_color(rgb(0x8b93a7))
-                                    .cursor_pointer().hover(|s| s.bg(rgb(0x3a1f24))).child("Remove")
+                                    .cursor_pointer().hover(|s| s.bg(rgb(0x3a1f24))).child(tr("Remove"))
                                     .on_click(cx.listener(move |this, _ev, _win, cx| {
                                         this.remove_model_at(model_ns, path_remove.clone(), index);
                                         cx.notify();
@@ -19772,7 +19885,7 @@ impl Render for Root {
                     models_col = models_col.child(
                         div().id("prov-model-add").px(px(10.)).py(px(5.)).rounded(px(6.)).bg(rgb(0x1a1f29))
                             .text_xs().text_color(rgb(0xb4bccb)).cursor_pointer().hover(|s| s.bg(rgb(0x252c39)))
-                            .child("+ Add model")
+                            .child(tr("+ Add model"))
                             .on_click(cx.listener(move |this, _ev, win, cx| {
                                 if route_add.is_empty() { return; }
                                 this.open_model_draft_at(model_ns, path_add.clone(), None, win, cx);
@@ -19780,20 +19893,20 @@ impl Render for Root {
                     );
                     let mut custom = div().flex().flex_col().gap(px(10.))
                         .child(div().flex().flex_row().gap(px(10.))
-                            .child(field("Route id", &self.provider_id_input))
-                            .child(field("Display name", &self.provider_name_input)))
+                            .child(field(tr("Route id"), &self.provider_id_input))
+                            .child(field(tr("Display name"), &self.provider_name_input)))
                         .child(div().flex().flex_row().gap(px(10.))
-                            .child(field("Base URL", &self.provider_base_input))
-                            .child(field("Key env", &self.provider_keyenv_input)))
+                            .child(field(tr("Base URL"), &self.provider_base_input))
+                            .child(field(tr("Key env"), &self.provider_keyenv_input)))
                         .child(models_col)
                         .child({
                             let mut protocols = div().flex().flex_col().gap(px(6.))
-                                .child(div().text_xs().text_color(rgb(0x7d8695)).child("Protocol"))
+                                .child(div().text_xs().text_color(rgb(0x7d8695)).child(tr("Protocol")))
                                 .child(div().flex().flex_row().gap(px(6.)));
                             for (value, label) in [
-                                ("openai-completions", "OpenAI Completions"),
-                                ("openai-responses", "OpenAI Responses"),
-                                ("anthropic-messages", "Anthropic Messages"),
+                                ("openai-completions", tr("OpenAI Completions")),
+                                ("openai-responses", tr("OpenAI Responses")),
+                                ("anthropic-messages", tr("Anthropic Messages")),
                             ] {
                                 let active = self.provider_api == value;
                                 let value_owned = value.to_string();
@@ -19818,9 +19931,9 @@ impl Render for Root {
                             .child(div().flex().flex_col().gap(px(4.))
                                 .child(div().text_xs().text_color(rgb(0x7d8695))
                                     .child(SharedString::from(if env_now.is_empty() {
-                                        "API key".to_string()
+                                        tr("API key").to_string()
                                     } else {
-                                        format!("API key (env {env_now})")
+                                        trf("API key (env {})", &[env_now.as_str()])
                                     })))
                                 .child(div().px(px(8.)).py(px(5.)).rounded(px(8.)).bg(rgb(0x0f131b))
                                     .border_1().border_color(rgb(0x252b38))
@@ -19828,13 +19941,11 @@ impl Render for Root {
                                         .bordered(false).appearance(false).focus_bordered(false).text_sm()))
                                 .children((!env_now.is_empty() && !key_set).then(|| {
                                     div().text_xs().text_color(rgb(0xc9a15a))
-                                        .child(SharedString::from(format!(
-                                            "Env var not detected. Enter an API key, or configure {env_now} in your env."
-                                        )))
+                                        .child(SharedString::from(trf("Env var not detected. Enter an API key, or configure {} in your env.", &[&env_now])))
                                 })))
                             .child(div().id("provider-custom-toggle").flex().flex_row().items_center().gap(px(6.))
                                 .text_xs().text_color(rgb(0x8b93a7)).cursor_pointer()
-                                .child(if self.customized_open { "▾ 自定义设置" } else { "▸ 自定义设置" })
+                                .child(if self.customized_open { tr("▾ Custom settings") } else { tr("▸ Custom settings") })
                                 .on_click(cx.listener(|this, _ev, _win, cx| {
                                     this.customized_open = !this.customized_open;
                                     cx.notify();
@@ -19843,11 +19954,11 @@ impl Render for Root {
                             .child(div().flex().flex_row().gap(px(8.))
                                 .child(div().id("provider-save").px(px(14.)).py(px(5.)).rounded(px(6.))
                                     .bg(rgb(0x2f6fb5)).text_xs().text_color(rgb(0xffffff)).cursor_pointer()
-                                    .child("Save")
+                                    .child(tr("Save"))
                                     .on_click(cx.listener(|this, _ev, _win, cx| { this.save_provider_draft(cx); })))
                                 .child(div().id("provider-cancel").px(px(14.)).py(px(5.)).rounded(px(6.))
                                     .bg(rgb(0x1a1f29)).text_xs().text_color(rgb(0x8b93a7)).cursor_pointer()
-                                    .child("Cancel")
+                                    .child(tr("Cancel"))
                                     .on_click(cx.listener(|this, _ev, _win, cx| {
                                         this.provider_draft = None;
                                         cx.notify();
@@ -19855,7 +19966,7 @@ impl Render for Root {
                                 .children(editing_route.map(|route| {
                                     div().id("provider-remove").px(px(14.)).py(px(5.)).rounded(px(6.))
                                         .bg(rgb(0x3a1f24)).text_xs().text_color(rgb(0xff8a95)).cursor_pointer()
-                                        .child("Remove")
+                                        .child(tr("Remove"))
                                         .on_click(cx.listener(move |this, _ev, _win, cx| {
                                             this.remove_provider(route.clone());
                                             this.provider_draft = None;
@@ -19888,7 +19999,7 @@ impl Render for Root {
                 specs.push((
                     "deepseek-official".to_string(),
                     "DeepSeek".to_string(),
-                    "llm-deepseek · API key".to_string(),
+                    tr("llm-deepseek · API key").to_string(),
                     deepseek_ok,
                     ProviderKind::Deepseek,
                 ));
@@ -19951,14 +20062,14 @@ impl Render for Root {
                             .map(|items| items.len())
                             .unwrap_or(0);
                         if api.is_empty() {
-                            "configured".to_string()
+                            tr("configured").to_string()
                         } else {
-                            format!("{api} · {model_count} models")
+                            format!("{api} · {model_count} {}", tr("models"))
                         }
                     } else {
                         match &env {
-                            Some(reference) => format!("not configured · {reference}"),
-                            None => "not configured".to_string(),
+                            Some(reference) => format!("{} · {reference}", tr("not configured")),
+                            None => tr("not configured").to_string(),
                         }
                     };
                     let kind = if providers.contains_key(&id) {
@@ -20001,7 +20112,7 @@ impl Render for Root {
                     specs.push((
                         route.clone(),
                         name,
-                        format!("{api} · {base} · {model_count} models"),
+                        format!("{api} · {base} · {model_count} {}", tr("models")),
                         ok,
                         ProviderKind::Route(route.clone()),
                     ));
@@ -20012,7 +20123,7 @@ impl Render for Root {
                         specs.push((
                             preset.route.to_string(),
                             preset.name.to_string(),
-                            "preset · not configured".to_string(),
+                            tr("preset · not configured").to_string(),
                             false,
                             ProviderKind::Available {
                                 name: preset.name.to_string(),
@@ -20051,7 +20162,7 @@ impl Render for Root {
                             .py(px(14.))
                             .text_xs()
                             .text_color(rgb(0x707786))
-                            .child("No providers match")
+                            .child(tr("No providers match"))
                             .into_any_element(),
                     );
                 }
@@ -20115,7 +20226,7 @@ impl Render for Root {
                                         .text_color(rgb(0xd0d4dc))
                                         .cursor_pointer()
                                         .hover(|style| style.bg(rgb(0x252c39)))
-                                        .child("Edit")
+                                        .child(tr("Edit"))
                                         .on_click(cx.listener(|this, _ev, win, cx| {
                                             this.open_provider_draft(
                                                 Some("deepseek-official".to_string()),
@@ -20208,7 +20319,7 @@ impl Render for Root {
                         .text_color(rgb(0x8b93a7))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(0x1a212b)))
-                        .child("Cancel")
+                        .child(tr("Cancel"))
                         .on_click(cx.listener(|this, _ev, _win, cx| {
                             this.adding_provider = false;
                             cx.notify();
@@ -20231,7 +20342,7 @@ impl Render for Root {
                         .text_color(rgb(0xd0d4dc))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(0x1a212b)))
-                        .child("+  Add model provider")
+                        .child(tr("+  Add model provider"))
                         .on_click(cx.listener(|this, _ev, win, cx| {
                             this.adding_provider = true;
                             this.provider_search
@@ -20294,9 +20405,9 @@ impl Render for Root {
                                     .text_sm()
                                     .text_color(rgb(0xe8ecf4))
                                     .child(if editing {
-                                        "Edit model"
+                                        tr("Edit model")
                                     } else {
-                                        "New model"
+                                        tr("New model")
                                     }),
                             )
                             .child(
@@ -20304,10 +20415,10 @@ impl Render for Root {
                                     .flex()
                                     .flex_row()
                                     .gap(px(10.))
-                                    .child(field("ID", &self.model_id_input))
-                                    .child(field("Display name", &self.model_name_input))
-                                    .child(field("Context window", &self.model_ctx_input))
-                                    .child(field("Max output tokens", &self.model_max_input)),
+                                    .child(field(tr("ID"), &self.model_id_input))
+                                    .child(field(tr("Display name"), &self.model_name_input))
+                                    .child(field(tr("Context window"), &self.model_ctx_input))
+                                    .child(field(tr("Max output tokens"), &self.model_max_input)),
                             )
                             .child(
                                 div()
@@ -20324,7 +20435,7 @@ impl Render for Root {
                                             .text_xs()
                                             .text_color(rgb(0xffffff))
                                             .cursor_pointer()
-                                            .child("Save")
+                                            .child(tr("Save"))
                                             .on_click(cx.listener(|this, _ev, _win, cx| {
                                                 this.save_model_draft(cx);
                                             })),
@@ -20339,7 +20450,7 @@ impl Render for Root {
                                             .text_xs()
                                             .text_color(rgb(0x8b93a7))
                                             .cursor_pointer()
-                                            .child("Cancel")
+                                            .child(tr("Cancel"))
                                             .on_click(cx.listener(|this, _ev, _win, cx| {
                                                 this.model_draft = None;
                                                 cx.notify();
@@ -20365,7 +20476,7 @@ impl Render for Root {
                     let context = model
                         .get("contextWindow")
                         .and_then(|v| v.as_i64())
-                        .map(|value| format!("{value} ctx"))
+                        .map(|value| format!("{value} {}", tr("ctx")))
                         .unwrap_or_default();
                     let is_default = id == default_id;
                     let id_arg = id.clone();
@@ -20407,7 +20518,7 @@ impl Render for Root {
                                                 .bg(rgb(0x1d3a2a))
                                                 .text_xs()
                                                 .text_color(rgb(0x59c48a))
-                                                .child("default")
+                                                .child(tr("default"))
                                         })),
                                 )
                                 .child(
@@ -20438,7 +20549,7 @@ impl Render for Root {
                                         .text_color(rgb(0x8b93a7))
                                         .cursor_pointer()
                                         .hover(|style| style.bg(rgb(0x1a212b)))
-                                        .child("Set default")
+                                        .child(tr("Set default"))
                                         .on_click(cx.listener(move |this, _ev, _win, cx| {
                                             this.set_default_model(
                                                 "deepseek-official".to_string(),
@@ -20457,7 +20568,7 @@ impl Render for Root {
                                         .text_color(rgb(0x8b93a7))
                                         .cursor_pointer()
                                         .hover(|style| style.bg(rgb(0x1a212b)))
-                                        .child("Edit")
+                                        .child(tr("Edit"))
                                         .on_click(cx.listener(move |this, _ev, win, cx| {
                                             this.open_model_draft(Some(index), win, cx);
                                         })),
@@ -20472,7 +20583,7 @@ impl Render for Root {
                                         .text_color(rgb(0x8b93a7))
                                         .cursor_pointer()
                                         .hover(|style| style.bg(rgb(0x3a1f24)))
-                                        .child("Remove")
+                                        .child(tr("Remove"))
                                         .on_click(cx.listener(move |this, _ev, _win, cx| {
                                             this.remove_model(index);
                                             cx.notify();
@@ -20488,7 +20599,7 @@ impl Render for Root {
                             .py(px(14.))
                             .text_xs()
                             .text_color(rgb(0x707786))
-                            .child("No models configured")
+                            .child(tr("No models configured"))
                             .into_any_element(),
                     );
                 }
@@ -20676,7 +20787,7 @@ impl Render for Root {
                                                     .bg(rgb(0x1d3a2a))
                                                     .text_xs()
                                                     .text_color(rgb(0x59c48a))
-                                                    .child("default")
+                                                    .child(tr("default"))
                                             })),
                                     )
                                     .child(
@@ -20700,7 +20811,7 @@ impl Render for Root {
                                     .text_color(rgb(0x8b93a7))
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(0x1a212b)))
-                                    .child("Use")
+                                    .child(tr("Use"))
                                     .on_click(cx.listener(move |this, _ev, _win, cx| {
                                         this.set_default_model(
                                             provider_arg.clone(),
@@ -20719,7 +20830,7 @@ impl Render for Root {
                             .py(px(14.))
                             .text_xs()
                             .text_color(rgb(0x707786))
-                            .child("No models yet — add a provider or set an API key")
+                            .child(tr("No models yet — add a provider or set an API key"))
                             .into_any_element(),
                     );
                 }
@@ -20768,7 +20879,7 @@ impl Render for Root {
                                     div()
                                         .text_sm()
                                         .text_color(rgb(0xe8ecf4))
-                                        .child("DeepSeek account"),
+                                        .child(tr("DeepSeek account")),
                                 )
                                 .child(
                                     div()
@@ -20778,7 +20889,7 @@ impl Render for Root {
                                         } else {
                                             rgb(0x8b93a7)
                                         })
-                                        .child(if signed_in { "Signed in" } else { "Not signed in" }),
+                                        .child(if signed_in { tr("Signed in") } else { tr("Not signed in") }),
                                 ),
                         )
                         .child(
@@ -20799,7 +20910,7 @@ impl Render for Root {
                                     rgb(0xffffff)
                                 })
                                 .cursor_pointer()
-                                .child(if signed_in { "Sign out" } else { "Sign in" })
+                                .child(if signed_in { tr("Sign out") } else { tr("Sign in") })
                                 .on_click(cx.listener(move |this, _ev, _win, cx| {
                                     if signed_in {
                                         this.sign_out_account();
@@ -20839,7 +20950,7 @@ impl Render for Root {
                                         div()
                                             .text_xs()
                                             .text_color(rgb(0x8b93a7))
-                                            .child("Account"),
+                                            .child(tr("Account")),
                                     )
                                     .child(
                                         div()
@@ -20893,7 +21004,7 @@ impl Render for Root {
                                         div()
                                             .text_xs()
                                             .text_color(rgb(0x8b93a7))
-                                            .child("Balance"),
+                                            .child(tr("Balance")),
                                     )
                                     .child(
                                         div()
@@ -20915,7 +21026,7 @@ impl Render for Root {
                     .py(px(10.))
                     .border_t_1()
                     .border_color(rgb(0x1d2229));
-                for (label, url) in [("Usage", usage), ("Top up", topup)] {
+                for (label, url) in [(tr("Usage"), usage), (tr("Top up"), topup)] {
                     if url.is_empty() {
                         continue;
                     }
@@ -20995,7 +21106,7 @@ impl Render for Root {
                 };
                 let segmented = |ns: &'static str,
                                  key: &'static str,
-                                 options: &'static [(&'static str, &'static str)]|
+                                 options: &[(&'static str, &'static str)]|
                  -> AnyElement {
                     let current = self
                         .ns_get(ns, key)
@@ -21033,7 +21144,7 @@ impl Render for Root {
                 };
 
                 let local_seg = |field: &'static str,
-                                 options: &'static [(&'static str, &'static str)]|
+                                 options: &[(&'static str, &'static str)]|
                  -> AnyElement {
                     let current = match field {
                         "work_details" => self.work_details.clone(),
@@ -21128,17 +21239,17 @@ impl Render for Root {
                         .overflow_hidden()
                         .mb(px(16.))
                         .child(row(
-                            "Appearance",
+                            tr("Appearance"),
                             "",
                             segmented(
                                 "ui-theme",
                                 "preference",
-                                &[("light", "Light"), ("dark", "Dark"), ("system", "System")],
+                                &[("light", tr("Light")), ("dark", tr("Dark")), ("system", tr("System"))],
                             ),
                         ))
                         .child(row(
-                            "Font size",
-                            "Only affects conversation content",
+                            tr("Font size"),
+                            tr("Only affects conversation content"),
                             div()
                                 .flex()
                                 .flex_row()
@@ -21198,64 +21309,64 @@ impl Render for Root {
                                 .into_any_element(),
                         ))
                         .child(row(
-                            "Work details",
-                            "Choose how much detail to show for tool calls",
+                            tr("Work details"),
+                            tr("Choose how much detail to show for tool calls"),
                             local_seg(
                                 "work_details",
                                 &[
-                                    ("compact", "Compact"),
-                                    ("standard", "Standard"),
-                                    ("detailed", "Detailed"),
-                                    ("verbose", "Verbose"),
+                                    ("compact", tr("Compact")),
+                                    ("standard", tr("Standard")),
+                                    ("detailed", tr("Detailed")),
+                                    ("verbose", tr("Verbose")),
                                 ],
                             ),
                         ))
                         .child(row(
-                            "When to Collapse Work Details",
-                            "Choose when to automatically collapse work details",
+                            tr("When to Collapse Work Details"),
+                            tr("Choose when to automatically collapse work details"),
                             segmented(
                                 "ui-chat",
                                 "collapseTiming",
-                                &[("completion", "On completion"), ("next-input", "On next input")],
+                                &[("completion", tr("On completion")), ("next-input", tr("On next input"))],
                             ),
                         ))
                         .child(row(
-                            "Replies After Collapse",
-                            "Choose which assistant replies stay visible when work details collapse",
+                            tr("Replies After Collapse"),
+                            tr("Choose which assistant replies stay visible when work details collapse"),
                             segmented(
                                 "ui-chat",
                                 "foldedReplies",
-                                &[("all", "All replies"), ("final", "Final reply only")],
+                                &[("all", tr("All replies")), ("final", tr("Final reply only"))],
                             ),
                         ))
                         .child(row(
-                            "Open chat links in",
-                            "Choose where to open web links",
+                            tr("Open chat links in"),
+                            tr("Choose where to open web links"),
                             segmented(
                                 "ui-chat",
                                 "linkOpening",
                                 &[
-                                    ("sidebar", "In-App Sidebar"),
-                                    ("newTab", "Default Browser"),
+                                    ("sidebar", tr("In-App Sidebar")),
+                                    ("newTab", tr("Default Browser")),
                                 ],
                             ),
                         ))
                         .child(row(
-                            "Send behavior while busy",
-                            "What Enter and the Send button do while the agent is running; Cmd/Ctrl+Enter uses the other behavior",
+                            tr("Send behavior while busy"),
+                            tr("What Enter and the Send button do while the agent is running; Cmd/Ctrl+Enter uses the other behavior"),
                             segmented(
                                 "ui-conversation",
                                 "busyEnter",
-                                &[("queue", "Queue"), ("steer", "Steer")],
+                                &[("queue", tr("Queue")), ("steer", tr("Steer"))],
                             ),
                         ))
                         .child(row(
-                            "Performance & usage",
-                            "Choose how much performance and usage information to show",
+                            tr("Performance & usage"),
+                            tr("Choose how much performance and usage information to show"),
                             segmented(
                                 "ui-chat",
                                 "performanceUsage",
-                                &[("compact", "Compact"), ("detailed", "Detailed")],
+                                &[("compact", tr("Compact")), ("detailed", tr("Detailed"))],
                             ),
                         ))
                         .into_any_element(),
@@ -21321,24 +21432,28 @@ impl Render for Root {
                         .overflow_hidden()
                         .mb(px(16.))
                         .child(row(
-                            "Permission",
-                            "Choose the default permission mode for new sessions",
+                            tr("Permission"),
+                            tr("Choose the default permission mode for new sessions"),
                             segmented(
                                 "permission",
                                 "defaultPreset",
                                 &[
-                                    ("read-only", "Read Only"),
-                                    ("workspace-write", "Workspace Write"),
+                                    ("read-only", tr("Read Only")),
+                                    ("workspace-write", tr("Workspace Write")),
                                 ],
                             ),
                         ))
                         .child(row(
-                            "Language",
+                            tr("Language"),
                             "",
                             {
                                 let mut seg = div().flex().flex_row().gap(px(6.));
-                                for (value, label) in [("en", "English"), ("zh-CN", "简体中文")] {
-                                    let active = language == value;
+                                for (value, label) in [("en", "English"), ("zh", "中文")] {
+                                    let active = if language.is_empty() {
+                                        i18n::is_zh() == (value == "zh")
+                                    } else {
+                                        language.split(['-', '_']).next().unwrap_or("") == value
+                                    };
                                     let value_owned = value.to_string();
                                     seg = seg.child(
                                         div()
@@ -21352,6 +21467,10 @@ impl Render for Root {
                                             .cursor_pointer()
                                             .child(SharedString::from(label))
                                             .on_click(cx.listener(move |this, _ev, _win, cx| {
+                                                // 立刻切 UI，不等 settings/describe 回来。
+                                                i18n::set_preference(&value_owned);
+                                                this.lang_refresh = true;
+                                                this.save_state();
                                                 this.write_setting(
                                                     "locale",
                                                     vec!["preference".to_string()],
@@ -21366,13 +21485,13 @@ impl Render for Root {
                             },
                         ))
                         .child(row(
-                            "Show coding view",
-                            "Shows trajectory, code diffs, and all Agent presets",
+                            tr("Show coding view"),
+                            tr("Shows trajectory, code diffs, and all Agent presets"),
                             toggle("ui-settings", "enabled"),
                         ))
                         .child(row(
-                            "Upload Session Log when using the official model API",
-                            "Help improve DeepSeek models and products.",
+                            tr("Upload Session Log when using the official model API"),
+                            tr("Help improve DeepSeek models and products."),
                             toggle("session-log-deepseek", "enabled"),
                         ))
                         .into_any_element(),
@@ -21396,9 +21515,9 @@ impl Render for Root {
                         .text_xs()
                         .text_color(rgb(0x5f6878))
                         .child(SharedString::from(if version.is_empty() {
-                            "Current version: unknown".to_string()
+                            tr("Current version: unknown").to_string()
                         } else {
-                            format!("Current version: {version}")
+                            format!("{}: {version}", tr("Current version"))
                         }))
                         .into_any_element(),
                 );
@@ -21430,7 +21549,7 @@ impl Render for Root {
                             .py(px(14.))
                             .text_xs()
                             .text_color(rgb(0x707786))
-                            .child("No presets reported"),
+                            .child(tr("No presets reported")),
                     );
                 }
                 for preset in &presets {
@@ -21447,7 +21566,7 @@ impl Render for Root {
                         "ptc" => "PTC".to_string(),
                         "minimal" => "Minimal".to_string(),
                         "cordis" => "Cordis".to_string(),
-                        "standard" => "Standard".to_string(),
+                        "standard" => tr("Standard").to_string(),
                         other => other.to_string(),
                     };
                     let select_id = id.clone();
@@ -21473,7 +21592,7 @@ impl Render for Root {
                                     div()
                                         .text_xs()
                                         .text_color(rgb(0x59c48a))
-                                        .child("Default"),
+                                        .child(tr("Default")),
                                 )
                             } else {
                                 None
@@ -21489,7 +21608,7 @@ impl Render for Root {
                                     .text_color(rgb(0xb4bccb))
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(0x252c39)))
-                                    .child("Set default")
+                                    .child(tr("Set default"))
                                     .on_click(cx.listener(move |this, _ev, _win, cx| {
                                         let _ = this.cmds.send_blocking(Cmd::Call {
                                             tag: "agent/presets/select".to_string(),
@@ -21509,7 +21628,7 @@ impl Render for Root {
             let mut git_rows: Vec<AnyElement> = Vec::new();
             let mut file_rows: Vec<AnyElement> = Vec::new();
             if self.settings_tab == SettingsTab::Browser {
-                browser_rows.push(info_row("Renderer", "CEF 156 · Chromium 156 (windowless)"));
+                browser_rows.push(info_row(tr("Renderer"), tr("CEF 156 · Chromium 156 (windowless)")));
                 let text_field = |label: &'static str, handle: &Entity<InputState>| -> AnyElement {
                     div()
                         .flex()
@@ -21547,8 +21666,8 @@ impl Render for Root {
                         )
                         .into_any_element()
                 };
-                browser_rows.push(text_field("Home URL", &self.browser_home_input));
-                browser_rows.push(text_field("CDP port", &self.browser_port_input));
+                browser_rows.push(text_field(tr("Home URL"), &self.browser_home_input));
+                browser_rows.push(text_field(tr("CDP port"), &self.browser_port_input));
                 browser_rows.push(
                     div()
                         .px(px(16.))
@@ -21563,7 +21682,7 @@ impl Render for Root {
                                 .text_xs()
                                 .text_color(rgb(0xffffff))
                                 .cursor_pointer()
-                                .child("Save")
+                                .child(tr("Save"))
                                 .on_click(cx.listener(|this, _ev, _win, cx| {
                                     let home = this
                                         .browser_home_input
@@ -21593,7 +21712,7 @@ impl Render for Root {
                         .into_any_element(),
                 );
                 browser_rows.push(info_row(
-                    "CDP endpoint",
+                    tr("CDP endpoint"),
                     &format!("http://127.0.0.1:{}/json", self.browser_cdp_port),
                 ));
             }
@@ -21645,13 +21764,13 @@ impl Render for Root {
                                     div()
                                         .text_sm()
                                         .text_color(rgb(0xe8ecf4))
-                                        .child("Add Signed-off-by when committing"),
+                                        .child(tr("Add Signed-off-by when committing")),
                                 )
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(rgb(0x6b7386))
-                                        .child("Append `Signed-off-by: <name> <email>` to commit messages"),
+                                        .child(tr("Append `Signed-off-by: <name> <email>` to commit messages")),
                                 ),
                         )
                         .child(switch)
@@ -21710,13 +21829,13 @@ impl Render for Root {
                                     div()
                                         .text_sm()
                                         .text_color(rgb(0xe8ecf4))
-                                        .child("Show hidden files"),
+                                        .child(tr("Show hidden files")),
                                 )
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(rgb(0x6b7386))
-                                        .child("Include dotfiles in the file tree"),
+                                        .child(tr("Include dotfiles in the file tree")),
                                 ),
                         )
                         .child(switch)
@@ -21849,7 +21968,7 @@ impl Render for Root {
                                                 div()
                                                     .text_lg()
                                                     .text_color(rgb(0xeef2f8))
-                                                    .child("Settings"),
+                                                    .child(tr("Settings")),
                                             ),
                                     )
                                     .child(
@@ -22219,11 +22338,11 @@ impl Render for Root {
                         .text_xs()
                         .text_color(rgb(0x707786))
                         .child(if self.model_loading {
-                            "Loading models…"
+                            tr("Loading models…")
                         } else if query.is_empty() {
-                            "No models available"
+                            tr("No models available")
                         } else {
-                            "No matches"
+                            tr("No matches")
                         })
                         .into_any_element(),
                 );
@@ -22278,7 +22397,7 @@ impl Render for Root {
                                             .px(px(12.))
                                             .pt(px(10.))
                                             .pb(px(4.))
-                                            .child(div().text_sm().child("Model"))
+                                            .child(div().text_sm().child(tr("Model")))
                                             .child(div().flex_1())
                                             .child(
                                                 div()
@@ -22865,9 +22984,9 @@ impl Render for Root {
         let permission_menu_overlay = self.permission_menu.map(|pos| {
             let current = self.permission_preset.clone().unwrap_or_default();
             let presets = [
-                ("read-only", "read-only", "no writes, no commands"),
-                ("workspace-write", "workspace-write", "write inside the workspace"),
-                ("danger-full-access", "danger-full-access", "no sandbox, rare approvals"),
+                ("read-only", "read-only", tr("no writes, no commands")),
+                ("workspace-write", "workspace-write", tr("write inside the workspace")),
+                ("danger-full-access", "danger-full-access", tr("no sandbox, rare approvals")),
             ];
             let menu = div()
                 .absolute()
@@ -22893,7 +23012,7 @@ impl Render for Root {
                         .py(px(6.))
                         .text_xs()
                         .text_color(rgb(0x51637e))
-                        .child("permission preset (sandbox + approval policy)"),
+                        .child(tr("permission preset (sandbox + approval policy)")),
                 );
             let menu = presets.into_iter().fold(menu, |menu, (value, label, sub)| {
                 let active = current == value;
@@ -23013,7 +23132,7 @@ impl Render for Root {
                 .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
                     cx.stop_propagation();
                 })
-                .child(row("tab-menu-rename", "Rename tab", false).on_click({
+                .child(row("tab-menu-rename", tr("Rename tab"), false).on_click({
                     cx.listener(move |this, _ev, win, cx| {
                         this.tab_menu = None;
                         this.begin_rename(RenameTarget::Panel(rename_tab_id.clone()), win, cx);
@@ -23021,7 +23140,7 @@ impl Render for Root {
                 }))
                 .children(if is_session {
                     Some(
-                        row("tab-menu-fork", "Fork session", false).on_click({
+                        row("tab-menu-fork", tr("Fork session"), false).on_click({
                             cx.listener(move |this, _ev, _win, cx| {
                                 this.tab_menu = None;
                                 if !fork_session_id.is_empty() {
@@ -23038,7 +23157,7 @@ impl Render for Root {
                     Some(
                         row(
                             "tab-menu-pin",
-                            if pinned { "Unpin session" } else { "Pin session" },
+                            if pinned { tr("Unpin session") } else { tr("Pin session") },
                             false,
                         )
                         .on_click({
@@ -23055,7 +23174,7 @@ impl Render for Root {
                     None
                 })
                 .children(if is_session {
-                    Some(row("tab-menu-archive", "Archive session", true).on_click({
+                    Some(row("tab-menu-archive", tr("Archive session"), true).on_click({
                         cx.listener(move |this, _ev, _win, cx| {
                             this.tab_menu = None;
                             if !archive_session_id.is_empty() {
@@ -23192,7 +23311,7 @@ impl Render for Root {
                         .py(px(16.))
                         .text_xs()
                         .text_color(rgb(0x707786))
-                        .child("No matches")
+                        .child(tr("No matches"))
                         .into_any_element(),
                 );
             }
@@ -23306,15 +23425,15 @@ impl Render for Root {
                                     .border_t_1()
                                     .border_color(rgb(0x23272f))
                                     .child(key_chip("↑ ↓"))
-                                    .child(div().text_xs().text_color(rgb(0x707786)).child("select"))
+                                    .child(div().text_xs().text_color(rgb(0x707786)).child(tr("select")))
                                     .child(key_chip("↵"))
-                                    .child(div().text_xs().text_color(rgb(0x707786)).child("run"))
+                                    .child(div().text_xs().text_color(rgb(0x707786)).child(tr("run")))
                                     .child(key_chip("⇥"))
-                                    .child(div().text_xs().text_color(rgb(0x707786)).child("next tab"))
+                                    .child(div().text_xs().text_color(rgb(0x707786)).child(tr("next tab")))
                                     .child(div().flex_1())
-                                    .child(div().text_xs().text_color(rgb(0x707786)).child("Ctrl K toggle"))
+                                    .child(div().text_xs().text_color(rgb(0x707786)).child(tr("Ctrl K toggle")))
                                     .child(div().text_xs().text_color(rgb(0x5a6070)).child("·"))
-                                    .child(div().text_xs().text_color(rgb(0x707786)).child("esc close")),
+                                    .child(div().text_xs().text_color(rgb(0x707786)).child(tr("esc close"))),
                             ),
                     ),
             )
@@ -23333,7 +23452,7 @@ impl Render for Root {
                         .py(px(10.))
                         .text_xs()
                         .text_color(rgb(0x707786))
-                        .child("No background jobs")
+                        .child(tr("No background jobs"))
                         .into_any_element(),
                 );
             }
@@ -23433,7 +23552,7 @@ impl Render for Root {
                                     .text_xs()
                                     .text_color(rgb(0xff5663))
                                     .hover(|style| style.bg(rgb(0x3a1f24)))
-                                    .child("kill")
+                                    .child(tr("kill"))
                                     .on_click(cx.listener(move |this, _ev, _win, cx| {
                                         let _ = this.cmds.send_blocking(Cmd::JobKill {
                                             session_id: kill_session.clone(),
@@ -23487,7 +23606,7 @@ impl Render for Root {
                                     .gap(px(8.))
                                     .px(px(14.))
                                     .py(px(10.))
-                                    .child(div().text_sm().child("Background jobs"))
+                                    .child(div().text_sm().child(tr("Background jobs")))
                                     .child(div().flex_1())
                                     .child(
                                         div()
@@ -23499,7 +23618,7 @@ impl Render for Root {
                                             .text_xs()
                                             .text_color(rgb(0x9ca3b0))
                                             .hover(|style| style.bg(rgb(0x20232b)))
-                                            .child("close")
+                                            .child(tr("close"))
                                             .on_click(cx.listener(|this, _ev, _win, cx| {
                                                 this.show_jobs = false;
                                                 cx.notify();
@@ -23546,7 +23665,7 @@ impl Render for Root {
                         .py(px(12.))
                         .text_xs()
                         .text_color(rgb(0x707786))
-                        .child("No scheduled reminders for this session")
+                        .child(tr("No scheduled reminders for this session"))
                         .into_any_element(),
                 );
                 rows.push(
@@ -23555,7 +23674,7 @@ impl Render for Root {
                         .pb(px(10.))
                         .text_xs()
                         .text_color(rgb(0x51637e))
-                        .child("Ask the agent to schedule one, e.g. “remind me every day at 9:00”.")
+                        .child(tr("Ask the agent to schedule one, e.g. “remind me every day at 9:00”."))
                         .into_any_element(),
                 );
             }
@@ -23666,7 +23785,7 @@ impl Render for Root {
                                 .text_xs()
                                 .text_color(rgb(0x9ca3b0))
                                 .hover(|style| style.bg(rgb(0x20232b)))
-                                .child("history")
+                                .child(tr("history"))
                                 .on_click(cx.listener(move |this, _ev, _win, cx| {
                                     if this.schedule_expanded.as_deref()
                                         == Some(history_id.as_str())
@@ -23689,7 +23808,7 @@ impl Render for Root {
                                 .text_xs()
                                 .text_color(rgb(0x9ca3b0))
                                 .hover(|style| style.bg(rgb(0x20232b)))
-                                .child("edit")
+                                .child(tr("edit"))
                                 .on_click({
                                     let edit_task = task.clone();
                                     cx.listener(move |this, _ev, win, cx| {
@@ -23714,7 +23833,7 @@ impl Render for Root {
                                 .text_xs()
                                 .text_color(rgb(0xff5663))
                                 .hover(|style| style.bg(rgb(0x3a1f24)))
-                                .child("delete")
+                                .child(tr("delete"))
                                 .on_click(cx.listener(move |this, _ev, _win, cx| {
                                     this.delete_schedule(&delete_id);
                                     cx.notify();
@@ -23739,7 +23858,7 @@ impl Render for Root {
                             div()
                                 .text_xs()
                                 .text_color(rgb(0x51637e))
-                                .child("No deliveries yet")
+                                .child(tr("No deliveries yet"))
                                 .into_any_element(),
                         );
                     }
@@ -23839,7 +23958,7 @@ impl Render for Root {
                                             .text_color(rgb(0x9ca3b0))
                                             .cursor_pointer()
                                             .hover(|style| style.bg(rgb(0x20232b)))
-                                            .child("Cancel")
+                                            .child(tr("Cancel"))
                                             .on_click(cx.listener(|this, _ev, _win, cx| {
                                                 this.schedule_edit = None;
                                                 cx.notify();
@@ -23859,7 +23978,7 @@ impl Render for Root {
                                             .text_color(rgb(0x7fb5e8))
                                             .cursor_pointer()
                                             .hover(|style| style.bg(rgb(0x16222f)))
-                                            .child("Save")
+                                            .child(tr("Save"))
                                             .on_click(cx.listener(|this, _ev, _win, cx| {
                                                 this.commit_schedule_edit(cx);
                                             })),
@@ -23908,7 +24027,7 @@ impl Render for Root {
                                     .gap(px(8.))
                                     .px(px(14.))
                                     .py(px(10.))
-                                    .child(div().text_sm().child("Scheduled reminders"))
+                                    .child(div().text_sm().child(tr("Scheduled reminders")))
                                     .child(div().flex_1())
                                     .child(
                                         div()
@@ -23936,7 +24055,7 @@ impl Render for Root {
                                             .text_xs()
                                             .text_color(rgb(0x9ca3b0))
                                             .hover(|style| style.bg(rgb(0x20232b)))
-                                            .child("close")
+                                            .child(tr("close"))
                                             .on_click(cx.listener(|this, _ev, _win, cx| {
                                                 this.show_schedules = false;
                                                 cx.notify();
@@ -23995,7 +24114,7 @@ impl Render for Root {
                         .py(px(12.))
                         .text_xs()
                         .text_color(rgb(0x707786))
-                        .child("No subagents for this session")
+                        .child(tr("No subagents for this session"))
                         .into_any_element(),
                 );
             }
@@ -24073,7 +24192,7 @@ impl Render for Root {
                                 .text_xs()
                                 .text_color(rgb(0xff5663))
                                 .hover(|style| style.bg(rgb(0x3a1f24)))
-                                .child("interrupt")
+                                .child(tr("interrupt"))
                                 .on_click(cx.listener(move |this, _ev, _win, cx| {
                                     cx.stop_propagation();
                                     this.interrupt_subagent(&interrupt_id);
@@ -24122,7 +24241,7 @@ impl Render for Root {
                                     .gap(px(8.))
                                     .px(px(14.))
                                     .py(px(10.))
-                                    .child(div().text_sm().child("Subagents"))
+                                    .child(div().text_sm().child(tr("Subagents")))
                                     .child(div().flex_1())
                                     .child(
                                         div()
@@ -24134,7 +24253,7 @@ impl Render for Root {
                                             .text_xs()
                                             .text_color(rgb(0x9ca3b0))
                                             .hover(|style| style.bg(rgb(0x20232b)))
-                                            .child("close")
+                                            .child(tr("close"))
                                             .on_click(cx.listener(|this, _ev, _win, cx| {
                                                 this.show_subagents = false;
                                                 cx.notify();
@@ -24196,8 +24315,8 @@ impl Render for Root {
                                             .cursor_pointer()
                                             .hover(|style| style.bg(rgb(0x16222f)))
                                             .child(match self.subagent_target {
-                                                Some(_) => "Send",
-                                                None => "Pick one",
+                                                Some(_) => tr("Send"),
+                                                None => tr("Pick one"),
                                             })
                                             .on_click(cx.listener(|this, _ev, _win, cx| {
                                                 this.send_subagent_prompt(cx);
@@ -24564,7 +24683,7 @@ impl Render for Root {
                                                     .child(div().text_sm().text_color(rgb(0x00b4ff)).child("◆"))
                                                     .child(div().text_sm().text_color(rgb(0xe8ecf4)).child("dsh"))
                                                     .child(div().flex_1())
-                                                    .child(div().text_xs().text_color(rgb(0x707786)).child("chat"))
+                                                    .child(div().text_xs().text_color(rgb(0x707786)).child(tr("chat")))
                                                     .on_click({
                                                         let cmds = cmds.clone();
                                                         let cwd = space_cwd.clone();
@@ -24587,9 +24706,9 @@ impl Render for Root {
                                                         div().text_sm().font_family("monospace")
                                                             .text_color(rgb(0x00d98a)).child(">_"),
                                                     )
-                                                    .child(div().text_sm().text_color(rgb(0xe8ecf4)).child("terminal"))
+                                                    .child(div().text_sm().text_color(rgb(0xe8ecf4)).child(tr("terminal")))
                                                     .child(div().flex_1())
-                                                    .child(div().text_xs().text_color(rgb(0x707786)).child("tab"))
+                                                    .child(div().text_xs().text_color(rgb(0x707786)).child(tr("tab")))
                                                     .on_click({
                                                         let cmds = cmds.clone();
                                                         let cwd = space_cwd.clone();
@@ -24792,7 +24911,7 @@ impl Render for Root {
                                                             div()
                                                                 .text_xs()
                                                                 .text_color(rgb(0x707786))
-                                                                .child(SharedString::from("Tabs")),
+                                                                .child(SharedString::from(tr("Tabs"))),
                                                         )
                                                         .child(div().flex_1())
                                                         .child(
@@ -25163,7 +25282,7 @@ fn tab_display_name(tab: &Panel, index: usize) -> String {
     } else {
         index + 1
     };
-    format!("tab {number}")
+    format!("{} {number}", tr("tab"))
 }
 
 /// 各语言的缩进宽度（编辑器 tab 宽度）。
@@ -25369,6 +25488,8 @@ struct UiState {
     browser_cdp_port: u16,
     /// 本地偏好：有新版时后台自动下载并安装。
     auto_update: bool,
+    /// 本地偏好：界面语言（dsh 的 locale 读不到时兜底）。
+    language: String,
 }
 
 fn layout_json_has_content(value: &Value) -> bool {
@@ -25411,6 +25532,7 @@ fn load_ui_state_inner() -> UiState {
         browser_home: "https://example.com".to_string(),
         browser_cdp_port: 9222,
         auto_update: false,
+        language: String::new(),
     };
     let Ok(text) = std::fs::read_to_string(ui_state_path()) else {
         return empty();
@@ -25646,6 +25768,11 @@ fn load_ui_state_inner() -> UiState {
             .and_then(|v| v.as_u64())
             .map(|v| v as u16)
             .unwrap_or(9222),
+        language: value
+            .get("language")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         auto_update: value
             .get("auto_update")
             .and_then(|v| v.as_bool())
@@ -25965,7 +26092,7 @@ fn draft_commit_message(changes: &[GitChange]) -> String {
         };
         return format!("{verb} {}", change.relative);
     }
-    format!("update {} files", picked.len())
+    trf("update {} files", &[picked.len().to_string().as_str()])
 }
 
 #[cfg(test)]
@@ -26151,10 +26278,10 @@ fn git_summary(cwd: &str) -> Option<String> {
 fn relative_time(updated_at: i64) -> String {
     let delta = (now_millis() - updated_at).max(0) / 1000;
     match delta {
-        0..=59 => "just now".to_string(),
-        60..=3599 => format!("{} min ago", delta / 60),
-        3600..=86399 => format!("{} h ago", delta / 3600),
-        _ => format!("{} d ago", delta / 86400),
+        0..=59 => tr("just now").to_string(),
+        60..=3599 => trf("{} min ago", &[(delta / 60).to_string().as_str()]),
+        3600..=86399 => trf("{} h ago", &[(delta / 3600).to_string().as_str()]),
+        _ => trf("{} d ago", &[(delta / 86400).to_string().as_str()]),
     }
 }
 
@@ -26562,6 +26689,7 @@ fn main() {
         }
     }
     stamp("main enter");
+    i18n::init_from_env();
     setup_fontconfig();
     setup_gpu_preference();
     if std::env::var("OMD_SELFCHECK").is_ok() {
