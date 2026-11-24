@@ -134,6 +134,11 @@ digest 校验，不一致就放弃安装，已装版本保持不动。
 `OMD_UPDATE_API` 可指向 HTTPS 镜像或本地 HTTP 测试响应（仅下载），
 `OMD_NO_UPDATE_CHECK=1` 关掉启动及周期检查。
 
+### 界面语言
+
+界面文案有中文和英文两种。语言取自 dsh 的 `locale.preference`：设置页的 **Language**
+可选 English / 中文；没有存储偏好时按系统 locale 兜底。切换后输入框的占位文案会一起刷新。
+
 ### 打包与发布
 
 图标在 `packaging/icons/`（深色圆角块 + 六点抓手 + 运行点）。窗口用内嵌的 256px PNG（X11），桌面启动器走 hicolor。

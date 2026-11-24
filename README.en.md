@@ -159,6 +159,13 @@ package and show where to find it. `OMD_UPDATE_API` supports an HTTPS mirror or
 a local HTTP fixture (download-only). `OMD_NO_UPDATE_CHECK=1` disables both the
 startup and periodic checks.
 
+### Interface language
+
+The interface ships in Chinese and English. The language follows dsh's
+`locale.preference`: pick English / 中文 under **Language** in Settings; without a
+stored preference it falls back to the system locale. Switching also refreshes
+input placeholders.
+
 ### Packaging and releasing
 
 ```sh
