@@ -63,7 +63,8 @@ DSH_BIN=$HOME/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.j
 | **插件管理**：`pluginManager/listPlugins` + `setPluginEnabled` + `listBundles` + `installBundle`/`removeBundle` | ✅（安装带 requestId、可取消、构建脚本批准、失败原因回显） |
 | **插件市场**：`pluginMarket/listIndexes` + `search`（`nextOffset` 分页） | ✅（搜索、安装/更新、状态徽章、load more） |
 | **消息反馈**：`messageFeedback/list` + `put`/`delete`，assistant 块下的 👍/👎（再点撤回） | ✅ |
-| **会话管理**：tab 右键 → Fork（`session/fork`）/ 置顶（`workspace/pinSession·unpinSession`）/ 归档（`workspace/archiveSession`） | ✅ |
+| **会话管理**：tab 右键 → 关闭（单个/其它/左/右）+ Fork（`session/fork`）/ 置顶（`workspace/pinSession·unpinSession`）/ 归档（`workspace/archiveSession`） | ✅ |
+| **dsh 内核升级**：设置 → 通用里的引擎卡片查 npm 上的 `@deepseek-ai/dsh@latest`，一键 `npm install` 到 `runtime/<version>` 并切 `runtime/current`，重启 app 生效 | ✅ |
 | **Slash 命令**：`commands/list` 进命令面板；输入框以已知 `/命令` 开头发送时走 `commands/execute` | ✅ |
 | **附件**：📎 选择文件 / 拖进窗口 / Ctrl+V 粘贴图片；图片内联，其它文件走 `fileUploads/upload` 换 receipt | ✅（上传 + prompt content 实测通过） |
 | **目标（goal）**：`goals/get` 横幅 + create/edit/pause/resume/complete/clear | ✅（回填、CAS revision 实测） |
@@ -128,6 +129,12 @@ omd-desktop update             # 下载并安装（重启 app 生效）
 卡片里的「Install updates automatically」开关（默认关）会在后台自动下载并安装新版本，
 装好提示重启；系统 deb 仍会弹 `pkexec` 授权。下载内容按 GitHub asset 的 `sha256`
 digest 校验，不一致就放弃安装，已装版本保持不动。
+
+**升级 dsh 内核**：同一页下面还有一张「dsh engine」卡片。打开设置时会去 npm 查一次
+`@deepseek-ai/dsh` 的 latest，卡片显示 `当前 vX → 最新 vY`；「Upgrade engine」把新版本
+装进 `~/.local/share/omd/runtime/<version>` 并切 `runtime/current`（旧目录留着，正在跑的
+host 不受影响），装完点「Restart OMD」就切到新内核（会话不丢，host daemon 复用）。
+`runtime/current` 用带 pid 的临时文件原子替换，两个安装同时跑也不会写坏。
 
 安装方式按当前可执行文件位置分派：`~/.local/opt/omd-desktop` 的副本就地覆盖（免 root），
 `/usr/lib/omd-desktop` 的走 `pkexec dpkg -i`，开发构建与 Windows 只下载并提示文件位置。
@@ -282,7 +289,10 @@ slash 命令面板、附件上传、目标横幅、日程面板、workspace 状�
 - 设置 → Plugins 现在分三段：内置插件（启停）、Bundles（官方 on-demand 安装 / 卸载）、
   Market（搜索 + 安装/更新；安装带 requestId，可取消，构建脚本需显式批准）。
   `pluginMarket/*` 在未安装市场 bundle 的 profile 里返回 404，UI 会提示未启用而不是报错。
-- tab 上右键：Rename / Fork session / Pin·Unpin / Archive（归档会关闭对应 tab 并刷新列表）。
+- tab 上右键（菜单贴着 tab 下沿弹出，窗口边缘自动翻面/贴边）：
+  Close tab / Close other tabs / Close tabs to the left / Close tabs to the right，
+  然后 Rename / Fork session / Pin·Unpin / Archive（归档会关闭对应 tab 并刷新列表）。
+  「全部 tab」下拉（⌄）底部也有这三个批量关闭。
   转写里带事件 seq 的消息下方有「⎇ fork here」，从那条消息处切开（`atSeq`）。
 - 空间可以有 0 个 tab：关掉最后一个 tab（× 或关掉里面最后一个 block）后停在空态
   （`no tabs open`，给 dsh / terminal 两个入口），不再自动补一个会话；切到空空间

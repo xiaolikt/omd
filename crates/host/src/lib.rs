@@ -750,16 +750,22 @@ impl DshRuntime {
         if selected.is_empty() {
             return None;
         }
-        let dir = if Path::new(selected).is_absolute() {
-            PathBuf::from(selected)
-        } else {
-            root.join(selected)
-        };
-        let bin = dir.join("node_modules/@deepseek-ai/dsh/lib/bin.js");
-        if !bin.is_file() {
-            return None;
+        let dir = resolve_runtime_dir(&root, selected)?;
+        if dir != root.join(selected) {
+            // `current` 被并发写坏过（两个安装抢同一个临时文件）：
+            // 用能匹配上的版本目录把它修回来。
+            if let Some(name) = dir.file_name().and_then(|name| name.to_str()) {
+                eprintln!("[runtime] repaired runtime/current → {name}");
+                let _ = write_current(&root, name);
+            }
         }
-        let version = version_from_bin(&bin).unwrap_or_else(|| selected.to_string());
+        let bin = dir.join("node_modules/@deepseek-ai/dsh/lib/bin.js");
+        let dir_name = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(selected)
+            .to_string();
+        let version = version_from_bin(&bin).unwrap_or(dir_name);
         let _ = write_metadata(&root, &version);
         let bundled = root.join(exe_name("node"));
         let node = if bundled.is_file() {
@@ -774,6 +780,48 @@ impl DshRuntime {
             bin,
         })
     }
+}
+
+/// 原子写 `runtime/current`：临时文件名带进程号和纳秒，两个安装同时跑也不会互相覆盖。
+fn write_current(root: &Path, version: &str) -> anyhow::Result<()> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = root.join(format!(".current.tmp-{}-{stamp}", std::process::id()));
+    std::fs::write(&tmp, version)?;
+    std::fs::rename(&tmp, root.join("current"))?;
+    Ok(())
+}
+
+/// `runtime/current` → 版本目录。名字对不上但目录装得完整时，挑名字能前缀
+/// 匹配的那个（修被写坏的 `current`）。
+fn resolve_runtime_dir(root: &Path, selected: &str) -> Option<PathBuf> {
+    let candidate = if Path::new(selected).is_absolute() {
+        PathBuf::from(selected)
+    } else {
+        root.join(selected)
+    };
+    let complete = |dir: &Path| dir.join("node_modules/@deepseek-ai/dsh/lib/bin.js").is_file();
+    if complete(&candidate) {
+        return Some(candidate);
+    }
+    let mut best: Option<(usize, PathBuf)> = None;
+    for entry in std::fs::read_dir(root).ok()? {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') || !complete(&path) {
+            continue;
+        }
+        // 写坏的 current 是「一个版本名 + 另一个版本名」，所以取被包含的最长目录名
+        if selected.starts_with(name) && best.as_ref().is_none_or(|(len, _)| name.len() > *len) {
+            best = Some((name.len(), path));
+        }
+    }
+    best.map(|(_, path)| path)
 }
 
 fn version_from_bin(bin: &Path) -> Option<String> {
@@ -986,18 +1034,13 @@ pub async fn install_dsh(tag: &str) -> anyhow::Result<DshRuntime> {
         // Never delete a runtime that might be in use by the running host.
         // Same version already installed: keep it and just select it.
         let _ = std::fs::remove_dir_all(&staging);
-        let tmp = root.join(".current.tmp");
-        std::fs::write(&tmp, &version)?;
-        std::fs::rename(&tmp, root.join("current"))?;
+        write_current(&root, &version)?;
         write_metadata(&root, &version)?;
         let bin = final_dir.join("node_modules/@deepseek-ai/dsh/lib/bin.js");
         return Ok(DshRuntime { version, dir: final_dir, node, bin });
     }
     std::fs::rename(&staging, &final_dir)?;
-    let current = root.join("current");
-    let tmp = root.join(".current.tmp");
-    std::fs::write(&tmp, &version)?;
-    std::fs::rename(&tmp, &current)?;
+    write_current(&root, &version)?;
     write_metadata(&root, &version)?;
     eprintln!("[runtime] installed dsh {version} at {}", final_dir.display());
     let bin = final_dir.join("node_modules/@deepseek-ai/dsh/lib/bin.js");
@@ -1007,4 +1050,97 @@ pub async fn install_dsh(tag: &str) -> anyhow::Result<DshRuntime> {
         node,
         bin,
     })
+}
+
+/// npm registry 地址（国内镜像可以用 `OMD_DSH_REGISTRY` 指过去）。
+fn npm_registry() -> String {
+    std::env::var("OMD_DSH_REGISTRY")
+        .unwrap_or_else(|_| "https://registry.npmjs.org".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// 当前系统上 dsh 内核的版本：优先 app 托管的 runtime，其次 `DSH_BIN`。
+pub fn current_dsh_version() -> Option<String> {
+    if let Some(runtime) = DshRuntime::current() {
+        return Some(runtime.version);
+    }
+    std::env::var("DSH_BIN")
+        .ok()
+        .and_then(|bin| version_from_bin(Path::new(&bin)))
+}
+
+/// 查 npm 上 `@deepseek-ai/dsh` 的 latest 版本（只读，不安装）。
+pub async fn latest_dsh_version() -> Result<String> {
+    let url = format!("{}/@deepseek-ai/dsh/latest", npm_registry());
+    let client = reqwest::Client::builder()
+        .user_agent("omd/desktop")
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .build()?;
+    let response = client.get(&url).send().await?;
+    if !response.status().is_success() {
+        return Err(anyhow!("registry returned HTTP {}", response.status()));
+    }
+    let value: serde_json::Value = response.json().await?;
+    value
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+        .ok_or_else(|| anyhow!("registry response has no version"))
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::{resolve_runtime_dir, write_current};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "omd-runtime-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn fake_runtime(root: &Path, version: &str) {
+        let dir = root.join(version).join("node_modules/@deepseek-ai/dsh/lib");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("bin.js"), "// bin").unwrap();
+    }
+
+    #[test]
+    fn resolves_the_version_named_by_current() {
+        let root = temp_root("plain");
+        fake_runtime(&root, "0.2.2-rc.1");
+        let dir = resolve_runtime_dir(&root, "0.2.2-rc.1").expect("installed version resolves");
+        assert_eq!(dir, root.join("0.2.2-rc.1"));
+        assert!(resolve_runtime_dir(&root, "9.9.9").is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repairs_a_current_written_by_two_installs() {
+        // 两个安装抢同一个临时文件时，`current` 会变成两个版本名首尾相连。
+        let root = temp_root("torn");
+        fake_runtime(&root, "0.2.2-rc.1");
+        fake_runtime(&root, "0.2.2-rc.10");
+        let dir = resolve_runtime_dir(&root, "0.2.2-rc.10.2.2-rc.1").expect("longest match wins");
+        assert_eq!(dir, root.join("0.2.2-rc.10"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_current_is_visible_immediately() {
+        let root = temp_root("write");
+        write_current(&root, "1.2.3").unwrap();
+        assert_eq!(fs::read_to_string(root.join("current")).unwrap(), "1.2.3");
+        let _ = fs::remove_dir_all(root);
+    }
 }

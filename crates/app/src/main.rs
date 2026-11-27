@@ -1027,6 +1027,8 @@ enum Cmd {
     Decide { event_id: String, allow: bool },
     AnswerQuestion { event_id: String, answer: Value },
     UpdateDsh,
+    /// 查 npm 上 dsh 的最新版本（不安装）
+    CheckDsh,
 }
 
 enum UpdateCmd {
@@ -1162,7 +1164,15 @@ enum Ev {
     /// 文件选择框返回的路径
     FilesPicked(Vec<String>),
     DshInfo { version: String, bundled: bool },
-    DshUpdate { done: bool, message: String },
+    DshUpdate {
+        done: bool,
+        ok: bool,
+        /// 新内核装好了，但要重启 app 才会用上
+        restart: bool,
+        message: String,
+    },
+    /// npm 上 dsh 内核的最新版本（Err = 查询失败）
+    DshChecked(std::result::Result<String, String>),
     /// 应用自更新：检查结果（Err = 网络/无 release）
     AppUpdateChecked(std::result::Result<update::Release, String>),
     /// 自更新下载进度
@@ -1213,6 +1223,7 @@ fn ev_name(ev: &Ev) -> &'static str {
         Ev::FilesPicked(_) => "FilesPicked",
         Ev::DshInfo { .. } => "DshInfo",
         Ev::DshUpdate { .. } => "DshUpdate",
+        Ev::DshChecked(_) => "DshChecked",
         Ev::AppUpdateChecked(_) => "AppUpdateChecked",
         Ev::AppUpdateProgress { .. } => "AppUpdateProgress",
         Ev::AppUpdateSettled(_) => "AppUpdateSettled",
@@ -1310,6 +1321,8 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
         let _ = evs
             .send(Ev::DshUpdate {
                 done: false,
+                ok: false,
+                restart: false,
                 message: tr("installing bundled dsh engine…").into(),
             })
             .await;
@@ -1318,6 +1331,8 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                 let _ = evs
                     .send(Ev::DshUpdate {
                         done: true,
+                        ok: true,
+                        restart: false,
                         message: format!("bundled engine v{} installed", runtime.version),
                     })
                     .await;
@@ -1326,6 +1341,8 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                 let _ = evs
                     .send(Ev::DshUpdate {
                         done: true,
+                        ok: false,
+                        restart: false,
                         message: format!("bundled engine install failed: {err}"),
                     })
                     .await;
@@ -2405,6 +2422,8 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                             let _ = evs
                                 .send(Ev::DshUpdate {
                                     done: false,
+                                    ok: false,
+                                    restart: false,
                                     message: tr("downloading and installing dsh…").into(),
                                 })
                                 .await;
@@ -2413,22 +2432,39 @@ async fn worker_main(cmds: Receiver<Cmd>, evs: Sender<Ev>) {
                                     let _ = evs
                                         .send(Ev::DshUpdate {
                                             done: true,
-                                            message: format!(
-                                                "Updated to v{}. Restart the app to apply.",
-                                                runtime.version
+                                            ok: true,
+                                            restart: true,
+                                            message: trf(
+                                                "engine upgraded to v{} · restart OMD to use it",
+                                                &[runtime.version.as_str()],
                                             ),
                                         })
                                         .await;
                                 }
                                 Err(err) => {
+                                    let detail = format!("{err:#}");
                                     let _ = evs
                                         .send(Ev::DshUpdate {
                                             done: true,
-                                            message: format!("update failed: {err}"),
+                                            ok: false,
+                                            restart: false,
+                                            message: trf(
+                                                "engine upgrade failed: {}",
+                                                &[detail.as_str()],
+                                            ),
                                         })
                                         .await;
                                 }
                             }
+                        });
+                    }
+                    Cmd::CheckDsh => {
+                        let evs = evs.clone();
+                        tokio::spawn(async move {
+                            let result = dsh_host::latest_dsh_version()
+                                .await
+                                .map_err(|err| format!("{err:#}"));
+                            let _ = evs.send(Ev::DshChecked(result)).await;
                         });
                     }
                     Cmd::AnswerQuestion { event_id, answer } => {
@@ -3247,8 +3283,10 @@ struct Root {
     attach_seq: u64,
     /// 消息反馈的本地状态：messageId → 反馈项
     feedback: std::collections::HashMap<String, FeedbackState>,
-    /// tab 右键菜单：panel id + 菜单弹出的位置
-    tab_menu: Option<(String, Point<Pixels>)>,
+    /// tab 右键菜单：tab id + 芯片边界（菜单贴着它展开）
+    tab_menu: Option<(String, Bounds<Pixels>)>,
+    /// 每个 tab 芯片的窗口边界（右键菜单贴着它弹出）
+    tab_bounds: std::collections::HashMap<String, Bounds<Pixels>>,
     /// 设置 → Browser：首页地址。
     browser_home_input: Entity<InputState>,
     /// 设置 → Browser：CDP 端口。
@@ -3291,6 +3329,13 @@ struct Root {
     dsh_bundled: bool,
     dsh_busy: bool,
     dsh_status: Option<String>,
+    /// 最近一次内核升级是不是失败了（状态行配色用）
+    dsh_failed: bool,
+    /// npm 上 @deepseek-ai/dsh 的最新版本（设置里「检查更新」后填写）
+    dsh_latest: Option<String>,
+    dsh_latest_error: Option<String>,
+    /// 刚装上新内核：设置页出现「重启 OMD」入口
+    dsh_restart_needed: bool,
     scroll: ScrollHandle,
     error: Option<String>,
     connected: bool,
@@ -3782,6 +3827,38 @@ impl Root {
             Err(_) => AppUpdateState::Failed("the updater is unavailable".into()),
         };
     }
+    /// 打开设置时顺手查一次 npm 上的 dsh 最新版本（只查不装）。
+    fn request_dsh_version(&mut self) {
+        if self.dsh_busy || self.dsh_latest.is_some() {
+            return;
+        }
+        self.dsh_latest_error = None;
+        let _ = self.cmds.send_blocking(Cmd::CheckDsh);
+    }
+
+    /// 重启自己：新起的进程接上同一个 host daemon（会话不丢），然后退出当前窗口。
+    /// 升级 dsh 内核后用它切到新版本。
+    fn restart_app(&mut self, cx: &mut Context<Self>) {
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(err) => {
+                self.error = Some(format!("cannot locate omd executable: {err}"));
+                cx.notify();
+                return;
+            }
+        };
+        match std::process::Command::new(&exe).spawn() {
+            Ok(_) => {
+                self.save_state();
+                cx.quit();
+            }
+            Err(err) => {
+                self.error = Some(format!("restart failed: {err}"));
+                cx.notify();
+            }
+        }
+    }
+
     fn terminal_panes(&self) -> Vec<&Block> {
         self.panes
             .iter()
@@ -4388,6 +4465,7 @@ impl Root {
             attachments: Vec::new(),
             attach_seq: 1,
             tab_menu: None,
+            tab_bounds: std::collections::HashMap::new(),
             browser_home_input,
             browser_port_input,
             pending_panel_tab: None,
@@ -4418,6 +4496,10 @@ impl Root {
             dsh_bundled: false,
             dsh_busy: false,
             dsh_status: None,
+            dsh_failed: false,
+            dsh_latest: None,
+            dsh_latest_error: None,
+            dsh_restart_needed: false,
             scroll: ScrollHandle::new(),
             error: None,
             connected: false,
@@ -5959,10 +6041,32 @@ impl Root {
                 self.dsh_version = Some(version);
                 self.dsh_bundled = bundled;
             }
-            Ev::DshUpdate { done, message } => {
+            Ev::DshUpdate {
+                done,
+                ok,
+                restart,
+                message,
+            } => {
                 self.dsh_busy = !done;
+                self.dsh_failed = done && !ok;
                 self.dsh_status = Some(message);
+                if done {
+                    // 新内核装好了但当前 host 还在旧目录上跑，重启才生效
+                    self.dsh_restart_needed = ok && restart;
+                    // 刷新一下 npm 上的最新版本，卡片上就能看到 vX → vY
+                    let _ = self.cmds.send_blocking(Cmd::CheckDsh);
+                }
             }
+            Ev::DshChecked(result) => match result {
+                Ok(version) => {
+                    self.dsh_latest = Some(version);
+                    self.dsh_latest_error = None;
+                }
+                Err(err) => {
+                    self.dsh_latest = None;
+                    self.dsh_latest_error = Some(err);
+                }
+            },
             Ev::AppUpdateChecked(result) => {
                 match result {
                     Ok(release) => {
@@ -6583,12 +6687,66 @@ impl Root {
                 .map(|space| space.panels.len())
                 .unwrap_or(0)
         );
+        self.tab_bounds.remove(tab_id);
+        if self.tab_menu.as_ref().is_some_and(|(id, _)| id == tab_id) {
+            self.tab_menu = None;
+        }
         if self.show_tab_list && self.spaces.iter().all(|space| space.panels.is_empty()) {
             self.show_tab_list = false;
         }
         // 空间可以被关空：留一块空态，用户点 + 再开 tab，不自动补会话
         self.save_state();
         cx.notify();
+    }
+
+    /// 按 tab 右键菜单的方向批量关 tab：其它 / 右侧 / 左侧（当前 tab 保留）。
+    fn close_tab_group(&mut self, tab_id: &str, side: TabCloseSide, cx: &mut Context<Self>) {
+        let Some(space) = self
+            .spaces
+            .iter()
+            .find(|space| space.panels.iter().any(|tab| tab.id == tab_id))
+        else {
+            return;
+        };
+        let Some(index) = space.panels.iter().position(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let ids: Vec<String> = match side {
+            TabCloseSide::Others => space
+                .panels
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .map(|(_, tab)| tab.id.clone())
+                .collect(),
+            TabCloseSide::Left => space
+                .panels
+                .iter()
+                .take(index)
+                .map(|tab| tab.id.clone())
+                .collect(),
+            TabCloseSide::Right => space
+                .panels
+                .iter()
+                .skip(index + 1)
+                .map(|tab| tab.id.clone())
+                .collect(),
+        };
+        if ids.is_empty() {
+            return;
+        }
+        eprintln!(
+            "[ui] close {} tab(s) {} of {tab_id}",
+            ids.len(),
+            match side {
+                TabCloseSide::Others => "other than",
+                TabCloseSide::Left => "left of",
+                TabCloseSide::Right => "right of",
+            }
+        );
+        for id in ids {
+            self.close_whole_tab(&id, cx);
+        }
     }
 
     /// 把一个 panel（dsh 会话）从所有空间/tab 里摘掉（归档后用）。
@@ -10813,6 +10971,7 @@ impl Root {
             PaletteAction::OpenFiles => self.files_toggle_sidebar(cx),
             PaletteAction::OpenSettings => {
                 self.show_settings = true;
+                self.request_dsh_version();
                 self.open_settings_tab(SettingsTab::General, window, cx);
             }
             PaletteAction::SlashCommand(name) => {
@@ -10851,6 +11010,12 @@ impl Root {
         // block 头菜单开着时：Esc 关掉
         if self.block_menu.is_some() && key == "escape" {
             self.block_menu = None;
+            cx.notify();
+            return true;
+        }
+        // tab 右键菜单开着时：Esc 关掉
+        if self.tab_menu.is_some() && key == "escape" {
+            self.tab_menu = None;
             cx.notify();
             return true;
         }
@@ -12463,6 +12628,14 @@ struct FileEditor {
     dirty: bool,
 }
 
+/// tab 右键菜单里的「批量关闭」方向。
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TabCloseSide {
+    Others,
+    Left,
+    Right,
+}
+
 /// 正在改名的目标。
 #[derive(Clone, Debug, PartialEq)]
 enum RenameTarget {
@@ -13741,6 +13914,22 @@ fn block_bounds_probe(pane_id: u64, cx: &mut Context<Root>) -> AnyElement {
         move |bounds, _window, cx| {
             let _ = weak.update(cx, |root, _| {
                 root.block_bounds.insert(pane_id, bounds);
+            });
+        },
+        |_bounds, _t, _window, _cx| {},
+    )
+    .absolute()
+    .inset_0()
+    .into_any_element()
+}
+
+/// tab 芯片边界探针（绝对定位，不参与布局）——右键菜单贴着 tab 展开。
+fn tab_bounds_probe(tab_id: String, cx: &mut Context<Root>) -> AnyElement {
+    let weak = cx.entity().downgrade();
+    gpui_kit::canvas(
+        move |bounds, _window, cx| {
+            let _ = weak.update(cx, |root, _| {
+                root.tab_bounds.insert(tab_id.clone(), bounds);
             });
         },
         |_bounds, _t, _window, _cx| {},
@@ -15712,6 +15901,214 @@ fn term_rows(screen: &[Vec<Span>]) -> Vec<AnyElement> {
                 .into_any_element()
         })
         .collect()
+}
+
+/// 设置页的「dsh 内核」卡片：当前版本 + 检查 / 升级按钮。
+///
+/// dsh 引擎是 npm 上的 `@deepseek-ai/dsh`，由 omd 装在
+/// `~/.local/share/omd/runtime/<version>`；升级只换 `runtime/current`，
+/// 正在跑的 host 仍在旧目录，重启 app 后生效。
+fn dsh_kernel_card(
+    current: Option<&str>,
+    bundled: bool,
+    busy: bool,
+    latest: Option<&str>,
+    latest_error: Option<&str>,
+    status: Option<&str>,
+    status_failed: bool,
+    restart_needed: bool,
+    cx: &mut Context<Root>,
+) -> AnyElement {
+    let current_label = match current {
+        Some(version) => format!("v{version}"),
+        None => tr("current engine: unknown").to_string(),
+    };
+    let source = if bundled {
+        tr("installed by omd")
+    } else {
+        tr("system install (DSH_BIN)")
+    };
+
+    let mut check_button = div()
+        .id("dsh-kernel-check")
+        .px(px(10.))
+        .py(px(4.))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(rgb(0x2c3340))
+        .text_xs()
+        .text_color(if busy { rgb(0x5a6070) } else { rgb(0xb4bccb) })
+        .child(tr("Check engine"));
+    if !busy {
+        check_button = check_button
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(0x1a212b)))
+            .on_click(cx.listener(|this, _ev, _win, cx| {
+                this.dsh_latest_error = None;
+                let _ = this.cmds.send_blocking(Cmd::CheckDsh);
+                cx.notify();
+            }));
+    }
+
+    let mut upgrade_button = div()
+        .id("dsh-kernel-upgrade")
+        .px(px(12.))
+        .py(px(4.))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(rgb(0x2f6fb5))
+        .text_xs()
+        .text_color(if busy { rgb(0x5a6070) } else { rgb(0x7fb5e8) })
+        .child(if busy {
+            tr("Upgrading…")
+        } else {
+            tr("Upgrade engine")
+        });
+    if !busy {
+        upgrade_button = upgrade_button
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(0x16222f)))
+            .on_click(cx.listener(|this, _ev, _win, cx| {
+                this.dsh_status = None;
+                this.dsh_failed = false;
+                let _ = this.cmds.send_blocking(Cmd::UpdateDsh);
+                cx.notify();
+            }));
+    }
+
+    // 状态行：升级过程 > 升级结果 > 检查结果 > 包来源
+    let status_line: Option<(String, u32)> = if busy {
+        Some((
+            status
+                .map(str::to_string)
+                .unwrap_or_else(|| tr("downloading and installing dsh…").to_string()),
+            0x7fb5e8,
+        ))
+    } else if let Some(error) = latest_error {
+        Some((error.to_string(), 0xff8a97))
+    } else if let Some(st) = status {
+        Some((
+            st.to_string(),
+            if status_failed { 0xff8a97 } else { 0x00d98a },
+        ))
+    } else if let (Some(current), Some(latest)) = (current, latest) {
+        if current == latest {
+            Some((format!("{} (v{latest})", tr("already up to date")), 0x00d98a))
+        } else {
+            Some((format!("v{current} → v{latest}"), 0xc9a15a))
+        }
+    } else {
+        None
+    };
+
+    let mut rows = div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .px(px(16.))
+        .py(px(12.))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.))
+                .child(div().text_sm().text_color(rgb(0xe8ecf4)).child(tr("dsh engine")))
+                .child(
+                    div()
+                        .px(px(6.))
+                        .py(px(1.))
+                        .rounded(px(5.))
+                        .bg(rgb(0x1b2130))
+                        .text_xs()
+                        .text_color(rgb(0x8b93a7))
+                        .child(SharedString::from(current_label)),
+                )
+                .child(div().flex_1())
+                .child(check_button)
+                .child(upgrade_button),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x707786))
+                        .child(tr("the engine that runs sessions, tools and plugins")),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x5a6070))
+                        .child(SharedString::from(format!("· {source}"))),
+                ),
+        );
+
+    if let Some((text, color)) = status_line {
+        rows = rows.child(
+            div()
+                .text_xs()
+                .text_color(rgb(color))
+                .child(SharedString::from(text)),
+        );
+    }
+
+    if restart_needed {
+        rows = rows.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex_1()
+                        .text_xs()
+                        .text_color(rgb(0xc9a15a))
+                        .child(tr("new engine installed · restart OMD to use it")),
+                )
+                .child(
+                    div()
+                        .id("dsh-kernel-restart")
+                        .px(px(10.))
+                        .py(px(4.))
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(rgb(0x2f6fb5))
+                        .text_xs()
+                        .text_color(rgb(0x7fb5e8))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0x16222f)))
+                        .child(tr("Restart OMD"))
+                        .on_click(cx.listener(|this, _ev, _win, cx| {
+                            this.restart_app(cx);
+                        })),
+                ),
+        );
+    }
+
+    rows = rows.child(
+        div()
+            .text_xs()
+            .text_color(rgb(0x5a6070))
+            .child(tr("releases are published on npm as @deepseek-ai/dsh")),
+    );
+
+    div()
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .rounded(px(10.))
+        .bg(rgb(0x151a23))
+        .border_1()
+        .border_color(rgb(0x222836))
+        .overflow_hidden()
+        .child(rows)
+        .into_any_element()
 }
 
 /// 设置页的「更新」卡片：当前版本 + 检查/安装按钮 + 发布说明。
@@ -21499,29 +21896,21 @@ impl Render for Root {
                 let update_card = app_update_card(&self.app_update, self.auto_update, cx);
                 // 放最上面：更新入口不该藏在设置页底部
                 general_rows.insert(0, update_card);
-                let version = std::env::var("DSH_BIN")
-                    .ok()
-                    .and_then(|path| {
-                        path.split("/runtime/")
-                            .nth(1)
-                            .and_then(|rest| rest.split('/').next())
-                            .map(str::to_string)
-                    })
-                    .unwrap_or_default();
-                general_rows.push(
-                    div()
-                        .px(px(16.))
-                        .py(px(10.))
-                        .text_xs()
-                        .text_color(rgb(0x5f6878))
-                        .child(SharedString::from(if version.is_empty() {
-                            tr("Current version: unknown").to_string()
-                        } else {
-                            format!("{}: {version}", tr("Current version"))
-                        }))
-                        .into_any_element(),
+                // dsh 内核也可以在这里升级（不用去容器里跑 npm）
+                general_rows.insert(
+                    1,
+                    dsh_kernel_card(
+                        self.dsh_version.as_deref(),
+                        self.dsh_bundled,
+                        self.dsh_busy,
+                        self.dsh_latest.as_deref(),
+                        self.dsh_latest_error.as_deref(),
+                        self.dsh_status.as_deref(),
+                        self.dsh_failed,
+                        self.dsh_restart_needed,
+                        cx,
+                    ),
                 );
-
             }
 
             // ---- Agent 预设 ----
@@ -23079,22 +23468,49 @@ impl Render for Root {
                 .child(menu)
         });
 
-        // tab 右键菜单：改名 / Fork / 置顶 / 归档
-        let tab_menu_overlay = self.tab_menu.clone().map(|(tab_id, pos)| {
-            let session_id = self
+        // tab 右键菜单：关闭（含左/右/其它）/ 改名 / Fork / 置顶 / 归档。
+        // 菜单贴着 tab 芯片的下沿展开（芯片边界由 tab_bounds_probe 记录），
+        // 超出窗口时由 anchored 自己翻到上方 / 贴边，不再固定落在鼠标点。
+        let tab_menu_overlay = self.tab_menu.clone().map(|(tab_id, anchor)| {
+            let space_index = self
                 .spaces
                 .iter()
-                .flat_map(|space| space.panels.iter())
-                .find(|tab| tab.id == tab_id)
-                .and_then(|tab| tab.active.clone().or_else(|| tab.blocks.first().cloned()));
+                .position(|space| space.panels.iter().any(|tab| tab.id == tab_id));
+            let tab_index = space_index.and_then(|index| {
+                self.spaces[index]
+                    .panels
+                    .iter()
+                    .position(|tab| tab.id == tab_id)
+            });
+            let tab_count = space_index
+                .map(|index| self.spaces[index].panels.len())
+                .unwrap_or(0);
+            let session_id = space_index
+                .zip(tab_index)
+                .and_then(|(space, index)| self.spaces[space].panels[index].active.clone())
+                .or_else(|| {
+                    space_index
+                        .zip(tab_index)
+                        .and_then(|(space, index)| {
+                            self.spaces[space].panels[index].blocks.first().cloned()
+                        })
+                });
             let is_session = session_id
                 .as_deref()
                 .is_some_and(|id| !is_file_panel(id) && !self.term_tabs.contains(id));
             let pinned = session_id
                 .as_deref()
                 .is_some_and(|id| self.pinned_sessions.iter().any(|pin| pin == id));
-            let row = move |id: &'static str, label: &'static str, danger: bool| {
-                div()
+            let has_left = tab_index.is_some_and(|index| index > 0);
+            let has_right = tab_index.is_some_and(|index| index + 1 < tab_count);
+            let has_other = tab_count > 1;
+            let row = move |id: &'static str, label: &'static str, danger: bool, enabled: bool| {
+                let text_color = match (enabled, danger) {
+                    (false, _) => rgb(0x5a6070),
+                    (true, true) => rgb(0xff8a97),
+                    (true, false) => rgb(0xe8ecf4),
+                };
+                let mut row = div()
                     .id(id)
                     .flex()
                     .flex_row()
@@ -23103,22 +23519,78 @@ impl Render for Root {
                     .px(px(10.))
                     .py(px(6.))
                     .rounded_sm()
-                    .cursor_pointer()
                     .text_sm()
-                    .text_color(if danger { rgb(0xff8a97) } else { rgb(0xe8ecf4) })
-                    .hover(|style| style.bg(rgb(0x20232b)))
-                    .child(SharedString::from(label))
+                    .text_color(text_color)
+                    .child(SharedString::from(label));
+                if enabled {
+                    row = row.cursor_pointer().hover(|style| style.bg(rgb(0x20232b)));
+                }
+                row
             };
+            let separator = div()
+                .h(px(1.))
+                .w_full()
+                .my(px(4.))
+                .bg(rgb(0x2c3340));
+            let close_tab_id = tab_id.clone();
+            let close_other_id = tab_id.clone();
+            let close_right_id = tab_id.clone();
+            let close_left_id = tab_id.clone();
             let rename_tab_id = tab_id.clone();
             let fork_session_id = session_id.clone().unwrap_or_default();
             let pin_session_id = session_id.clone().unwrap_or_default();
             let archive_tab_id = tab_id.clone();
             let archive_session_id = session_id.clone().unwrap_or_default();
+            let close_tab = row("tab-menu-close", tr("Close tab"), false, true).on_click({
+                cx.listener(move |this, _ev, _win, cx| {
+                    this.tab_menu = None;
+                    this.close_whole_tab(&close_tab_id, cx);
+                })
+            });
+            let mut close_others = row(
+                "tab-menu-close-others",
+                tr("Close other tabs"),
+                false,
+                has_other,
+            );
+            if has_other {
+                close_others = close_others.on_click({
+                    cx.listener(move |this, _ev, _win, cx| {
+                        this.tab_menu = None;
+                        this.close_tab_group(&close_other_id, TabCloseSide::Others, cx);
+                    })
+                });
+            }
+            let mut close_right = row(
+                "tab-menu-close-right",
+                tr("Close tabs to the right"),
+                false,
+                has_right,
+            );
+            if has_right {
+                close_right = close_right.on_click({
+                    cx.listener(move |this, _ev, _win, cx| {
+                        this.tab_menu = None;
+                        this.close_tab_group(&close_right_id, TabCloseSide::Right, cx);
+                    })
+                });
+            }
+            let mut close_left = row(
+                "tab-menu-close-left",
+                tr("Close tabs to the left"),
+                false,
+                has_left,
+            );
+            if has_left {
+                close_left = close_left.on_click({
+                    cx.listener(move |this, _ev, _win, cx| {
+                        this.tab_menu = None;
+                        this.close_tab_group(&close_left_id, TabCloseSide::Left, cx);
+                    })
+                });
+            }
             let menu = div()
-                .absolute()
-                .left(pos.x)
-                .top(pos.y + px(6.))
-                .w(px(200.))
+                .w(px(210.))
                 .flex()
                 .flex_col()
                 .gap(px(1.))
@@ -23132,49 +23604,51 @@ impl Render for Root {
                 .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
                     cx.stop_propagation();
                 })
-                .child(row("tab-menu-rename", tr("Rename tab"), false).on_click({
+                .child(close_tab)
+                .child(close_others)
+                .child(close_right)
+                .child(close_left)
+                .child(separator)
+                .child(row("tab-menu-rename", tr("Rename tab"), false, true).on_click({
                     cx.listener(move |this, _ev, win, cx| {
                         this.tab_menu = None;
                         this.begin_rename(RenameTarget::Panel(rename_tab_id.clone()), win, cx);
                     })
                 }))
-                .children(if is_session {
-                    Some(
-                        row("tab-menu-fork", tr("Fork session"), false).on_click({
-                            cx.listener(move |this, _ev, _win, cx| {
-                                this.tab_menu = None;
-                                if !fork_session_id.is_empty() {
-                                    this.fork_session(&fork_session_id, None);
-                                }
-                                cx.notify();
-                            })
-                        }),
+                .children(is_session.then(|| {
+                    row("tab-menu-fork", tr("Fork session"), false, true).on_click({
+                        cx.listener(move |this, _ev, _win, cx| {
+                            this.tab_menu = None;
+                            if !fork_session_id.is_empty() {
+                                this.fork_session(&fork_session_id, None);
+                            }
+                            cx.notify();
+                        })
+                    })
+                }))
+                .children(is_session.then(|| {
+                    row(
+                        "tab-menu-pin",
+                        if pinned {
+                            tr("Unpin session")
+                        } else {
+                            tr("Pin session")
+                        },
+                        false,
+                        true,
                     )
-                } else {
-                    None
-                })
-                .children(if is_session {
-                    Some(
-                        row(
-                            "tab-menu-pin",
-                            if pinned { tr("Unpin session") } else { tr("Pin session") },
-                            false,
-                        )
-                        .on_click({
-                            cx.listener(move |this, _ev, _win, cx| {
-                                this.tab_menu = None;
-                                if !pin_session_id.is_empty() {
-                                    this.set_session_pinned(&pin_session_id, !pinned);
-                                }
-                                cx.notify();
-                            })
-                        }),
-                    )
-                } else {
-                    None
-                })
-                .children(if is_session {
-                    Some(row("tab-menu-archive", tr("Archive session"), true).on_click({
+                    .on_click({
+                        cx.listener(move |this, _ev, _win, cx| {
+                            this.tab_menu = None;
+                            if !pin_session_id.is_empty() {
+                                this.set_session_pinned(&pin_session_id, !pinned);
+                            }
+                            cx.notify();
+                        })
+                    })
+                }))
+                .children(is_session.then(|| {
+                    row("tab-menu-archive", tr("Archive session"), true, true).on_click({
                         cx.listener(move |this, _ev, _win, cx| {
                             this.tab_menu = None;
                             if !archive_session_id.is_empty() {
@@ -23183,10 +23657,17 @@ impl Render for Root {
                             }
                             cx.notify();
                         })
-                    }))
-                } else {
-                    None
-                });
+                    })
+                }));
+            let target = if anchor.size.width > px(0.) {
+                anchor
+            } else {
+                // 边界还没记录到（理论上第一帧后才可能）：退回鼠标点
+                Bounds {
+                    origin: anchor.origin,
+                    size: size(px(120.), px(26.)),
+                }
+            };
             div()
                 .absolute()
                 .inset_0()
@@ -23194,7 +23675,13 @@ impl Render for Root {
                     this.tab_menu = None;
                     cx.notify();
                 }))
-                .child(menu)
+                .child(
+                    anchored()
+                        .attach(target, Anchor::BottomLeft)
+                        .offset(point(px(0.), px(4.)))
+                        .snap_to_window_with_margin(px(8.))
+                        .child(menu),
+                )
         });
 
         let palette = if self.show_palette {
@@ -24509,8 +24996,18 @@ impl Render for Root {
                                                     let menu_id = id.clone();
                                                     move |this, ev: &MouseDownEvent, _win, cx| {
                                                         cx.stop_propagation();
+                                                        // 贴着芯片弹出（边界由 tab_bounds_probe 记录）；
+                                                        // 没录到就退回鼠标点。
+                                                        let anchor = this
+                                                            .tab_bounds
+                                                            .get(&menu_id)
+                                                            .copied()
+                                                            .unwrap_or(Bounds {
+                                                                origin: ev.position,
+                                                                size: size(px(0.), px(0.)),
+                                                            });
                                                         this.tab_menu =
-                                                            Some((menu_id.clone(), ev.position));
+                                                            Some((menu_id.clone(), anchor));
                                                         cx.notify();
                                                     }
                                                 }),
@@ -24605,6 +25102,8 @@ impl Render for Root {
                                                         this.close_whole_tab(&close_id, cx);
                                                     })),
                                             )
+                                            // 边界探针：右键菜单要贴到这个芯片上
+                                            .child(tab_bounds_probe(id.clone(), cx))
                                     })),
                             )
                             .children(if tab_overflow {
@@ -24754,6 +25253,11 @@ impl Render for Root {
                                 let weak = cx.entity().downgrade();
                                 let weak_open = weak.clone();
                                 let rows = tab_rows.clone();
+                                // 「全部 tab」清单底部的批量关闭：对当前 tab 生效
+                                let active_tab_id = tab_rows
+                                    .iter()
+                                    .find(|(_, _, active, _)| *active)
+                                    .map(|(id, _, _, _)| id.clone());
                                 gpui_kit::base::Popover::new("tab-list-popover")
                                     .anchor(gpui_kit::Anchor::TopRight)
                                     .offset(px(6.))
@@ -24934,6 +25438,65 @@ impl Render for Root {
                                                         .overflow_y_scroll()
                                                         .children(rows),
                                                 )
+                                                .children(active_tab_id.map(|tab_id| {
+                                                    let mut footer = div()
+                                                        .flex()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .gap(px(2.))
+                                                        .mt(px(4.))
+                                                        .pt(px(4.))
+                                                        .border_t_1()
+                                                        .border_color(rgb(0x23272f));
+                                                    for (id, label, side) in [
+                                                        (
+                                                            "tab-list-close-others",
+                                                            "Close other tabs",
+                                                            TabCloseSide::Others,
+                                                        ),
+                                                        (
+                                                            "tab-list-close-left",
+                                                            "Close tabs to the left",
+                                                            TabCloseSide::Left,
+                                                        ),
+                                                        (
+                                                            "tab-list-close-right",
+                                                            "Close tabs to the right",
+                                                            TabCloseSide::Right,
+                                                        ),
+                                                    ] {
+                                                        let weak_one = weak_row.clone();
+                                                        let target = tab_id.clone();
+                                                        footer = footer.child(
+                                                            div()
+                                                                .id(id)
+                                                                .flex_1()
+                                                                .px(px(6.))
+                                                                .py(px(4.))
+                                                                .rounded_sm()
+                                                                .text_xs()
+                                                                .text_color(rgb(0x9ca3b0))
+                                                                .cursor_pointer()
+                                                                .hover(|style| {
+                                                                    style.bg(rgb(0x20232b))
+                                                                })
+                                                                .child(tr(label))
+                                                                .on_click(move |_ev, _win, cx| {
+                                                                    cx.stop_propagation();
+                                                                    let _ = weak_one.update(
+                                                                        cx,
+                                                                        |root, cx| {
+                                                                            root.show_tab_list = false;
+                                                                            root.close_tab_group(
+                                                                                &target, side, cx,
+                                                                            );
+                                                                        },
+                                                                    );
+                                                                }),
+                                                        );
+                                                    }
+                                                    footer.into_any_element()
+                                                }))
                                         }
                                     })
                             })
@@ -25118,6 +25681,7 @@ impl Render for Root {
                                     .on_click(cx.listener(|this, _ev, _win, cx| {
                                         this.show_settings = true;
                                         this.reload_settings();
+                                        this.request_dsh_version();
                                         cx.notify();
                                     })),
                             )

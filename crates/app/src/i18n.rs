@@ -95,6 +95,30 @@ fn lookup(en: &str) -> Option<&'static str> {
         "Current version: unknown" => "当前版本：未知",
         "Current version" => "当前版本",
 
+        // ---- dsh 内核 ----
+        "dsh engine" => "dsh 内核",
+        "the engine that runs sessions, tools and plugins" => {
+            "运行会话、工具和插件的引擎"
+        }
+        "Upgrade engine" => "升级内核",
+        "Check engine" => "检查内核",
+        "current engine: unknown" => "当前内核：未知",
+        "installed by omd" => "由 omd 安装",
+        "system install (DSH_BIN)" => "系统安装（DSH_BIN）",
+        "checking the npm registry…" => "正在查询 npm registry…",
+        "releases are published on npm as @deepseek-ai/dsh" => {
+            "新版发布在 npm 的 @deepseek-ai/dsh"
+        }
+        "Upgrading…" => "升级中…",
+        "engine upgraded to v{} · restart OMD to use it" => {
+            "内核已升级到 v{} · 重启 OMD 后生效"
+        }
+        "engine upgrade failed: {}" => "内核升级失败：{}",
+        "new engine installed · restart OMD to use it" => {
+            "新内核已安装 · 重启 OMD 后生效"
+        }
+        "Restart OMD" => "重启 OMD",
+
         // ---- 更新 ----
         "Checking…" => "检查中…",
         "Check now" => "立即检查",
@@ -136,6 +160,10 @@ fn lookup(en: &str) -> Option<&'static str> {
         "Pin session" => "置顶会话",
         "Unpin session" => "取消置顶",
         "Rename tab" => "重命名标签页",
+        "Close tab" => "关闭标签页",
+        "Close other tabs" => "关闭其它标签页",
+        "Close tabs to the right" => "关闭右侧标签页",
+        "Close tabs to the left" => "关闭左侧标签页",
         "Fork session" => "分叉会话",
         "Archive session" => "归档会话",
         "Tabs" => "标签页",
